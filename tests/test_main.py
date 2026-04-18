@@ -7,7 +7,7 @@ import sys
 
 def test_assistant():
     """Test the AI assistant with a simple query"""
-    print("Testing AI Assistant with IBM ICA OpenAI-compatible endpoint...")
+    print("Testing AI Assistant...")
     print("="*60)
     
     # Create test input
@@ -16,7 +16,7 @@ def test_assistant():
     try:
         # Run the assistant with test input using virtual environment
         result = subprocess.run(
-            ['venv/bin/python3', 'ai_assistant.py'],
+            ['venv/bin/python3', 'main.py'],
             input=test_input,
             capture_output=True,
             text=True,

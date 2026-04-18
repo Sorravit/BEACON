@@ -62,3 +62,5 @@ htmlcov/
 # Backup files
 *.bak
 *.tmp
+
+.playwright-mcp
