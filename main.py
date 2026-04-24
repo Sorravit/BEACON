@@ -80,14 +80,15 @@ logger = logging.getLogger(__name__)
 class ToolManager:
     """Manages all agent tools including file, browser, and HTTP operations."""
     
-    def __init__(self, vector_memory=None):
+    def __init__(self, vector_memory=None, mcp_manager=None):
         """Initialize the tool manager."""
         self.tools: List[Dict[str, Any]] = []
         self.tool_handlers: Dict[str, Callable] = {}
         self.browser = None
         self.page = None
         self.playwright = None
-        self.vector_memory = vector_memory  # set after VectorMemory is initialized
+        self.vector_memory = vector_memory
+        self.mcp_manager = mcp_manager
         
     async def initialize(self):
         """Initialize tools"""
@@ -125,6 +126,11 @@ class ToolManager:
             # HTTP tools
             ("http_get", "Makes an HTTP GET request to the specified URL and returns the response", {"url": "string"}, self._http_get),
             ("http_post", "Makes an HTTP POST request to the specified URL with data and returns the response", {"url": "string", "data": "string"}, self._http_post),
+
+            # MCP server management tools
+            ("mcp_list_servers", "Lists all MCP servers and their current status (running/stopped) and tool count. Use when asked about MCP servers.", {}, self._mcp_list_servers),
+            ("mcp_restart_server", "Restarts a specific MCP server by name. Use when an MCP server is unresponsive or the user asks to restart it.", {"server_name": "string"}, self._mcp_restart_server),
+            ("mcp_restart_all", "Restarts ALL MCP servers. Use when the user asks to restart all MCP servers or when multiple servers are unresponsive.", {}, self._mcp_restart_all),
 
             # Memory management tools
             ("memory_list_facts", "Lists all personal facts stored in memory about the user. Use this when asked 'what do you know about me' or 'show my memory'.", {}, self._memory_list_facts),
@@ -355,6 +361,39 @@ class ToolManager:
         except Exception as e:
             return f"Error: {e}"
     
+    # MCP server management tool handlers
+    async def _mcp_list_servers(self):
+        if not self.mcp_manager:
+            return "No MCP manager available."
+        servers = await self.mcp_manager.list_servers()
+        if not servers:
+            return "No MCP servers registered."
+        lines = [f"  {s['name']}: {s['status']} ({s['tools']} tools)" for s in servers]
+        return "MCP Servers:\n" + "\n".join(lines)
+
+    async def _mcp_restart_server(self, server_name: str):
+        if not self.mcp_manager:
+            return "No MCP manager available."
+        ok = await self.mcp_manager.restart_server(server_name)
+        if ok:
+            servers = await self.mcp_manager.list_servers()
+            info = next((s for s in servers if s["name"] == server_name), None)
+            tools = info["tools"] if info else "?"
+            return f"MCP server '{server_name}' restarted successfully ({tools} tools loaded)."
+        return f"Failed to restart MCP server '{server_name}'. Check logs for details."
+
+    async def _mcp_restart_all(self):
+        if not self.mcp_manager:
+            return "No MCP manager available."
+        servers = await self.mcp_manager.list_servers()
+        if not servers:
+            return "No MCP servers to restart."
+        results = []
+        for s in servers:
+            ok = await self.mcp_manager.restart_server(s["name"])
+            results.append(f"  {s['name']}: {'✅ restarted' if ok else '❌ failed'}")
+        return "MCP server restart results:\n" + "\n".join(results)
+
     # Memory management tool handlers
     async def _memory_add_fact(self, topic: str, fact: str):
         if not self.vector_memory or not self.vector_memory._ready:
@@ -534,12 +573,16 @@ class AIAgent:
                 logger.info("ℹ️  Vector memory unavailable — running without persistent memory")
 
             if self.config.enable_tools:
-                self.tools = ToolManager(vector_memory=self.vector_memory)
+                self.tools = ToolManager(vector_memory=self.vector_memory, mcp_manager=self.mcp_manager)
                 self.tools_available = await self.tools.initialize()
-                
+
                 # Initialize MCP manager and load servers
                 self.mcp_manager = MCPManager()
                 await self._load_mcp_servers()
+
+                # Update ToolManager with the fully-loaded mcp_manager reference
+                if self.tools:
+                    self.tools.mcp_manager = self.mcp_manager
                 
                 # Add system message establishing tool usage context
                 if self.tools_available:
@@ -888,8 +931,12 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                         
                         print(f"  🔧 Executing: {tool_name}({', '.join(f'{k}={str(v)[:30]}' for k, v in tool_args.items()) if tool_args else ''})")
                         
-                        # Check if it's an MCP tool or built-in tool
-                        if tool_name.startswith("mcp_") and self.mcp_manager:
+                        # Check if it's a built-in tool first, then MCP tool
+                        # NOTE: mcp_list_servers / mcp_restart_* are built-in tools despite the mcp_ prefix
+                        is_builtin = self.tools and tool_name in self.tools.tool_handlers
+                        if is_builtin:
+                            tool_result = await self.tools.execute_tool(tool_name, tool_args)
+                        elif tool_name.startswith("mcp_") and self.mcp_manager:
                             tool_result = await self.mcp_manager.call_tool(tool_name, tool_args)
                             if tool_result is None:
                                 tool_result = json.dumps({"error": f"Unknown tool: {tool_name}"})
