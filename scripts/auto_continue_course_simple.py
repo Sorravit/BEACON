@@ -13,16 +13,18 @@ from pathlib import Path
 from datetime import datetime
 
 # Configuration
-COURSE_URL = "https://ibmdt.udemy.com/course/react-testing-library-and-jest/?kw=React+Testing+Library+and+Jest%3A+The+Complete+Guide&src=sac"
+COURSE_URL = "https://ibmdt.udemy.com/course/maginesolutions005/#overview"
 CHECK_INTERVAL = 600  # 1 hour in seconds
 LOCKFILE = "/tmp/course_completion.lock"
-LOGFILE = "course_completion.log"
+LOGFILE = "logs/course_completion.log"
 
 def log(message: str):
     """Log with timestamp"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_msg = f"[{timestamp}] {message}"
     print(log_msg)
+    # Ensure logs directory exists
+    os.makedirs("logs", exist_ok=True)
     with open(LOGFILE, "a") as f:
         f.write(log_msg + "\n")
 

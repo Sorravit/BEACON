@@ -2,79 +2,106 @@
 
 **Version:** 4.2.0 | **Status:** Production Ready
 
-AI Assistant for automating tasks, web automation, and long-running operations.
+Autonomous AI agent with browser automation, web search, file operations, and persistent vector memory.
 
-## Quick Start
+---
+
+## 🚀 Quick Start
 
 ```bash
-# Setup
+# 1. Setup
+git clone <repository>
+cd ClineSandbox
 python3 -m venv venv
-source venv/bin/activate
+source venv/bin/activate.fish   # fish shell
 pip install -r requirements.txt
+playwright install chromium
+
+# 2. Configure
 cp config.example.env .env
-# Edit .env with your API credentials
+# Edit .env with your API key and endpoint
 
-# Run
+# 3. Start Weaviate (vector memory)
+docker compose up -d
+
+# 4. Run
 python main.py
-```
-
-## Usage
-
-```bash
-# Chat mode - Interactive conversation
-python main.py
-
-# Task mode - Single task
-python run.py "your task description"
-
-# Agent mode - Autonomous execution  
-python scripts/run_agent.py "your task description"
-```
-
-## Features
-
-- 35+ Tools (browser automation, web search, file operations, system commands)
-- MCP Protocol integration
-- Playwright browser automation
-- Conversation memory
-- Long-running task support
-
-## Documentation
-
-- **[Getting Started](docs/GETTING_STARTED.md)** - Installation and basics
-- **[Configuration](docs/CONFIGURATION.md)** - Settings
-- **[Troubleshooting](docs/TROUBLESHOOTING.md)** - Common issues
-- **[Full Documentation](docs/README.md)** - All docs
-
-## Configuration
-
-Edit `main.py` lines 22-50:
-
-```python
-MAX_TOOL_ITERATIONS = 1000        # ~8-10 hours
-MAX_CONVERSATION_TOKENS = 150000  # Memory limit
-DEFAULT_MODEL = "gpt-3.5-turbo"   # AI model
-```
-
-## Requirements
-
-- Python 3.8+
-- Node.js (for MCP servers)
-- Virtual environment (recommended)
-
-## Project Structure
-
-```
-ClineSandbox/
-├── main.py                    # Main application
-├── agent_api.py               # Agent API
-├── agent_executor.py          # Autonomous executor
-├── run.py                     # Task launcher
-├── docs/                      # Documentation
-├── scripts/                   # Helper scripts
-└── tests/                     # Tests
 ```
 
 ---
 
-**Version:** 4.2.0 | **Last Updated:** April 18, 2026
+## 🧠 Vector Memory (Weaviate)
+
+The agent has persistent semantic memory backed by Weaviate:
+
+- **Personal facts** — tells the agent things about you ("I have a Samsung oven") and it remembers permanently across sessions
+- **Research memory** — every tool result is stored and retrieved semantically, so the agent never re-fetches what it already knows
+- **Memory tools** — `memory_list_facts`, `memory_add_fact`, `memory_delete_fact`, `memory_delete_research`, `memory_clear_research`
+
+Weaviate runs in Docker. Start it with `docker compose up -d`.
+
+---
+
+## 🔧 Available Tools
+
+| Category | Tools |
+|---|---|
+| System | `get_current_time`, `execute_command` |
+| Files | `read_file`, `write_file`, `list_files` |
+| Web | `web_search`, `browser_navigate`, `browser_click`, `browser_type`, `browser_screenshot`, `browser_get_text`, `browser_close` |
+| HTTP | `http_get`, `http_post` |
+| Notifications | `slack_notify` |
+| Memory | `memory_list_facts`, `memory_add_fact`, `memory_delete_fact`, `memory_delete_research`, `memory_clear_research` |
+| MCP (Playwright) | 21 additional browser automation tools |
+
+---
+
+## ⚙️ Configuration
+
+| Variable | Description | Default |
+|---|---|---|
+| `OPENAI_API_KEY` | API key (OpenAI or IBM ICA) | required |
+| `OPENAI_BASE_URL` | API endpoint | `https://api.openai.com/v1` |
+| `AI_MODEL` | Model name | `gpt-3.5-turbo` |
+| `AI_TEMPERATURE` | Response creativity (0-2) | `0.7` |
+| `AI_MAX_TOKENS` | Max response tokens | `2000` |
+| `SLACK_WEBHOOK_URL` | Slack webhook for notifications | optional |
+| `TRANSFORMERS_OFFLINE` | Skip HuggingFace update checks | `1` (after first run) |
+
+---
+
+## 📁 Project Structure
+
+```
+main.py              — Main agent entry point
+agent_api.py         — Programmatic API wrapper
+agent_executor.py    — Autonomous task execution engine
+lib/
+  vector_memory.py   — Weaviate-backed semantic memory
+  mcp_client.py      — MCP protocol client
+  agent_memory.py    — Simple key-value memory
+docker-compose.yml   — Weaviate vector DB
+examples/
+  example_agent_usage.py  — Programmatic usage examples
+scripts/             — Utility scripts
+docs/                — Documentation
+```
+
+---
+
+## 💬 Chat Commands
+
+| Command | Action |
+|---|---|
+| `clear` | Clear conversation history |
+| `quit` / `exit` | Exit the agent |
+| `help` | Show usage examples |
+
+---
+
+## 📚 Documentation
+
+- [Getting Started](docs/GETTING_STARTED.md)
+- [Configuration](docs/CONFIGURATION.md)
+- [API Reference](docs/API_REFERENCE.md)
+- [Troubleshooting](docs/TROUBLESHOOTING.md)

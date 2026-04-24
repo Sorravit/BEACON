@@ -1,0 +1,1 @@
+Do not use heredoc syntax (<< EOF). I use Fish shell which does not support heredocs. Instead, use echo, printf, or a text editor to create files.

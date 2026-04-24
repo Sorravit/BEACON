@@ -14,6 +14,30 @@ from enum import Enum
 
 logger = logging.getLogger(__name__)
 
+def safe_encode_string(text: str, errors: str = 'replace') -> str:
+    """
+    Safely encode string to handle UTF-8 surrogate characters.
+    Fixes: 'utf-8' codec can't encode characters - surrogates not allowed
+    
+    Args:
+        text: String that may contain invalid UTF-8 characters
+        errors: How to handle encoding errors ('replace', 'ignore', 'strict')
+                
+    Returns:
+        str: Safely encoded string without surrogate characters
+    """
+    if not text:
+        return text
+    try:
+        return text.encode('utf-8', errors=errors).decode('utf-8')
+    except Exception as e:
+        logger.warning(f"Failed to encode string safely: {e}")
+        try:
+            return str(text).encode('utf-8', errors='ignore').decode('utf-8')
+        except:
+            return "[Invalid UTF-8 content]"
+
+
 
 class TaskStatus(Enum):
     """Status of a task execution"""
@@ -163,8 +187,13 @@ Respond in JSON format:
 
 Be specific and actionable. Each step should be independently executable."""
 
-        # Get plan from AI
-        response = await self.ai_agent.get_response(planning_prompt)
+        # Get plan from AI with encoding safety
+        try:
+            raw_response = await self.ai_agent.get_response(planning_prompt)
+            response = safe_encode_string(raw_response) if raw_response else None
+        except Exception as e:
+            logger.error(f"Error getting planning response: {e}")
+            raise Exception(f"Failed to get planning response: {e}")
         
         if not response:
             raise Exception("Failed to generate task plan")
@@ -204,7 +233,7 @@ Be specific and actionable. Each step should be independently executable."""
     
     async def _execute_steps(self, task: Task):
         """
-        Execute all steps in the task plan.
+        Execute all steps in the task plan with intelligent error detection and recovery.
         
         Args:
             task: Task with steps to execute
@@ -216,7 +245,7 @@ Be specific and actionable. Each step should be independently executable."""
             step.started_at = datetime.now()
             
             try:
-                # Execute step with retries
+                # Execute step with intelligent retries
                 for attempt in range(self.max_retries):
                     try:
                         if step.tool_name and step.tool_args:
@@ -228,15 +257,38 @@ Be specific and actionable. Each step should be independently executable."""
                             step.result = result
                         else:
                             # Let AI choose and execute the appropriate tool using function calling
-                            result = await self.ai_agent.get_response(
+                            raw_result = await self.ai_agent.get_response(
                                 f"Execute this step: {step.description}\n\n"
                                 f"Context: This is step {step.step_id} of task '{task.description}'\n"
                                 f"Use the appropriate tool to complete this step."
                             )
-                            step.result = result
+                            step.result = safe_encode_string(raw_result) if raw_result else None
                         
+                        # CRITICAL NEW FEATURE: Analyze the result for errors
+                        has_error, error_analysis = await self._analyze_step_result(step, task)
+                        
+                        if has_error:
+                            logger.warning(f"Step {step.step_id} completed but output contains errors: {error_analysis}")
+                            
+                            if attempt < self.max_retries - 1:
+                                # Try to fix the error automatically
+                                logger.info(f"Attempting to fix error automatically (attempt {attempt + 1}/{self.max_retries})")
+                                fix_applied = await self._attempt_error_fix(step, error_analysis, task)
+                                
+                                if fix_applied:
+                                    logger.info(f"Fix applied, retrying step {step.step_id}")
+                                    await asyncio.sleep(1)
+                                    continue  # Retry the step after applying fix
+                                else:
+                                    logger.warning(f"Could not apply automatic fix, treating as failure")
+                                    raise Exception(f"Step produced errors that could not be fixed: {error_analysis}")
+                            else:
+                                raise Exception(f"Step failed after {self.max_retries} attempts: {error_analysis}")
+                        
+                        # No errors detected, mark as completed
                         step.status = TaskStatus.COMPLETED
                         step.completed_at = datetime.now()
+                        logger.info(f"Step {step.step_id} completed successfully")
                         break
                         
                     except Exception as e:
@@ -255,6 +307,203 @@ Be specific and actionable. Each step should be independently executable."""
                 # Decide whether to continue or abort
                 if self._is_critical_failure(step):
                     raise Exception(f"Critical step failed: {step.description}")
+    
+    async def _analyze_step_result(self, step: TaskStep, task: Task) -> Tuple[bool, str]:
+        """
+        Analyze the step result to detect if there are errors, even if the tool executed successfully.
+        
+        Args:
+            step: The step that was just executed
+            task: The parent task
+            
+        Returns:
+            Tuple of (has_error: bool, error_analysis: str)
+        """
+        if not step.result:
+            return False, ""
+        
+        # Safely encode result before analyzing
+        try:
+            safe_result = safe_encode_string(step.result)
+            result_lower = safe_result.lower()
+        except Exception as e:
+            logger.error(f"Error encoding result for analysis: {e}")
+            return True, f"Could not analyze result due to encoding error: {e}"
+        
+        # Quick pattern matching for common errors
+        error_patterns = [
+            "error:",
+            "exception:",
+            "traceback",
+            "modulenotfounderror",
+            "importerror",
+            "filenotfound",
+            "permission denied",
+            "command not found",
+            "no such file",
+            "failed",
+            "http 403",
+            "http 404",
+            "http 500",
+            "http 502",
+            "http 503",
+            "connection refused",
+            "timeout",
+            "syntax error",
+            "name error",
+            "type error",
+            "value error",
+            "attribute error",
+        ]
+        
+        # Check for error patterns
+        has_error_pattern = any(pattern in result_lower for pattern in error_patterns)
+        
+        if not has_error_pattern:
+            # No obvious error pattern, consider it successful
+            return False, ""
+        
+        # Found error pattern, ask AI to analyze it
+        logger.info(f"Error pattern detected in step {step.step_id}, asking AI to analyze...")
+        
+        analysis_prompt = f"""Analyze this command/script output and determine if it indicates an error that needs to be fixed.
+
+Step Description: {step.description}
+Tool Used: {step.tool_name or 'AI-selected tool'}
+Output:
+{safe_encode_string(step.result[:2000]) if step.result else "No output"}  
+
+IMPORTANT: Look for actual errors that prevent the step from completing successfully.
+- ModuleNotFoundError/ImportError = YES, error
+- HTTP 403/404/500 errors = YES, error  
+- "Failed" or "Error" messages = YES, error
+- Successful execution messages = NO, not an error
+- Informational warnings = NO, not an error
+
+Respond in JSON format:
+{{
+    "has_error": true/false,
+    "error_type": "type of error (e.g., 'missing_dependency', 'http_error', 'file_not_found', 'permission_error', 'syntax_error', etc.)",
+    "error_description": "brief description of the error",
+    "suggested_fix": "what needs to be done to fix it"
+}}
+"""
+        
+        try:
+            raw_analysis = await self.ai_agent.get_response(analysis_prompt)
+            analysis_response = safe_encode_string(raw_analysis) if raw_analysis else None
+            
+            if not analysis_response:
+                return True, "Could not get analysis response"
+            
+            # Parse JSON response
+            json_start = analysis_response.find('{')
+            json_end = analysis_response.rfind('}') + 1
+            if json_start >= 0 and json_end > json_start:
+                analysis_json = analysis_response[json_start:json_end]
+                analysis = json.loads(analysis_json)
+                
+                if analysis.get('has_error', False):
+                    error_desc = f"{analysis.get('error_type', 'unknown')}: {analysis.get('error_description', 'No description')}"
+                    logger.info(f"AI confirmed error in step {step.step_id}: {error_desc}")
+                    return True, error_desc
+                else:
+                    logger.info(f"AI determined no actionable error in step {step.step_id}")
+                    return False, ""
+            else:
+                # Couldn't parse JSON, fall back to pattern matching result
+                logger.warning(f"Could not parse AI analysis, using pattern matching result")
+                return True, "Error detected in output (pattern matching)"
+                
+        except Exception as e:
+            logger.error(f"Error during result analysis: {e}")
+            # If analysis fails, be conservative and report error
+            return True, f"Error detected in output: {str(e)}"
+    
+    async def _attempt_error_fix(self, step: TaskStep, error_analysis: str, task: Task) -> bool:
+        """
+        Attempt to automatically fix the error detected in the step.
+        
+        Args:
+            step: The step that failed
+            error_analysis: Description of the error
+            task: The parent task
+            
+        Returns:
+            bool: True if fix was applied, False if couldn't fix
+        """
+        logger.info(f"Attempting to generate fix for: {error_analysis}")
+        
+        fix_prompt = f"""You are an autonomous agent that can fix errors. An error was detected during task execution.
+
+Original Task: {task.description}
+Failed Step: {step.description}
+Tool Used: {step.tool_name or 'AI-selected tool'}
+Error Analysis: {error_analysis}
+Step Output:
+{safe_encode_string(step.result[:1500]) if step.result else "No output"}
+
+Your job is to fix this error automatically. Common fixes:
+- ModuleNotFoundError → Install the missing module with pip
+- HTTP 403/404 errors → Try different approach (browser automation instead of HTTP)
+- File not found → Create the file or fix the path
+- Permission denied → Adjust permissions
+- Syntax errors → Fix the code
+
+Generate a fix action. Respond in JSON format:
+{{
+    "can_fix": true/false,
+    "fix_action": "tool_name to use (e.g., 'execute_command', 'write_file', etc.)",
+    "fix_args": {{"arg1": "value1"}},
+    "fix_description": "what this fix does"
+}}
+
+If you cannot fix it automatically, set can_fix to false.
+"""
+        
+        try:
+            raw_fix_response = await self.ai_agent.get_response(fix_prompt)
+            fix_response = safe_encode_string(raw_fix_response) if raw_fix_response else None
+            
+            if not fix_response:
+                logger.warning("Could not get fix response")
+                return False
+            
+            # Parse JSON response
+            json_start = fix_response.find('{')
+            json_end = fix_response.rfind('}') + 1
+            if json_start >= 0 and json_end > json_start:
+                fix_json = fix_response[json_start:json_end]
+                fix_plan = json.loads(fix_json)
+                
+                if not fix_plan.get('can_fix', False):
+                    logger.info(f"AI determined error cannot be fixed automatically")
+                    return False
+                
+                # Apply the fix
+                fix_action = fix_plan.get('fix_action')
+                fix_args = fix_plan.get('fix_args', {})
+                fix_desc = fix_plan.get('fix_description', 'No description')
+                
+                logger.info(f"Applying fix: {fix_desc}")
+                logger.info(f"Fix action: {fix_action}({fix_args})")
+                
+                # Execute the fix
+                if fix_action and self.ai_agent.tools:
+                    fix_result = await self.ai_agent.tools.execute_tool(fix_action, fix_args)
+                    safe_fix_result = safe_encode_string(str(fix_result)[:200]) if fix_result else "No result"
+                    logger.info(f"Fix applied. Result: {safe_fix_result}")
+                    return True
+                else:
+                    logger.warning(f"Fix action not available: {fix_action}")
+                    return False
+            else:
+                logger.warning(f"Could not parse fix plan JSON")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error during fix attempt: {e}")
+            return False
     
     def _compile_task_result(self, task: Task) -> str:
         """

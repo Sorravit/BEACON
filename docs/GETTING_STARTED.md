@@ -19,11 +19,11 @@ python main.py
 ```
 Interactive conversation with the AI.
 
-### Task Mode  
+### Task Mode (with Human Intervention Support)
 ```bash
-python run.py "your task description"
+python scripts/run_interactive_task.py "your task description"
 ```
-Single task execution.
+Single task execution. The browser stays open so you can handle CAPTCHA, login, or other manual steps as needed. Perfect for tasks requiring human intervention.
 
 ### Agent Mode
 ```bash

@@ -64,7 +64,7 @@ DEFAULT_MAX_TOKENS = 2000  # Maximum response length
 
 **LOG_FILE**
 ```python
-LOG_FILE = "ai_assistant.log"  # Where logs are saved
+LOG_FILE = "logs/ai_assistant.log"  # Where logs are saved
 ```
 
 **To change log level:**

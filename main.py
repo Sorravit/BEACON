@@ -12,12 +12,18 @@ import logging
 import os
 import subprocess
 import sys
+import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+# Suppress noisy deprecation warnings from third-party libraries
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="authlib")
+warnings.filterwarnings("ignore", message=".*authlib.jose.*")
+
 from openai import OpenAI
 from lib.mcp_client import MCPManager
+from lib.vector_memory import VectorMemory
 
 # ============================================================================
 # CONFIGURATION CONSTANTS - Modify these to customize behavior
@@ -48,7 +54,11 @@ MAX_TOOL_ITERATIONS = 1000
 # - Dynamically trims based on actual token count, not message count
 # - Keeps as many recent messages as possible within token limit
 # - System message is always kept
-MAX_CONVERSATION_TOKENS = 150000  # Keep up to 150k tokens (safe buffer from 200k limit)
+# Set to 80k to be safe: actual limit is 200k but _estimate_tokens() is ~33% too low,
+# and the system message (with tools XML) + memory context add thousands of untracked tokens.
+MAX_CONVERSATION_TOKENS = 80000
+# Max characters for the memory context block injected per user message
+MAX_MEMORY_CONTEXT_CHARS = 3000
 
 # MCP Configuration
 MCP_CONFIG_FILE = "mcp_config.json"
@@ -70,13 +80,14 @@ logger = logging.getLogger(__name__)
 class ToolManager:
     """Manages all agent tools including file, browser, and HTTP operations."""
     
-    def __init__(self):
+    def __init__(self, vector_memory=None):
         """Initialize the tool manager."""
         self.tools: List[Dict[str, Any]] = []
         self.tool_handlers: Dict[str, Callable] = {}
         self.browser = None
         self.page = None
         self.playwright = None
+        self.vector_memory = vector_memory  # set after VectorMemory is initialized
         
     async def initialize(self):
         """Initialize tools"""
@@ -114,6 +125,13 @@ class ToolManager:
             # HTTP tools
             ("http_get", "Makes an HTTP GET request to the specified URL and returns the response", {"url": "string"}, self._http_get),
             ("http_post", "Makes an HTTP POST request to the specified URL with data and returns the response", {"url": "string", "data": "string"}, self._http_post),
+
+            # Memory management tools
+            ("memory_list_facts", "Lists all personal facts stored in memory about the user. Use this when asked 'what do you know about me' or 'show my memory'.", {}, self._memory_list_facts),
+            ("memory_add_fact", "Manually adds a personal fact to memory. Use this when the user explicitly asks you to remember something specific about them.", {"topic": "string", "fact": "string"}, self._memory_add_fact),
+            ("memory_delete_fact", "Deletes personal facts from memory that match a keyword. Use this when the user asks to forget or remove something about themselves.", {"keyword": "string"}, self._memory_delete_fact),
+            ("memory_delete_research", "Deletes research memory entries that match a keyword. Use this when the user asks to forget research about a topic.", {"keyword": "string"}, self._memory_delete_research),
+            ("memory_clear_research", "Clears ALL research memory entries. Use only when user explicitly asks to clear all research memory.", {}, self._memory_clear_research),
         ]
         
         for name, desc, params, handler in tools_config:
@@ -337,6 +355,46 @@ class ToolManager:
         except Exception as e:
             return f"Error: {e}"
     
+    # Memory management tool handlers
+    async def _memory_add_fact(self, topic: str, fact: str):
+        if not self.vector_memory or not self.vector_memory._ready:
+            return "Memory system is not available."
+        stored = await self.vector_memory.store_personal_fact(topic, fact)
+        if stored:
+            return f"Remembered: [{topic}] {fact}"
+        return f"Failed to store fact."
+
+    async def _memory_list_facts(self):
+        if not self.vector_memory or not self.vector_memory._ready:
+            return "Memory system is not available."
+        facts = await self.vector_memory.get_all_personal_facts()
+        if not facts:
+            return "No personal facts stored in memory."
+        lines = [f"[{f.get('topic')}] {f.get('fact')} (saved: {f.get('stored_at', '')[:10]})" for f in facts]
+        return f"Personal facts in memory ({len(facts)}):\n" + "\n".join(lines)
+
+    async def _memory_delete_fact(self, keyword: str):
+        if not self.vector_memory or not self.vector_memory._ready:
+            return "Memory system is not available."
+        count = await self.vector_memory.delete_personal_facts(keyword)
+        if count == 0:
+            return f"No personal facts found matching '{keyword}'."
+        return f"Deleted {count} personal fact(s) matching '{keyword}'."
+
+    async def _memory_delete_research(self, keyword: str):
+        if not self.vector_memory or not self.vector_memory._ready:
+            return "Memory system is not available."
+        count = await self.vector_memory.delete_research(keyword)
+        if count == 0:
+            return f"No research entries found matching '{keyword}'."
+        return f"Deleted {count} research entry/entries matching '{keyword}'."
+
+    async def _memory_clear_research(self):
+        if not self.vector_memory or not self.vector_memory._ready:
+            return "Memory system is not available."
+        count = await self.vector_memory.clear_all_research()
+        return f"Cleared all {count} research memory entries."
+
     async def execute_tool(self, name: str, args: Dict):
         if name not in self.tool_handlers:
             return f"Unknown tool: {name}"
@@ -444,6 +502,8 @@ class AIAgent:
         self.tools: Optional[ToolManager] = None
         self.mcp_manager: Optional[MCPManager] = None
         self.tools_available = False
+        self.vector_memory: Optional[VectorMemory] = None
+        self.memory_available = False
     
     async def initialize(self) -> bool:
         """
@@ -461,8 +521,20 @@ class AIAgent:
             # Load MCP servers from config
             await self._load_mcp_servers()
             
+            # Initialize vector memory (Weaviate) — optional, graceful if unavailable
+            self.vector_memory = VectorMemory(
+                openai_api_key=self.config.api_key,
+                weaviate_url="http://localhost:8080",
+                openai_base_url=self.config.base_url,
+            )
+            self.memory_available = await self.vector_memory.initialize()
+            if self.memory_available:
+                logger.info("✅ Vector memory (Weaviate) available")
+            else:
+                logger.info("ℹ️  Vector memory unavailable — running without persistent memory")
+
             if self.config.enable_tools:
-                self.tools = ToolManager()
+                self.tools = ToolManager(vector_memory=self.vector_memory)
                 self.tools_available = await self.tools.initialize()
                 
                 # Initialize MCP manager and load servers
@@ -597,6 +669,49 @@ class AIAgent:
         
         return None
     
+    async def _extract_and_store_facts(self, user_input: str):
+        """
+        Detect personal facts in user input and store them in vector memory.
+        Examples: "I have a Samsung oven", "my name is John", "I live in Bangkok"
+        """
+        # Simple heuristic patterns that suggest personal facts
+        fact_patterns = [
+            "i have", "i own", "i use", "i am", "i'm", "my name is",
+            "i live", "i work", "my ", "i prefer", "i like", "i hate",
+            "i drive", "i eat", "i drink", "i take", "i need",
+        ]
+        lower = user_input.lower()
+        if not any(p in lower for p in fact_patterns):
+            return
+
+        # Ask the AI to extract the fact cleanly
+        try:
+            extraction_prompt = (
+                f'Extract personal facts from this message as JSON.\n'
+                f'Message: "{user_input}"\n'
+                f'Respond ONLY with JSON like: {{"topic": "oven", "fact": "I have a Samsung NV75K5571RS oven"}}\n'
+                f'If no personal fact found, respond: {{"topic": null, "fact": null}}'
+            )
+            extraction_response = self.client.chat.completions.create(
+                model=self.config.model,
+                messages=[{"role": "user", "content": extraction_prompt}],
+                temperature=0,
+                max_tokens=100
+            )
+            text = extraction_response.choices[0].message.content or ""
+            # Parse JSON
+            json_start = text.find('{')
+            json_end = text.rfind('}') + 1
+            if json_start >= 0 and json_end > json_start:
+                data = json.loads(text[json_start:json_end])
+                topic = data.get("topic")
+                fact = data.get("fact")
+                if topic and fact and self.vector_memory:
+                    await self.vector_memory.store_personal_fact(topic, fact)
+                    print(f"  🧠 Remembered: [{topic}] {fact}")
+        except Exception as e:
+            logger.debug(f"Fact extraction skipped: {e}")
+
     def _build_tools_prompt(self) -> str:
         """Build system prompt with tool descriptions"""
         prompt = "\n\nYou have access to the following tools:\n\n"
@@ -710,18 +825,30 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
             return None
         
         try:
-            # Add tools description to system message if not already present
+            # Add tools description to system message if not already present (once only)
             if self.tools_available and len(self.conversation) > 0:
-                # Check if we need to update system message with tools
                 if self.conversation[0]["role"] == "system":
-                    # Update system message to include tools
                     tools_prompt = self._build_tools_prompt()
                     if tools_prompt not in self.conversation[0]["content"]:
                         self.conversation[0]["content"] += tools_prompt
-            
-            self.conversation.append({"role": "user", "content": user_input})
-            
-            # Trim conversation if it's getting too long
+
+            # --- Vector memory: detect and store personal facts from user input ---
+            if self.memory_available and self.vector_memory:
+                await self._extract_and_store_facts(user_input)
+
+            # --- Vector memory: inject relevant context as prefix (capped size) ---
+            memory_prefix = ""
+            if self.memory_available and self.vector_memory:
+                raw_prefix = await self.vector_memory.build_context_prompt(user_input)
+                # Cap memory context to avoid token overflow
+                if raw_prefix and len(raw_prefix) > MAX_MEMORY_CONTEXT_CHARS:
+                    raw_prefix = raw_prefix[:MAX_MEMORY_CONTEXT_CHARS] + "\n...[memory truncated]\n\n"
+                memory_prefix = raw_prefix
+
+            user_message = (memory_prefix + user_input) if memory_prefix else user_input
+            self.conversation.append({"role": "user", "content": user_message})
+
+            # Trim AFTER adding the new message so trimming sees the full picture
             self._trim_conversation()
             
             # Agent loop - allow multiple tool calls
@@ -771,6 +898,15 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                         else:
                             tool_result = json.dumps({"error": "No tool manager available"})
                         
+                        # --- Store tool result in vector memory ---
+                        if self.memory_available and self.vector_memory:
+                            query_hint = str(list(tool_args.values())[0]) if tool_args else tool_name
+                            await self.vector_memory.store_research(
+                                tool_name=tool_name,
+                                query=query_hint[:200],
+                                result=str(tool_result)
+                            )
+
                         tool_results.append(f"Tool: {tool_name}\nResult: {tool_result}")
                     
                     # Add tool results as user message
@@ -953,6 +1089,8 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
         
         if self.tools:
             await self.tools.cleanup()
+        if self.vector_memory:
+            self.vector_memory.close()
 
 
 async def main():

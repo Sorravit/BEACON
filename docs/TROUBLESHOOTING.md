@@ -50,7 +50,7 @@ node --version
 
 **Check logs:**
 ```bash
-tail -f ai_assistant.log
+tail -f logs/ai_assistant.log
 ```
 
 **Test configuration:**

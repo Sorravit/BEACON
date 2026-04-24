@@ -64,3 +64,5 @@ htmlcov/
 *.tmp
 
 .playwright-mcp
+
+output/
