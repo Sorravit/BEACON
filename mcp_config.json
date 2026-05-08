@@ -6,6 +6,10 @@
                 "@playwright/mcp@latest"
             ],
             "type": "stdio"
+        },
+        "Atlassian-Rovo-MCP": {
+            "command": "npx",
+            "args": ["-y", "mcp-remote@latest", "https://mcp.atlassian.com/v1/mcp/authv2"]
         }
     },
     "inputs": []

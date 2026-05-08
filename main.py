@@ -127,6 +127,11 @@ class ToolManager:
             ("http_get", "Makes an HTTP GET request to the specified URL and returns the response", {"url": "string"}, self._http_get),
             ("http_post", "Makes an HTTP POST request to the specified URL with data and returns the response", {"url": "string", "data": "string"}, self._http_post),
 
+            # Background task delegation — for long-running / infinite-loop tasks
+            ("delegate_background_task", "Delegates a long-running or infinite-loop task to a background process. Use this when a task needs to run continuously (e.g. monitoring, watching a course, polling). The task runs independently and won't block the chat.", {"name": "string", "command": "string", "interval_seconds": "string"}, self._delegate_background_task),
+            ("stop_background_task", "Stops a running background task by name.", {"name": "string"}, self._stop_background_task),
+            ("background_task_status", "Shows status of all background tasks or a specific one by name.", {"name": "string"}, self._background_task_status),
+
             # MCP server management tools
             ("mcp_list_servers", "Lists all MCP servers and their current status (running/stopped) and tool count. Use when asked about MCP servers.", {}, self._mcp_list_servers),
             ("mcp_restart_server", "Restarts a specific MCP server by name. Use when an MCP server is unresponsive or the user asks to restart it.", {"server_name": "string"}, self._mcp_restart_server),
@@ -361,6 +366,76 @@ class ToolManager:
         except Exception as e:
             return f"Error: {e}"
     
+    # Background task delegation handlers
+    async def _delegate_background_task(self, name: str, command: str, interval_seconds: str = "0"):
+        script = Path(__file__).parent / "scripts" / "background_task.py"
+        if not script.exists():
+            return f"Error: background_task.py not found at {script}"
+        try:
+            interval = int(interval_seconds)
+        except ValueError:
+            interval = 0
+        try:
+            os.makedirs("logs", exist_ok=True)
+            args = [
+                sys.executable, str(script),
+                "--name", name,
+                "--command", command,
+                "--interval", str(interval),
+                "--max-runs", "-1" if interval > 0 else "1",
+                "--no-detach",   # already launching detached below; skip the double-fork
+            ]
+            proc = subprocess.Popen(
+                args,
+                stdout=open(f"logs/bg_{name}.log", "a"),
+                stderr=subprocess.STDOUT,
+                start_new_session=True  # detach from main.py's process group
+            )
+            return (
+                f"✅ Background task '{name}' started (PID: {proc.pid})\n"
+                f"   Command: {command}\n"
+                f"   Interval: {interval}s ({'loop forever' if interval > 0 else 'run once'})\n"
+                f"   Log: logs/bg_{name}.log\n"
+                f"   Stop: use stop_background_task(name='{name}')"
+            )
+        except Exception as e:
+            return f"Error starting background task: {e}"
+
+    async def _stop_background_task(self, name: str):
+        lockfile = f"/tmp/bg_task_{name}.lock"
+        if not os.path.exists(lockfile):
+            return f"Task '{name}' is not running."
+        try:
+            with open(lockfile) as f:
+                pid = int(f.read().strip())
+            import signal as sig
+            os.kill(pid, sig.SIGTERM)
+            os.remove(lockfile)
+            return f"✅ Background task '{name}' stopped (PID: {pid})."
+        except Exception as e:
+            return f"Error stopping '{name}': {e}"
+
+    async def _background_task_status(self, name: str = ""):
+        import glob
+        locks = glob.glob("/tmp/bg_task_*.lock")
+        if not locks:
+            return "No background tasks found."
+        lines = []
+        for lf in locks:
+            task_name = Path(lf).stem.replace("bg_task_", "")
+            if name and task_name != name:
+                continue
+            try:
+                with open(lf) as f:
+                    pid = int(f.read().strip())
+                result = subprocess.run(["ps", "-p", str(pid)], capture_output=True)
+                alive = result.returncode == 0
+                status = f"RUNNING (PID: {pid})" if alive else "STOPPED (stale lock)"
+                lines.append(f"  {task_name}: {status} | log: logs/bg_{task_name}.log")
+            except Exception:
+                lines.append(f"  {task_name}: unknown")
+        return "Background tasks:\n" + "\n".join(lines) if lines else f"No task named '{name}' found."
+
     # MCP server management tool handlers
     async def _mcp_list_servers(self):
         if not self.mcp_manager:
@@ -440,6 +515,20 @@ class ToolManager:
         
         # Normalize parameter names to handle AI model variations
         normalized_args = self._normalize_tool_args(name, args)
+
+        # Validate required parameters before calling handler
+        import inspect
+        handler = self.tool_handlers[name]
+        sig = inspect.signature(handler)
+        missing = [
+            p for p, v in sig.parameters.items()
+            if p != "self"
+            and v.default is inspect.Parameter.empty
+            and p not in normalized_args
+        ]
+        if missing:
+            return f"Error: tool '{name}' missing required parameter(s): {', '.join(missing)}"
+
         return await self.tool_handlers[name](**normalized_args)
     
     def _normalize_tool_args(self, tool_name: str, args: Dict) -> Dict:
@@ -561,9 +650,10 @@ class AIAgent:
             await self._load_mcp_servers()
             
             # Initialize vector memory (Weaviate) — optional, graceful if unavailable
+            weaviate_port = int(os.getenv("WEAVIATE_PORT", "8090"))
             self.vector_memory = VectorMemory(
                 openai_api_key=self.config.api_key,
-                weaviate_url="http://localhost:8080",
+                weaviate_url=f"http://localhost:{weaviate_port}",
                 openai_base_url=self.config.base_url,
             )
             self.memory_available = await self.vector_memory.initialize()
@@ -929,7 +1019,7 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                         tool_name = tool_call["tool_name"]
                         tool_args = tool_call["parameters"]
                         
-                        print(f"  🔧 Executing: {tool_name}({', '.join(f'{k}={str(v)[:30]}' for k, v in tool_args.items()) if tool_args else ''})")
+                        print(f"\033[92m  🔧 Executing: {tool_name}({', '.join(f'{k}={str(v)[:30]}' for k, v in tool_args.items()) if tool_args else ''})\033[0m")
                         
                         # Check if it's a built-in tool first, then MCP tool
                         # NOTE: mcp_list_servers / mcp_restart_* are built-in tools despite the mcp_ prefix
@@ -944,6 +1034,12 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                             tool_result = await self.tools.execute_tool(tool_name, tool_args)
                         else:
                             tool_result = json.dumps({"error": "No tool manager available"})
+                        
+                        # Print tool result in cyan
+                        result_preview = str(tool_result)
+                        if len(result_preview) > 500:
+                            result_preview = result_preview[:500] + "... [truncated]"
+                        print(f"\033[96m  📤 Result: {result_preview}\033[0m")
                         
                         # --- Store tool result in vector memory ---
                         if self.memory_available and self.vector_memory:
@@ -1081,10 +1177,24 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
             print("🕐 Time/Date | 🔍 Web Search | 📁 Files | 🌐 Browser | 💻 Commands")
         print("\nCommands: help, clear, quit, agent")
         print("-"*60)
-        
+
+        # Use prompt_toolkit for rich input: arrow keys, history recall (↑), no length limit
+        try:
+            from prompt_toolkit import PromptSession
+            from prompt_toolkit.history import FileHistory
+            session = PromptSession(history=FileHistory(".chat_history"))
+        except ImportError:
+            session = None
+
         while True:
             try:
-                user_input = input("\n👤 You: ").strip()
+                if session:
+                    user_input = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: session.prompt("\n👤 You: ")
+                    )
+                else:
+                    user_input = input("\n👤 You: ")
+                user_input = user_input.strip()
                 if not user_input:
                     continue
                 
