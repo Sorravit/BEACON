@@ -22,8 +22,8 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, module="authlib")
 warnings.filterwarnings("ignore", message=".*authlib.jose.*")
 
 from openai import OpenAI
-from lib.mcp_client import MCPManager
-from lib.vector_memory import VectorMemory
+from core.mcp_client import MCPManager
+from core.vector_memory import VectorMemory
 
 # ============================================================================
 # CONFIGURATION CONSTANTS - Modify these to customize behavior
