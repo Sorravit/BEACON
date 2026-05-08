@@ -7,3 +7,7 @@ prompt_toolkit>=3.0.0
 weaviate-client>=4.5.0
 packaging>=24.0
 sentence-transformers>=3.0.0
+# Web application
+fastapi>=0.111.0
+uvicorn>=0.29.0
+python-multipart>=0.0.9

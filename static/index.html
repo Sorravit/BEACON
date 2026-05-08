@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>AI Assistant</title>
+<link rel="stylesheet" href="/static/style.css"/>
+</head>
+<body>
+<div class="app">
+
+  <!-- Header -->
+  <header>
+    <div class="header-left">
+      <div class="logo">🤖</div>
+      <div>
+        <div class="title">AI Assistant</div>
+        <div class="subtitle">Powered by IBM ICA · v4.2</div>
+      </div>
+    </div>
+    <div class="header-right">
+      <button class="btn-icon" onclick="clearChat()" title="Clear conversation">
+        🗑 Clear
+      </button>
+    </div>
+  </header>
+
+  <!-- Status bar -->
+  <div class="status-bar">
+    <div class="status-dot" id="status-dot"></div>
+    <span id="status-text">Initialising…</span>
+  </div>
+
+  <!-- Messages -->
+  <div class="messages" id="messages">
+    <div class="empty-state" id="empty-state">
+      <div class="empty-icon">🤖</div>
+      <div class="empty-title">AI Assistant</div>
+      <div class="empty-subtitle">Ask me anything — I can search the web, run commands, read files, and more.</div>
+      <div class="suggestions">
+        <span class="suggestion-chip" onclick="useSuggestion('What time is it?')">🕐 What time is it?</span>
+        <span class="suggestion-chip" onclick="useSuggestion('List files in current directory')">📁 List files</span>
+        <span class="suggestion-chip" onclick="useSuggestion('Search for latest AI news')">🔍 Latest AI news</span>
+        <span class="suggestion-chip" onclick="useSuggestion('What is my IP address?')">🌐 My IP address</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Input area -->
+  <div class="input-area">
+    <div class="input-row">
+      <div class="input-wrap">
+        <textarea
+          id="user-input"
+          placeholder="Ask me anything… (Enter to send, Shift+Enter for new line)"
+          rows="1"
+        ></textarea>
+      </div>
+      <button class="send-btn" id="send-btn" title="Send">➤</button>
+    </div>
+    <div class="input-hint">Enter to send · Shift+Enter for new line · Tools: web search, files, commands, browser</div>
+  </div>
+
+</div>
+
+<!-- Toast notification -->
+<div class="toast" id="toast"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
