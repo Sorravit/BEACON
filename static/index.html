@@ -19,6 +19,10 @@
       </div>
     </div>
     <div class="header-right">
+      <button class="btn-icon tasks-btn" id="tasks-btn" onclick="openTasksPanel()" title="Background tasks">
+        ⚙ Tasks
+        <span class="badge" id="tasks-badge"></span>
+      </button>
       <button class="btn-icon" onclick="clearChat()" title="Clear conversation">
         🗑 Clear
       </button>
@@ -65,6 +69,29 @@
 
 <!-- Toast notification -->
 <div class="toast" id="toast"></div>
+
+<!-- Background Tasks overlay + panel -->
+<div class="tasks-overlay" id="tasks-overlay" onclick="closeTasksPanel()"></div>
+<div class="tasks-panel" id="tasks-panel">
+  <div class="resize-handle resize-n"  data-dir="n"></div>
+  <div class="resize-handle resize-s"  data-dir="s"></div>
+  <div class="resize-handle resize-e"  data-dir="e"></div>
+  <div class="resize-handle resize-w"  data-dir="w"></div>
+  <div class="resize-handle resize-ne" data-dir="ne"></div>
+  <div class="resize-handle resize-nw" data-dir="nw"></div>
+  <div class="resize-handle resize-se" data-dir="se"></div>
+  <div class="resize-handle resize-sw" data-dir="sw"></div>
+  <div class="tasks-panel-header">
+    <div class="tasks-panel-title">
+      ⚙ Background Tasks
+      <span class="tasks-badge" id="tasks-count">0</span>
+    </div>
+    <button class="tasks-close" onclick="closeTasksPanel()">✕</button>
+  </div>
+  <div class="tasks-list" id="tasks-list">
+    <div class="tasks-empty" id="tasks-empty">No background tasks running</div>
+  </div>
+</div>
 
 <script src="/static/app.js"></script>
 </body>

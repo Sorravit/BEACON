@@ -65,3 +65,5 @@ htmlcov/
 .playwright-mcp
 
 output/
+
+.chat_history
