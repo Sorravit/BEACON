@@ -1,7 +1,11 @@
+
 #!/usr/bin/env python3
 """
 AI Assistant - Web Application
 Serves a chat UI and exposes the AIAgent via FastAPI + SSE streaming.
+
+Multi-session support: each session has its own AIAgent conversation history,
+persisted to sessions/<id>.json so history survives server restarts.
 """
 
 import asyncio
@@ -9,11 +13,13 @@ import glob
 import json
 import logging
 import os
-import signal
+import re
 import subprocess
 import sys
+import uuid
+from datetime import datetime
 from pathlib import Path
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator, Dict, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -26,43 +32,145 @@ from main import AIAgent, Config
 logger = logging.getLogger(__name__)
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
-app = FastAPI(title="AI Assistant", version="4.2.0")
+app = FastAPI(title="AI Assistant", version="4.3.0")
 
 static_dir = Path("static")
 static_dir.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# ── Global agent ─────────────────────────────────────────────────────────────
-_agent: Optional[AIAgent] = None
+SESSIONS_DIR = Path("sessions")
+SESSIONS_DIR.mkdir(exist_ok=True)
+
+# ── Global config + shared agent ─────────────────────────────────────────────
+_config: Optional[Config] = None
+_shared_agent: Optional[AIAgent] = None   # single pre-warmed agent, shared across sessions
+
+# ── Session store ─────────────────────────────────────────────────────────────
+# session_id -> { title, created_at, updated_at, messages }
+# Each session stores its own conversation history; _shared_agent is loaded with
+# the active session's history before each call.
+_sessions: Dict[str, dict] = {}
 
 
+def _session_file(session_id: str) -> Path:
+    return SESSIONS_DIR / f"{session_id}.json"
+
+
+def _save_session(session_id: str):
+    s = _sessions.get(session_id)
+    if not s:
+        return
+    data = {
+        "id":         session_id,
+        "title":      s["title"],
+        "created_at": s["created_at"],
+        "updated_at": s["updated_at"],
+        "messages":   s["messages"],
+    }
+    try:
+        _session_file(session_id).write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    except Exception as e:
+        logger.warning(f"Could not save session {session_id}: {e}")
+
+
+def _load_all_sessions():
+    for f in sorted(SESSIONS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime):
+        try:
+            data = json.loads(f.read_text())
+            sid = data["id"]
+            _sessions[sid] = {
+                "title":      data.get("title", "New Chat"),
+                "created_at": data.get("created_at", datetime.now().isoformat()),
+                "updated_at": data.get("updated_at", datetime.now().isoformat()),
+                "messages":   data.get("messages", []),
+            }
+        except Exception as e:
+            logger.warning(f"Could not load session file {f}: {e}")
+
+
+async def _prepare_agent_for_session(session_id: str) -> Optional[AIAgent]:
+    """
+    Load the shared agent with the stored conversation history for session_id.
+    Returns the shared agent, or None if not available.
+    """
+    if _shared_agent is None:
+        return None
+    s = _sessions.get(session_id)
+    if s is None:
+        return None
+
+    # Reset agent conversation to just the system message, then replay this session's history
+    agent = _shared_agent
+    # Keep only the system message (first message)
+    if agent.conversation and agent.conversation[0]["role"] == "system":
+        agent.conversation = [agent.conversation[0]]
+    else:
+        agent.conversation = []
+
+    # Replay stored conversation for this session
+    for msg in s["messages"]:
+        role = msg.get("role")
+        content = msg.get("content", "")
+        if role in ("user", "assistant"):
+            agent.conversation.append({"role": role, "content": content})
+
+    return agent
+
+
+def _create_session() -> str:
+    sid = str(uuid.uuid4())
+    now = datetime.now().isoformat()
+    _sessions[sid] = {
+        "title":      "New Chat",
+        "created_at": now,
+        "updated_at": now,
+        "messages":   [],
+    }
+    _save_session(sid)
+    return sid
+
+
+def _auto_title(text: str) -> str:
+    clean = re.sub(r'\s+', ' ', text).strip()
+    return (clean[:48] + "\u2026") if len(clean) > 48 else clean
+
+
+# ── Startup / shutdown ────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup_event():
-    global _agent
-    config = Config()
-    if not config.validate():
-        logger.error("❌ API key not configured — set OPENAI_API_KEY in .env")
+    global _config, _shared_agent
+    _config = Config()
+    if not _config.validate():
+        logger.error("API key not configured - set OPENAI_API_KEY in .env")
         sys.exit(1)
-    _agent = AIAgent(config)
-    ok = await _agent.initialize()
+    # Initialize the single shared agent at startup (like the original code)
+    _shared_agent = AIAgent(_config)
+    ok = await _shared_agent.initialize()
     if not ok:
-        logger.error("❌ Failed to initialize AI agent")
+        logger.error("Failed to initialize AI agent")
         sys.exit(1)
-    logger.info("✅ AI Agent ready")
+    logger.info("AI Agent ready")
+    _load_all_sessions()
+    logger.info(f"Loaded {len(_sessions)} session(s) from disk")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global _agent
-    if _agent and _agent.tools:
-        await _agent.tools.cleanup()
-    if _agent and _agent.vector_memory:
-        _agent.vector_memory.close()
+    if _shared_agent:
+        if _shared_agent.tools:
+            await _shared_agent.tools.cleanup()
+        if _shared_agent.vector_memory:
+            _shared_agent.vector_memory.close()
 
 
 # ── Request models ────────────────────────────────────────────────────────────
 class ChatRequest(BaseModel):
     message: str
+    session_id: str
+
+
+class RenameRequest(BaseModel):
+    title: str
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -71,63 +179,111 @@ async def index():
     html_file = Path("static/index.html")
     if html_file.exists():
         return HTMLResponse(content=html_file.read_text(), status_code=200)
-    return HTMLResponse(content="<h1>Frontend not found — static/index.html missing</h1>", status_code=404)
+    return HTMLResponse(content="<h1>Frontend not found</h1>", status_code=404)
+
+
+# ── Session endpoints ─────────────────────────────────────────────────────────
+@app.get("/sessions")
+async def list_sessions():
+    result = []
+    for sid, s in _sessions.items():
+        result.append({
+            "id":            sid,
+            "title":         s["title"],
+            "created_at":    s["created_at"],
+            "updated_at":    s["updated_at"],
+            "message_count": len(s["messages"]),
+        })
+    result.sort(key=lambda x: x["updated_at"], reverse=True)
+    return {"sessions": result}
+
+
+@app.post("/sessions")
+async def create_session():
+    sid = _create_session()
+    return {"id": sid, "title": "New Chat"}
+
+
+@app.get("/sessions/{session_id}")
+async def get_session(session_id: str):
+    s = _sessions.get(session_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {
+        "id":         session_id,
+        "title":      s["title"],
+        "created_at": s["created_at"],
+        "updated_at": s["updated_at"],
+        "messages":   s["messages"],
+    }
+
+
+@app.patch("/sessions/{session_id}/rename")
+async def rename_session(session_id: str, req: RenameRequest):
+    s = _sessions.get(session_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Session not found")
+    s["title"] = req.title.strip() or "New Chat"
+    s["updated_at"] = datetime.now().isoformat()
+    _save_session(session_id)
+    return {"id": session_id, "title": s["title"]}
+
+
+@app.delete("/sessions/{session_id}")
+async def delete_session(session_id: str):
+    s = _sessions.pop(session_id, None)
+    if not s:
+        raise HTTPException(status_code=404, detail="Session not found")
+    fp = _session_file(session_id)
+    if fp.exists():
+        fp.unlink()
+    return {"status": "deleted", "id": session_id}
 
 
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
-    """
-    Stream agent responses via Server-Sent Events.
-
-    SSE event types:
-      {"type": "tool",   "name": "...", "args": "..."}   — tool is being called
-      {"type": "result", "name": "...", "content": "..."}  — tool result preview
-      {"type": "token",  "content": "..."}                 — response text chunk
-      {"type": "done"}                                      — stream finished
-      {"type": "error",  "content": "..."}                 — error occurred
-    """
-    if not _agent:
+    sid = req.session_id
+    if sid not in _sessions:
         async def err_gen():
-            yield " " + json.dumps({"type": "error", "content": "Agent not initialised"}) + "\n\n"
+            yield " " + json.dumps({"type": "error", "content": "Session not found"}) + "\n\n"
         return StreamingResponse(err_gen(), media_type="text/event-stream")
-
+    agent = await _prepare_agent_for_session(sid)
+    if not agent:
+        async def err_gen2():
+            yield " " + json.dumps({"type": "error", "content": "Agent not initialised"}) + "\n\n"
+        return StreamingResponse(err_gen2(), media_type="text/event-stream")
     return StreamingResponse(
-        _stream_response(req.message),
+        _stream_response(req.message, sid, agent),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
 @app.post("/chat/clear")
-async def chat_clear():
-    """Clear conversation history."""
-    if _agent:
-        _agent.clear()
-    return {"status": "cleared"}
+async def chat_clear(req: ChatRequest):
+    sid = req.session_id
+    s = _sessions.get(sid)
+    if s:
+        s["messages"] = []
+        s["updated_at"] = datetime.now().isoformat()
+        _save_session(sid)
+    return {"status": "cleared", "session_id": sid}
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "agent_ready": _agent is not None}
+    return {"status": "ok", "sessions": len(_sessions)}
 
-
-# ── Background task endpoints ─────────────────────────────────────────────────
 
 @app.get("/tasks")
 async def list_tasks():
-    """
-    List all background tasks.
-    Shows tasks that have a lock file OR a log file so stopped tasks remain visible.
-    """
-    # Collect names from lock files AND log files
     names = set()
     for lf in glob.glob("/tmp/bg_task_*.lock"):
         names.add(Path(lf).stem.replace("bg_task_", ""))
     os.makedirs("logs", exist_ok=True)
     for lf in glob.glob("logs/bg_*.log"):
-        name = Path(lf).stem[3:]  # strip "bg_" prefix
+        name = Path(lf).stem[3:]
         names.add(name)
-
     tasks = []
     for name in sorted(names):
         check = subprocess.run(
@@ -146,18 +302,11 @@ async def list_tasks():
 
 
 def _kill_task(name: str) -> str:
-    """Kill all processes related to a background task by name using pkill."""
     try:
-        # Kill the background_task runner and any child using the task name as pattern
         result = subprocess.run(
-            ["pkill", "-f", f"background_task.*--name.*{name}"],
-            capture_output=True
+            ["pkill", "-f", f"background_task.*--name.*{name}"], capture_output=True
         )
-        # Also try killing by lock file pattern
-        subprocess.run(
-            ["pkill", "-f", f"bg_task_{name}"],
-            capture_output=True
-        )
+        subprocess.run(["pkill", "-f", f"bg_task_{name}"], capture_output=True)
         return "stopped" if result.returncode == 0 else "already_stopped"
     except Exception as e:
         return f"error: {e}"
@@ -165,28 +314,19 @@ def _kill_task(name: str) -> str:
 
 @app.post("/tasks/{name}/stop")
 async def stop_task(name: str):
-    """Stop a running background task. Keeps BOTH the lock file and the log so the task stays visible."""
-    status = _kill_task(name)
-    return {"status": status, "name": name}
+    return {"status": _kill_task(name), "name": name}
 
 
 @app.delete("/tasks/{name}/log")
 async def clear_task_log(name: str):
-    """
-    Delete the log file for a task.
-    If the task is not running, also removes the lock file so it disappears from the panel.
-    """
     log_file = Path(f"logs/bg_{name}.log")
     if not log_file.exists():
         return {"status": "not_found", "name": name}
     log_file.unlink()
-    # Check if task is still running
     check = subprocess.run(
-        ["pgrep", "-f", f"background_task.*--name.*{name}"],
-        capture_output=True
+        ["pgrep", "-f", f"background_task.*--name.*{name}"], capture_output=True
     )
     if check.returncode != 0:
-        # Task is not running — also remove the lock file so it leaves the panel
         lockfile = f"/tmp/bg_task_{name}.lock"
         try:
             if os.path.exists(lockfile):
@@ -198,7 +338,6 @@ async def clear_task_log(name: str):
 
 @app.post("/tasks/{name}/stop-and-clear")
 async def stop_and_clear_task(name: str):
-    """Stop the task AND delete its log file."""
     lockfile = f"/tmp/bg_task_{name}.lock"
     log_file = Path(f"logs/bg_{name}.log")
     status = _kill_task(name)
@@ -217,16 +356,9 @@ async def stop_and_clear_task(name: str):
 
 @app.get("/tasks/{name}/logs")
 async def stream_task_logs(name: str):
-    """
-    Stream the log file of a background task via SSE.
-    Sends existing content first, then tails for new lines.
-    Each event: data: {"line": "...", "done": false}
-    Final event when task ends:  {"line": "", "done": true}
-    """
     log_file = f"logs/bg_{name}.log"
     if not Path(log_file).exists():
         raise HTTPException(status_code=404, detail=f"Log file for task '{name}' not found")
-
     return StreamingResponse(
         _tail_log(name, log_file),
         media_type="text/event-stream",
@@ -235,41 +367,34 @@ async def stream_task_logs(name: str):
 
 
 async def _tail_log(name: str, log_file: str) -> AsyncGenerator[str, None]:
-    """Yield SSE events from a log file, tailing for new content."""
     try:
-        # Send all existing content first
         with open(log_file, "r", errors="replace") as f:
             existing = f.read()
         for line in existing.splitlines():
             yield " " + json.dumps({"line": line, "done": False}) + "\n\n"
-
-        # Now tail for new lines
         with open(log_file, "r", errors="replace") as f:
-            f.seek(0, 2)  # seek to end
+            f.seek(0, 2)
             while True:
                 lockfile = f"/tmp/bg_task_{name}.lock"
                 line = f.readline()
                 if line:
                     yield " " + json.dumps({"line": line.rstrip(), "done": False}) + "\n\n"
                 else:
-                    # Check if task is still running
                     if not os.path.exists(lockfile):
-                        yield "data: " + json.dumps({"line": "", "done": True}) + "\n\n"
+                        yield " " + json.dumps({"line": "", "done": True}) + "\n\n"
                         break
                     await asyncio.sleep(0.5)
     except Exception as e:
         yield " " + json.dumps({"line": f"[error reading log: {e}]", "done": True}) + "\n\n"
 
 
-# ── SSE streaming helper ──────────────────────────────────────────────────────
-async def _stream_response(user_input: str) -> AsyncGenerator[str, None]:
-    """Run the agent and yield SSE events."""
+async def _stream_response(user_input: str, session_id: str, agent: AIAgent) -> AsyncGenerator[str, None]:
+    s = _sessions.get(session_id)
     try:
         queue: asyncio.Queue = asyncio.Queue()
 
         async def run_agent():
-            original_execute = _agent.tools.execute_tool if _agent.tools else None
-
+            original_execute = agent.tools.execute_tool if agent.tools else None
             if original_execute:
                 async def instrumented_execute(name, args):
                     args_preview = ", ".join(
@@ -279,20 +404,17 @@ async def _stream_response(user_input: str) -> AsyncGenerator[str, None]:
                     result = await original_execute(name, args)
                     preview = str(result)
                     if len(preview) > 400:
-                        preview = preview[:400] + "…"
+                        preview = preview[:400] + "\u2026"
                     await queue.put({"type": "result", "name": name, "content": preview})
                     return result
-
-                _agent.tools.execute_tool = instrumented_execute
-
+                agent.tools.execute_tool = instrumented_execute
             try:
-                response = await _agent.get_response(user_input)
+                response = await agent.get_response(user_input)
             finally:
-                if original_execute and _agent.tools:
-                    _agent.tools.execute_tool = original_execute
-
+                if original_execute and agent.tools:
+                    agent.tools.execute_tool = original_execute
             await queue.put({"type": "__response__", "content": response or ""})
-            await queue.put(None)  # sentinel
+            await queue.put(None)
 
         task = asyncio.create_task(run_agent())
 
@@ -300,22 +422,29 @@ async def _stream_response(user_input: str) -> AsyncGenerator[str, None]:
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=180.0)
             except asyncio.TimeoutError:
-                yield "data: " + json.dumps({"type": "error", "content": "Response timed out after 3 minutes"}) + "\n\n"
-                break
-
+                yield ": keepalive\n\n"
+                continue
             if event is None:
                 break
-
             if event.get("type") == "__response__":
                 content = event.get("content", "")
-                # Stream text word-by-word for a typing effect
                 words = content.split(" ")
                 for i, word in enumerate(words):
                     chunk = word + (" " if i < len(words) - 1 else "")
                     yield " " + json.dumps({"type": "token", "content": chunk}) + "\n\n"
                     await asyncio.sleep(0.008)
+                # Persist both user and assistant messages after response
+                if s is not None:
+                    now = datetime.now().isoformat()
+                    s["messages"].append({"role": "user", "content": user_input, "ts": now})
+                    s["messages"].append({"role": "assistant", "content": content, "ts": now})
+                    if len([m for m in s["messages"] if m["role"] == "user"]) == 1:
+                        s["title"] = _auto_title(user_input)
+                    s["updated_at"] = now
+                    _save_session(session_id)
             else:
                 yield " " + json.dumps(event) + "\n\n"
+                await asyncio.sleep(0)
 
         await task
         yield " " + json.dumps({"type": "done"}) + "\n\n"
@@ -324,10 +453,9 @@ async def _stream_response(user_input: str) -> AsyncGenerator[str, None]:
         logger.error(f"Stream error: {e}")
         import traceback
         traceback.print_exc()
-        yield "data: " + json.dumps({"type": "error", "content": str(e)}) + "\n\n"
+        yield " " + json.dumps({"type": "error", "content": str(e)}) + "\n\n"
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     uvicorn.run(
         "web_app:app",

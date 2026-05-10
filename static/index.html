@@ -7,67 +7,86 @@
 <link rel="stylesheet" href="/static/style.css"/>
 </head>
 <body>
-<div class="app">
+<div class="layout">
 
-  <!-- Header -->
-  <header>
-    <div class="header-left">
-      <div class="logo">🤖</div>
-      <div>
-        <div class="title">AI Assistant</div>
-        <div class="subtitle">Powered by IBM ICA · v4.2</div>
+  <!-- ── Sidebar ─────────────────────────────────────────────── -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <div class="sidebar-logo">🤖</div>
+      <span class="sidebar-title">AI Assistant</span>
+      <button class="sidebar-toggle" id="sidebar-toggle" title="Collapse sidebar">◀</button>
+    </div>
+
+    <button class="new-chat-btn" id="new-chat-btn" onclick="newChat()">
+      <span class="new-chat-icon">✚</span>
+      <span class="new-chat-label">New Chat</span>
+    </button>
+
+    <div class="sessions-list" id="sessions-list">
+      <!-- populated by JS -->
+    </div>
+  </aside>
+
+  <!-- ── Main area ───────────────────────────────────────────── -->
+  <div class="app" id="app">
+
+    <header>
+      <div class="header-left">
+        <button class="sidebar-open-btn" id="sidebar-open-btn" onclick="openSidebar()" title="Open sidebar" style="display:none">☰</button>
+        <div class="logo">🤖</div>
+        <div>
+          <div class="title" id="chat-title">AI Assistant</div>
+          <div class="subtitle">Powered by IBM ICA · v4.3</div>
+        </div>
+      </div>
+      <div class="header-right">
+        <button class="btn-icon tasks-btn" id="tasks-btn" onclick="openTasksPanel()" title="Background tasks">
+          ⚙ Tasks
+          <span class="badge" id="tasks-badge"></span>
+        </button>
+        <button class="btn-icon" onclick="clearChat()" title="Clear conversation">
+          🗑 Clear
+        </button>
+      </div>
+    </header>
+
+    <div class="status-bar">
+      <div class="status-dot" id="status-dot"></div>
+      <span id="status-text">Initialising…</span>
+    </div>
+
+    <div class="messages" id="messages">
+      <div class="empty-state" id="empty-state">
+        <div class="empty-icon">🤖</div>
+        <div class="empty-title">AI Assistant</div>
+        <div class="empty-subtitle">Ask me anything — I can search the web, run commands, read files, and more.</div>
+        <div class="suggestions">
+          <span class="suggestion-chip" onclick="useSuggestion('What time is it?')">🕐 What time is it?</span>
+          <span class="suggestion-chip" onclick="useSuggestion('List files in current directory')">📁 List files</span>
+          <span class="suggestion-chip" onclick="useSuggestion('Search for latest AI news')">🔍 Latest AI news</span>
+          <span class="suggestion-chip" onclick="useSuggestion('What is my IP address?')">🌐 My IP address</span>
+        </div>
       </div>
     </div>
-    <div class="header-right">
-      <button class="btn-icon tasks-btn" id="tasks-btn" onclick="openTasksPanel()" title="Background tasks">
-        ⚙ Tasks
-        <span class="badge" id="tasks-badge"></span>
-      </button>
-      <button class="btn-icon" onclick="clearChat()" title="Clear conversation">
-        🗑 Clear
-      </button>
-    </div>
-  </header>
 
-  <!-- Status bar -->
-  <div class="status-bar">
-    <div class="status-dot" id="status-dot"></div>
-    <span id="status-text">Initialising…</span>
-  </div>
-
-  <!-- Messages -->
-  <div class="messages" id="messages">
-    <div class="empty-state" id="empty-state">
-      <div class="empty-icon">🤖</div>
-      <div class="empty-title">AI Assistant</div>
-      <div class="empty-subtitle">Ask me anything — I can search the web, run commands, read files, and more.</div>
-      <div class="suggestions">
-        <span class="suggestion-chip" onclick="useSuggestion('What time is it?')">🕐 What time is it?</span>
-        <span class="suggestion-chip" onclick="useSuggestion('List files in current directory')">📁 List files</span>
-        <span class="suggestion-chip" onclick="useSuggestion('Search for latest AI news')">🔍 Latest AI news</span>
-        <span class="suggestion-chip" onclick="useSuggestion('What is my IP address?')">🌐 My IP address</span>
+    <div class="input-area">
+      <div class="input-row">
+        <div class="input-wrap">
+          <textarea
+            id="user-input"
+            placeholder="Ask me anything… (Enter to send, Shift+Enter for new line)"
+            rows="1"
+          ></textarea>
+        </div>
+        <button class="send-btn" id="send-btn" title="Send">➤</button>
       </div>
+      <div class="input-hint">Enter to send · Shift+Enter for new line · Tools: web search, files, commands, browser</div>
     </div>
-  </div>
 
-  <!-- Input area -->
-  <div class="input-area">
-    <div class="input-row">
-      <div class="input-wrap">
-        <textarea
-          id="user-input"
-          placeholder="Ask me anything… (Enter to send, Shift+Enter for new line)"
-          rows="1"
-        ></textarea>
-      </div>
-      <button class="send-btn" id="send-btn" title="Send">➤</button>
-    </div>
-    <div class="input-hint">Enter to send · Shift+Enter for new line · Tools: web search, files, commands, browser</div>
-  </div>
+  </div><!-- /.app -->
+</div><!-- /.layout -->
 
-</div>
-
-<!-- Toast notification -->
+<!-- Toast -->
 <div class="toast" id="toast"></div>
 
 <!-- Background Tasks overlay + panel -->
@@ -90,6 +109,17 @@
   </div>
   <div class="tasks-list" id="tasks-list">
     <div class="tasks-empty" id="tasks-empty">No background tasks running</div>
+  </div>
+</div>
+
+<!-- Session rename modal -->
+<div class="modal-overlay" id="rename-overlay" onclick="closeRenameModal()"></div>
+<div class="modal" id="rename-modal">
+  <div class="modal-title">Rename Chat</div>
+  <input class="modal-input" id="rename-input" type="text" placeholder="Chat title…" maxlength="80"/>
+  <div class="modal-btns">
+    <button class="modal-btn cancel" onclick="closeRenameModal()">Cancel</button>
+    <button class="modal-btn confirm" onclick="confirmRename()">Rename</button>
   </div>
 </div>
 
