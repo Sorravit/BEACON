@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 AI Assistant - Web Application
@@ -6,6 +5,11 @@ Serves a chat UI and exposes the AIAgent via FastAPI + SSE streaming.
 
 Multi-session support: each session has its own AIAgent conversation history,
 persisted to sessions/<id>.json so history survives server restarts.
+
+Background-task architecture: the agent task is decoupled from the HTTP
+connection lifetime.  When a client disconnects (refresh/close), the agent
+keeps running.  On reconnect, the client replays the buffered event log and
+then tails live events.
 """
 
 import asyncio
@@ -19,10 +23,10 @@ import sys
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import AsyncGenerator, Dict, Optional
+from typing import AsyncGenerator, Dict, List, Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -32,7 +36,7 @@ from main import AIAgent, Config
 logger = logging.getLogger(__name__)
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
-app = FastAPI(title="AI Assistant", version="4.3.0")
+app = FastAPI(title="AI Assistant", version="4.4.0")
 
 static_dir = Path("static")
 static_dir.mkdir(exist_ok=True)
@@ -43,13 +47,27 @@ SESSIONS_DIR.mkdir(exist_ok=True)
 
 # ── Global config + shared agent ─────────────────────────────────────────────
 _config: Optional[Config] = None
-_shared_agent: Optional[AIAgent] = None   # single pre-warmed agent, shared across sessions
+_shared_agent: Optional[AIAgent] = None
 
 # ── Session store ─────────────────────────────────────────────────────────────
-# session_id -> { title, created_at, updated_at, messages }
-# Each session stores its own conversation history; _shared_agent is loaded with
-# the active session's history before each call.
 _sessions: Dict[str, dict] = {}
+
+# ── Per-session background state ─────────────────────────────────────────────
+_bg: Dict[str, dict] = {}
+
+# Global agent lock – only one request may use _shared_agent at a time
+_agent_lock: Optional[asyncio.Lock] = None
+
+
+def _bg_state(session_id: str) -> dict:
+    if session_id not in _bg:
+        _bg[session_id] = {
+            "task":       None,
+            "event_buf":  [],
+            "done_event": asyncio.Event(),
+            "activity":   "",
+        }
+    return _bg[session_id]
 
 
 def _session_file(session_id: str) -> Path:
@@ -89,31 +107,21 @@ def _load_all_sessions():
 
 
 async def _prepare_agent_for_session(session_id: str) -> Optional[AIAgent]:
-    """
-    Load the shared agent with the stored conversation history for session_id.
-    Returns the shared agent, or None if not available.
-    """
     if _shared_agent is None:
         return None
     s = _sessions.get(session_id)
     if s is None:
         return None
-
-    # Reset agent conversation to just the system message, then replay this session's history
     agent = _shared_agent
-    # Keep only the system message (first message)
     if agent.conversation and agent.conversation[0]["role"] == "system":
         agent.conversation = [agent.conversation[0]]
     else:
         agent.conversation = []
-
-    # Replay stored conversation for this session
     for msg in s["messages"]:
         role = msg.get("role")
         content = msg.get("content", "")
         if role in ("user", "assistant"):
             agent.conversation.append({"role": role, "content": content})
-
     return agent
 
 
@@ -131,19 +139,18 @@ def _create_session() -> str:
 
 
 def _auto_title(text: str) -> str:
-    clean = re.sub(r'\s+', ' ', text).strip()
+    clean = re.sub(r"\s+", " ", text).strip()
     return (clean[:48] + "\u2026") if len(clean) > 48 else clean
 
 
-# ── Startup / shutdown ────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup_event():
-    global _config, _shared_agent
+    global _config, _shared_agent, _agent_lock
+    _agent_lock = asyncio.Lock()
     _config = Config()
     if not _config.validate():
         logger.error("API key not configured - set OPENAI_API_KEY in .env")
         sys.exit(1)
-    # Initialize the single shared agent at startup (like the original code)
     _shared_agent = AIAgent(_config)
     ok = await _shared_agent.initialize()
     if not ok:
@@ -163,7 +170,6 @@ async def shutdown_event():
             _shared_agent.vector_memory.close()
 
 
-# ── Request models ────────────────────────────────────────────────────────────
 class ChatRequest(BaseModel):
     message: str
     session_id: str
@@ -171,6 +177,35 @@ class ChatRequest(BaseModel):
 
 class RenameRequest(BaseModel):
     title: str
+
+
+# ── File upload ────────────────────────────────────────────────────────────────
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    """Upload a file and save it to temp/ folder. Returns the saved path."""
+    import shutil
+
+    dest_dir = Path("temp")
+    dest_dir.mkdir(exist_ok=True)
+
+    # Sanitise filename — strip directory, replace spaces
+    safe_name = Path(file.filename).name.replace(" ", "_")
+    if not safe_name:
+        safe_name = "upload"
+    dest = dest_dir / safe_name
+
+    # Avoid overwriting existing files
+    stem = Path(safe_name).stem
+    suffix = Path(safe_name).suffix
+    counter = 1
+    while dest.exists():
+        dest = dest_dir / f"{stem}_{counter}{suffix}"
+        counter += 1
+
+    contents = await file.read()
+    dest.write_bytes(contents)
+
+    return {"path": str(dest), "name": dest.name, "size": dest.stat().st_size}
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -182,17 +217,20 @@ async def index():
     return HTMLResponse(content="<h1>Frontend not found</h1>", status_code=404)
 
 
-# ── Session endpoints ─────────────────────────────────────────────────────────
 @app.get("/sessions")
 async def list_sessions():
     result = []
     for sid, s in _sessions.items():
+        bg = _bg.get(sid, {})
+        task = bg.get("task")
+        running = task is not None and not task.done()
         result.append({
             "id":            sid,
             "title":         s["title"],
             "created_at":    s["created_at"],
             "updated_at":    s["updated_at"],
             "message_count": len(s["messages"]),
+            "running":       running,
         })
     result.sort(key=lambda x: x["updated_at"], reverse=True)
     return {"sessions": result}
@@ -209,12 +247,16 @@ async def get_session(session_id: str):
     s = _sessions.get(session_id)
     if not s:
         raise HTTPException(status_code=404, detail="Session not found")
+    bg = _bg.get(session_id, {})
+    task = bg.get("task")
+    running = task is not None and not task.done()
     return {
         "id":         session_id,
         "title":      s["title"],
         "created_at": s["created_at"],
         "updated_at": s["updated_at"],
         "messages":   s["messages"],
+        "running":    running,
     }
 
 
@@ -237,6 +279,7 @@ async def delete_session(session_id: str):
     fp = _session_file(session_id)
     if fp.exists():
         fp.unlink()
+    _bg.pop(session_id, None)
     return {"status": "deleted", "id": session_id}
 
 
@@ -247,16 +290,78 @@ async def chat_stream(req: ChatRequest):
         async def err_gen():
             yield " " + json.dumps({"type": "error", "content": "Session not found"}) + "\n\n"
         return StreamingResponse(err_gen(), media_type="text/event-stream")
+
+    bg = _bg_state(sid)
+    # If a task is already running for this session, just reconnect to it
+    if bg["task"] is not None and not bg["task"].done():
+        return StreamingResponse(
+            _reconnect_stream(sid),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
     agent = await _prepare_agent_for_session(sid)
     if not agent:
         async def err_gen2():
             yield " " + json.dumps({"type": "error", "content": "Agent not initialised"}) + "\n\n"
         return StreamingResponse(err_gen2(), media_type="text/event-stream")
+
+    # Reject if agent is busy with another session
+    if _agent_lock and _agent_lock.locked():
+        async def busy_gen():
+            yield " " + json.dumps({"type": "error", "content": "Agent is busy with another session. Please wait and try again."}) + "\n\n"
+        return StreamingResponse(busy_gen(), media_type="text/event-stream")
+
+    # Reset buffer for the new request
+    bg["event_buf"] = []
+    bg["done_event"] = asyncio.Event()
+    bg["activity"] = ""
+
+    # Start background task (NOT tied to this HTTP connection)
+    bg["task"] = asyncio.create_task(_run_agent_bg(req.message, sid, agent))
+
     return StreamingResponse(
-        _stream_response(req.message, sid, agent),
+        _reconnect_stream(sid),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.get("/chat/reconnect/{session_id}")
+async def chat_reconnect(session_id: str):
+    """Reconnect to an in-progress or recently finished agent stream."""
+    if session_id not in _sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return StreamingResponse(
+        _reconnect_stream(session_id),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/chat/stop/{session_id}")
+async def stop_chat(session_id: str):
+    bg = _bg.get(session_id)
+    if bg:
+        task = bg.get("task")
+        if task and not task.done():
+            task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+        bg["activity"] = ""
+        return {"status": "stopped", "session_id": session_id}
+    return {"status": "not_running", "session_id": session_id}
+
+
+@app.get("/chat/status/{session_id}")
+async def chat_status(session_id: str):
+    bg = _bg.get(session_id, {})
+    task = bg.get("task")
+    running = task is not None and not task.done()
+    activity = bg.get("activity", "") if running else ""
+    return {"running": running, "activity": activity, "session_id": session_id}
 
 
 @app.post("/chat/clear")
@@ -267,6 +372,7 @@ async def chat_clear(req: ChatRequest):
         s["messages"] = []
         s["updated_at"] = datetime.now().isoformat()
         _save_session(sid)
+    _bg.pop(sid, None)
     return {"status": "cleared", "session_id": sid}
 
 
@@ -275,6 +381,123 @@ async def health():
     return {"status": "ok", "sessions": len(_sessions)}
 
 
+# ── Background agent task ─────────────────────────────────────────────────────
+async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent):
+    """
+    Run the agent completely decoupled from any HTTP connection.
+    Holds _agent_lock for the entire duration so no other session can
+    corrupt the shared agent state concurrently.
+    """
+    bg = _bg_state(session_id)
+    s = _sessions.get(session_id)
+
+    def _emit(ev: dict):
+        bg["event_buf"].append(ev)
+
+    # Persist the user message immediately so it's visible even while AI is thinking
+    if s is not None:
+        now = datetime.now().isoformat()
+        # Avoid duplicate if already saved (e.g. reconnect scenario)
+        already_saved = any(
+            m.get("role") == "user" and m.get("content") == user_input
+            for m in s["messages"][-2:] if s["messages"]
+        )
+        if not already_saved:
+            s["messages"].append({"role": "user", "content": user_input, "ts": now})
+            if len([m for m in s["messages"] if m["role"] == "user"]) == 1:
+                s["title"] = _auto_title(user_input)
+            s["updated_at"] = now
+            _save_session(session_id)
+
+    try:
+        async with _agent_lock:
+            original_execute = agent.tools.execute_tool if agent.tools else None
+            if original_execute:
+                async def instrumented_execute(name, args):
+                    args_preview = ", ".join(
+                        f"{k}={str(v)[:50]}" for k, v in args.items()
+                    ) if args else ""
+                    bg["activity"] = f"{name}({args_preview})"
+                    _emit({"type": "tool", "name": name, "args": args_preview})
+                    result = await original_execute(name, args)
+                    preview = str(result)
+                    if len(preview) > 400:
+                        preview = preview[:400] + "\u2026"
+                    bg["activity"] = f"Processing result from {name}..."
+                    _emit({"type": "result", "name": name, "content": preview})
+                    return result
+                agent.tools.execute_tool = instrumented_execute
+
+            bg["activity"] = "Thinking..."
+            try:
+                response = await agent.get_response(user_input)
+            finally:
+                if original_execute and agent.tools:
+                    agent.tools.execute_tool = original_execute
+
+            bg["activity"] = "Responding..."
+            content = response or ""
+            words = content.split(" ")
+            for i, word in enumerate(words):
+                chunk = word + (" " if i < len(words) - 1 else "")
+                _emit({"type": "token", "content": chunk})
+                await asyncio.sleep(0.008)
+
+            if s is not None:
+                now = datetime.now().isoformat()
+                # Only append the assistant reply — user message was already saved above
+                s["messages"].append({"role": "assistant", "content": content, "ts": now})
+                s["updated_at"] = now
+                _save_session(session_id)
+
+            _emit({"type": "done"})
+
+    except asyncio.CancelledError:
+        _emit({"type": "stopped", "content": "Stopped by user"})
+        raise
+    except Exception as e:
+        logger.error(f"Agent BG error: {e}")
+        import traceback; traceback.print_exc()
+        _emit({"type": "error", "content": str(e)})
+    finally:
+        bg["activity"] = ""
+        bg["done_event"].set()
+
+
+async def _reconnect_stream(session_id: str) -> AsyncGenerator[str, None]:
+    """
+    Stream all buffered events then continue streaming live events until done.
+    Uses simple sleep-based polling so generator cancellation (client disconnect)
+    never propagates into the background agent task.
+    """
+    bg = _bg_state(session_id)
+    cursor = 0
+    idle_ticks = 0
+
+    while True:
+        buf = bg["event_buf"]
+        # Drain any new events since our cursor
+        new_events = False
+        while cursor < len(buf):
+            ev = buf[cursor]
+            cursor += 1
+            new_events = True
+            yield " " + json.dumps(ev) + "\n\n"
+
+        # If task is done and we've delivered everything, we're finished
+        task = bg.get("task")
+        is_done = (task is None or task.done()) and bg["done_event"].is_set()
+        if is_done and cursor >= len(bg["event_buf"]):
+            break
+
+        # Short sleep to avoid busy-looping; send periodic keepalives
+        await asyncio.sleep(0.25)
+        idle_ticks += 1
+        if idle_ticks % 8 == 0:   # every ~2 seconds
+            yield ": keepalive\n\n"
+
+
+# ── Background tasks (CLI processes) ─────────────────────────────────────────
 @app.get("/tasks")
 async def list_tasks():
     names = set()
@@ -302,14 +525,62 @@ async def list_tasks():
 
 
 def _kill_task(name: str) -> str:
-    try:
-        result = subprocess.run(
-            ["pkill", "-f", f"background_task.*--name.*{name}"], capture_output=True
-        )
-        subprocess.run(["pkill", "-f", f"bg_task_{name}"], capture_output=True)
-        return "stopped" if result.returncode == 0 else "already_stopped"
-    except Exception as e:
-        return f"error: {e}"
+    """
+    Stop a background CLI task by reading its PID from the lock file and
+    sending SIGTERM.  Falls back to pkill for any orphaned processes.
+    """
+    import signal as _signal
+    lockfile = f"/tmp/bg_task_{name}.lock"
+    killed = False
+
+    # Primary: kill via stored PID
+    if os.path.exists(lockfile):
+        try:
+            pid = int(Path(lockfile).read_text().strip())
+            os.kill(pid, _signal.SIGTERM)
+            killed = True
+        except (ValueError, ProcessLookupError, PermissionError):
+            pass
+        try:
+            os.remove(lockfile)
+        except Exception:
+            pass
+
+    # Fallback: pkill the wrapper script and any child process
+    r1 = subprocess.run(["pkill", "-f", f"background_task.*--name.*{name}"], capture_output=True)
+    r2 = subprocess.run(["pkill", "-TERM", "-f", f"bg_{name}"], capture_output=True)
+    if r1.returncode == 0 or r2.returncode == 0:
+        killed = True
+
+    return "stopped" if killed else "already_stopped"
+
+
+@app.post("/tasks/stop-all")
+async def stop_all_tasks():
+    """Stop and clear every background CLI task."""
+    names = set()
+    for lf in glob.glob("/tmp/bg_task_*.lock"):
+        names.add(Path(lf).stem.replace("bg_task_", ""))
+    os.makedirs("logs", exist_ok=True)
+    for lf in glob.glob("logs/bg_*.log"):
+        names.add(Path(lf).stem[3:])
+    results = {}
+    for name in names:
+        status = _kill_task(name)
+        lockfile = f"/tmp/bg_task_{name}.lock"
+        log_file = Path(f"logs/bg_{name}.log")
+        try:
+            if os.path.exists(lockfile):
+                os.remove(lockfile)
+        except Exception:
+            pass
+        try:
+            if log_file.exists():
+                log_file.unlink()
+        except Exception:
+            pass
+        results[name] = status
+    return {"status": "done", "tasks": results}
 
 
 @app.post("/tasks/{name}/stop")
@@ -358,7 +629,7 @@ async def stop_and_clear_task(name: str):
 async def stream_task_logs(name: str):
     log_file = f"logs/bg_{name}.log"
     if not Path(log_file).exists():
-        raise HTTPException(status_code=404, detail=f"Log file for task '{name}' not found")
+        raise HTTPException(status_code=404, detail=f"Log file for task not found")
     return StreamingResponse(
         _tail_log(name, log_file),
         media_type="text/event-stream",
@@ -386,74 +657,6 @@ async def _tail_log(name: str, log_file: str) -> AsyncGenerator[str, None]:
                     await asyncio.sleep(0.5)
     except Exception as e:
         yield " " + json.dumps({"line": f"[error reading log: {e}]", "done": True}) + "\n\n"
-
-
-async def _stream_response(user_input: str, session_id: str, agent: AIAgent) -> AsyncGenerator[str, None]:
-    s = _sessions.get(session_id)
-    try:
-        queue: asyncio.Queue = asyncio.Queue()
-
-        async def run_agent():
-            original_execute = agent.tools.execute_tool if agent.tools else None
-            if original_execute:
-                async def instrumented_execute(name, args):
-                    args_preview = ", ".join(
-                        f"{k}={str(v)[:50]}" for k, v in args.items()
-                    ) if args else ""
-                    await queue.put({"type": "tool", "name": name, "args": args_preview})
-                    result = await original_execute(name, args)
-                    preview = str(result)
-                    if len(preview) > 400:
-                        preview = preview[:400] + "\u2026"
-                    await queue.put({"type": "result", "name": name, "content": preview})
-                    return result
-                agent.tools.execute_tool = instrumented_execute
-            try:
-                response = await agent.get_response(user_input)
-            finally:
-                if original_execute and agent.tools:
-                    agent.tools.execute_tool = original_execute
-            await queue.put({"type": "__response__", "content": response or ""})
-            await queue.put(None)
-
-        task = asyncio.create_task(run_agent())
-
-        while True:
-            try:
-                event = await asyncio.wait_for(queue.get(), timeout=180.0)
-            except asyncio.TimeoutError:
-                yield ": keepalive\n\n"
-                continue
-            if event is None:
-                break
-            if event.get("type") == "__response__":
-                content = event.get("content", "")
-                words = content.split(" ")
-                for i, word in enumerate(words):
-                    chunk = word + (" " if i < len(words) - 1 else "")
-                    yield " " + json.dumps({"type": "token", "content": chunk}) + "\n\n"
-                    await asyncio.sleep(0.008)
-                # Persist both user and assistant messages after response
-                if s is not None:
-                    now = datetime.now().isoformat()
-                    s["messages"].append({"role": "user", "content": user_input, "ts": now})
-                    s["messages"].append({"role": "assistant", "content": content, "ts": now})
-                    if len([m for m in s["messages"] if m["role"] == "user"]) == 1:
-                        s["title"] = _auto_title(user_input)
-                    s["updated_at"] = now
-                    _save_session(session_id)
-            else:
-                yield " " + json.dumps(event) + "\n\n"
-                await asyncio.sleep(0)
-
-        await task
-        yield " " + json.dumps({"type": "done"}) + "\n\n"
-
-    except Exception as e:
-        logger.error(f"Stream error: {e}")
-        import traceback
-        traceback.print_exc()
-        yield " " + json.dumps({"type": "error", "content": str(e)}) + "\n\n"
 
 
 if __name__ == "__main__":

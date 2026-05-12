@@ -322,6 +322,13 @@ class ToolManager:
     async def _browser_screenshot(self, filename: str):
         try:
             page = await self._ensure_browser()
+            # Redirect bare filenames (no directory) to output/ folder
+            p = Path(filename)
+            if not p.parent or str(p.parent) == ".":
+                Path("output").mkdir(exist_ok=True)
+                filename = str(Path("output") / p.name)
+            else:
+                p.parent.mkdir(parents=True, exist_ok=True)
             await page.screenshot(path=filename)
             return f"Screenshot saved to {filename}"
         except Exception as e:
@@ -676,6 +683,9 @@ class AIAgent:
                 
                 # Add system message establishing tool usage context
                 if self.tools_available:
+                    # Ensure output/temp directories exist for AI-generated files
+                    Path("output").mkdir(exist_ok=True)
+                    Path("temp").mkdir(exist_ok=True)
                     system_message = {
                         "role": "system",
                         "content": (
@@ -689,8 +699,14 @@ class AIAgent:
                             "6. For system info → use execute_command\n"
                             "7. Chain multiple tools when needed\n"
                             "8. Only respond in text AFTER you've used tools to get the answer\n\n"
+                            "FILE CREATION RULES (ALWAYS FOLLOW):\n"
+                            "9. ALWAYS save screenshots, images, and temp files to the 'output/' folder (e.g. output/screenshot.png)\n"
+                            "10. ALWAYS save intermediate/scratch files to the 'temp/' folder (e.g. temp/work.txt)\n"
+                            "11. NEVER create temp/image files in the project root directory\n"
+                            "12. If a filename has no directory prefix, prepend 'output/' automatically\n\n"
                             "Example: User asks 'what time is it?' → Call get_current_time() → Return the time\n"
-                            "Example: User asks 'latest aviation accident' → Call web_search('latest aviation accident') → Summarize results\n\n"
+                            "Example: User asks 'latest aviation accident' → Call web_search('latest aviation accident') → Summarize results\n"
+                            "Example: Taking a screenshot → use filename 'output/screenshot.png' not 'screenshot.png'\n\n"
                             "BE PROACTIVE. ACT FIRST. EXPLAIN AFTER."
                         )
                     }

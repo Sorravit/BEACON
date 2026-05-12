@@ -12,12 +12,20 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
 header{display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid var(--border);background:var(--surface);flex-shrink:0}
 .header-left{display:flex;align-items:center;gap:10px}
 .logo{width:34px;height:34px;background:linear-gradient(135deg,var(--accent),var(--accent2));border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:18px}
-.title{font-size:17px;font-weight:600}
+.title{font-size:17px;font-weight:600;cursor:text;min-width:60px}
+.title:hover{color:var(--accent2)}
+/* Inline title editing */
+.title-edit-input{font-size:17px;font-weight:600;font-family:var(--font);background:var(--surface2);border:1px solid var(--accent);border-radius:6px;color:var(--text);padding:2px 8px;outline:none;width:220px;max-width:50vw}
 .subtitle{font-size:12px;color:var(--muted)}
-.header-right{display:flex;gap:8px}
+.header-right{display:flex;gap:8px;align-items:center}
 .btn-icon{background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--muted);cursor:pointer;padding:7px 12px;font-size:13px;transition:all .15s;display:flex;align-items:center;gap:5px}
 .btn-icon:hover{background:var(--border);color:var(--text)}
-.status-bar{display:flex;align-items:center;gap:7px;padding:5px 20px;font-size:12px;color:var(--muted);border-bottom:1px solid var(--border);background:var(--surface);flex-shrink:0}
+/* Stop button – highlighted in red when visible */
+.stop-btn{background:#3a1a1a!important;border-color:#6b2a2a!important;color:var(--red)!important;font-weight:600;animation:stopPulse 1.5s ease-in-out infinite}
+.stop-btn:hover{background:#5a2a2a!important;color:#fca5a5!important}
+@keyframes stopPulse{0%,100%{box-shadow:0 0 0 0 rgba(248,113,113,.4)}50%{box-shadow:0 0 0 4px rgba(248,113,113,0)}}
+.status-bar{display:flex;align-items:center;gap:7px;padding:5px 20px;font-size:12px;color:var(--muted);border-bottom:1px solid var(--border);background:var(--surface);flex-shrink:0;overflow:hidden}
+.activity-text{flex:1;font-size:12px;color:var(--yellow);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono);opacity:.9}
 .status-dot{width:7px;height:7px;border-radius:50%;background:var(--green);animation:pulse 2s infinite}
 .status-dot.thinking{background:var(--yellow)}
 .status-dot.error{background:var(--red);animation:none}
@@ -32,6 +40,9 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 .msg.user .avatar{background:linear-gradient(135deg,#4f46e5,#7c3aed)}
 .msg.ai .avatar{background:linear-gradient(135deg,var(--accent),#06b6d4)}
 .bubble{max-width:76%;padding:12px 16px;border-radius:var(--radius);font-size:14.5px;line-height:1.65}
+.msg-ts{font-size:10px;color:var(--muted);margin-top:4px;opacity:.6;white-space:nowrap}
+.msg.user .msg-ts{text-align:right}
+.msg.ai .msg-ts{text-align:left}
 .msg.user .bubble{background:var(--user-bg);border:1px solid #3d3f6b;border-bottom-right-radius:3px}
 .msg.ai .bubble{background:var(--ai-bg);border:1px solid var(--border);border-bottom-left-radius:3px}
 /* Thinking / debug block */
@@ -60,8 +71,20 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 .bubble ul,.bubble ol{padding-left:20px;margin-bottom:8px}
 .bubble li{margin-bottom:3px}
 .bubble code{font-family:var(--mono);font-size:13px;background:#0d1117;border:1px solid var(--border);padding:1px 5px;border-radius:4px;color:var(--cyan)}
-.bubble pre{background:#0d1117;border:1px solid var(--border);border-radius:8px;padding:12px 14px;overflow-x:auto;margin:8px 0}
+.bubble pre{background:#0d1117;border:1px solid var(--border);border-radius:8px;padding:12px 14px;overflow-x:auto;margin:8px 0;position:relative}
 .bubble pre code{border:none;background:none;padding:0;font-size:13px;color:#c9d1d9;white-space:pre}
+/* Copy button on code blocks */
+.copy-btn{
+  position:absolute;top:6px;right:6px;
+  background:var(--surface2);border:1px solid var(--border);
+  border-radius:5px;color:var(--muted);cursor:pointer;
+  padding:3px 8px;font-size:11px;line-height:1.4;
+  opacity:0;transition:opacity .15s,background .15s;
+  font-family:var(--font);
+}
+.bubble pre:hover .copy-btn{opacity:1}
+.copy-btn:hover{background:var(--border);color:var(--text)}
+.copy-btn.copied{color:var(--green);border-color:var(--green);opacity:1}
 .bubble strong{font-weight:600;color:#f1f5f9}
 .bubble em{font-style:italic;color:var(--accent2)}
 .bubble blockquote{border-left:3px solid var(--accent);padding-left:12px;margin:8px 0;color:var(--muted)}
@@ -75,14 +98,44 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 .tool-result-text{color:var(--cyan);font-size:12px;margin-top:5px;font-family:var(--mono);word-break:break-all;white-space:pre-wrap;max-height:120px;overflow-y:auto}
 .cursor{display:inline-block;width:2px;height:1em;background:var(--accent2);margin-left:2px;vertical-align:text-bottom;animation:blink .8s infinite}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+/* ── Drag-and-drop overlay ─────────────────────────────────────────── */
+.drop-overlay{
+  display:none;position:fixed;inset:0;
+  background:rgba(108,99,255,.18);
+  border:3px dashed var(--accent);
+  border-radius:0;
+  z-index:1000;
+  pointer-events:none;
+  align-items:center;justify-content:center;
+  flex-direction:column;gap:12px;
+  color:var(--accent2);font-size:22px;font-weight:700;
+  backdrop-filter:blur(2px);
+}
+.drop-overlay.active{display:flex}
+
+/* ── File preview chips in input area ─────────────────────────────── */
+.file-previews{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
+.file-chip{
+  display:flex;align-items:center;gap:6px;
+  background:var(--surface2);border:1px solid var(--accent);
+  border-radius:8px;padding:5px 10px;font-size:12px;
+  max-width:220px;
+}
+.file-chip-icon{font-size:16px;flex-shrink:0}
+.file-chip-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text)}
+.file-chip-size{color:var(--muted);font-size:11px;flex-shrink:0}
+.file-chip-remove{background:none;border:none;color:var(--muted);cursor:pointer;padding:0 2px;font-size:14px;line-height:1;flex-shrink:0}
+.file-chip-remove:hover{color:var(--red)}
+.file-chip.image-chip img{width:32px;height:32px;object-fit:cover;border-radius:4px;flex-shrink:0}
+
 /* Input area */
 .input-area{padding:16px 20px;border-top:1px solid var(--border);background:var(--surface);flex-shrink:0}
 .input-row{display:flex;gap:10px;align-items:flex-end}
 .input-wrap{flex:1;position:relative}
-textarea{width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:10px;color:var(--text);font-family:var(--font);font-size:14px;line-height:1.5;padding:11px 14px;resize:none;outline:none;transition:border .15s;min-height:44px;max-height:160px;overflow-y:auto}
+textarea{width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:10px;color:var(--text);font-family:var(--font);font-size:14px;line-height:1.5;padding:11px 14px;resize:none;outline:none;transition:border .15s;min-height:44px;max-height:160px;overflow-y:auto;vertical-align:bottom;box-sizing:border-box}
 textarea:focus{border-color:var(--accent)}
 textarea::placeholder{color:var(--muted)}
-.send-btn{width:44px;height:44px;background:var(--accent);border:none;border-radius:10px;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:all .15s;font-size:18px}
+.send-btn{width:44px;height:44px;background:var(--accent);border:none;border-radius:10px;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:all .15s;font-size:18px;align-self:flex-end}
 .send-btn:hover{background:var(--accent2);transform:scale(1.05)}
 .send-btn:disabled{opacity:.4;cursor:not-allowed;transform:none}
 .input-hint{font-size:11px;color:var(--muted);margin-top:6px}
@@ -138,6 +191,9 @@ textarea::placeholder{color:var(--muted)}
 .tasks-badge{background:var(--accent);color:#fff;border-radius:20px;padding:1px 8px;font-size:11px}
 .tasks-close{background:none;border:none;color:var(--muted);cursor:pointer;font-size:18px;line-height:1;padding:2px 6px;border-radius:4px}
 .tasks-close:hover{background:var(--border);color:var(--text)}
+.tasks-stop-all-btn{background:#3a1a1a;border:1px solid #6b2a2a;color:var(--red);border-radius:6px;padding:4px 10px;font-size:12px;font-weight:600;cursor:pointer;transition:all .15s;white-space:nowrap}
+.tasks-stop-all-btn:hover{background:#5a2a2a;color:#fca5a5}
+.tasks-stop-all-btn:disabled{opacity:.4;cursor:not-allowed}
 .tasks-list{flex:1;overflow-y:auto;padding:10px}
 .task-item{background:var(--surface2);border:1px solid var(--border);border-radius:10px;margin-bottom:10px;overflow:hidden}
 .task-item-header{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;cursor:pointer;user-select:none}
@@ -182,6 +238,134 @@ textarea::placeholder{color:var(--muted)}
 /* ── Layout: sidebar + main ───────────────────────────────────────── */
 .layout{display:flex;height:100vh;overflow:hidden}
 .app{display:flex;flex-direction:column;flex:1;min-width:0;height:100vh}
+
+/* ── Mobile / iPhone ──────────────────────────────────────────────── */
+/* iPhone 13 = 390×844 CSS px. Safe-area vars handle the notch/home-bar */
+@media (max-width:700px){
+
+  /* Layout root: use 100dvh so toolbar/address-bar don't clip content */
+  .layout,.app{height:100dvh;min-height:0}
+
+  /* Keep input area always visible when the keyboard opens.
+     sticky+bottom:0 anchors it to the visible viewport bottom.    */
+  .input-area{
+    flex-shrink:0!important;
+    position:sticky;bottom:0;
+    z-index:10;
+  }
+  /* Let messages area shrink to whatever space remains */
+  .messages{flex:1 1 0!important;min-height:60px}
+  /* 16px font prevents iOS from auto-zooming the textarea on focus */
+  textarea{font-size:16px!important}
+  /* Both elements vertically centered in the row */
+  .input-row{align-items:center!important}
+  /* Send button fixed height matching textarea min-height */
+  .input-wrap,.input-wrap textarea{display:block;height:auto}
+  .send-btn{
+    width:48px!important;
+    height:44px!important;
+    min-height:44px!important;
+    font-size:20px!important;
+    display:flex!important;
+    align-items:center!important;
+    justify-content:center!important;
+    align-self:auto!important;
+    flex-shrink:0!important;
+  }
+
+  /* Sidebar: always starts collapsed (hidden off-screen) */
+  .sidebar{width:0;min-width:0;border-right:none;transition:none}
+  .sidebar.collapsed{width:0;min-width:0}
+
+  /* When open on mobile: fixed overlay drawer */
+  .sidebar:not(.collapsed){
+    width:min(260px,80vw);min-width:0;
+    position:fixed;left:0;top:0;bottom:0;z-index:600;
+    box-shadow:4px 0 32px rgba(0,0,0,.8);
+    overflow-y:auto;
+  }
+
+  /* Semi-transparent backdrop behind the open drawer */
+  .sidebar:not(.collapsed)::after{
+    content:'';position:fixed;inset:0;
+    background:rgba(0,0,0,.45);z-index:-1;
+  }
+
+  /* Always show the ☰ open button on mobile */
+  .sidebar-open-btn{display:flex!important}
+
+  /* Header: tighter padding, respect notch */
+  header{
+    padding:10px 12px;
+    padding-left:max(12px,env(safe-area-inset-left));
+    padding-right:max(12px,env(safe-area-inset-right));
+    padding-top:max(10px,env(safe-area-inset-top));
+  }
+
+  /* Hide logo on very small headers to save space */
+  .logo{display:none}
+  .subtitle{display:none}
+
+  /* Header title smaller */
+  .title{font-size:15px}
+  .title-edit-input{width:160px;font-size:15px}
+
+  /* Header buttons: icon-only on mobile */
+  .btn-label{display:none}
+  .btn-icon-only{display:inline}
+  .btn-icon{padding:8px 10px;font-size:16px}
+
+  /* Status bar: compact */
+  .status-bar{
+    padding:4px max(12px,env(safe-area-inset-left));
+    font-size:11px;
+  }
+
+  /* Messages: tighter padding */
+  .messages{
+    padding:12px;
+    padding-left:max(12px,env(safe-area-inset-left));
+    padding-right:max(12px,env(safe-area-inset-right));
+    gap:12px;
+  }
+
+  /* Bubbles: wider on mobile */
+  .bubble{max-width:88%;padding:10px 12px;font-size:14px}
+
+  /* Input area: respect home-bar at the bottom */
+  .input-area{
+    padding:10px 12px;
+    padding-left:max(12px,env(safe-area-inset-left));
+    padding-right:max(12px,env(safe-area-inset-right));
+    padding-bottom:max(10px,env(safe-area-inset-bottom));
+  }
+  .input-hint .hint-full{display:none}
+  .input-hint .hint-short{display:inline}
+
+  /* Tasks panel: full-width on mobile */
+  .tasks-panel{
+    width:100vw!important;left:0!important;right:0!important;
+    top:auto!important;bottom:0!important;
+    height:60vh!important;min-height:200px;
+    border-radius:16px 16px 0 0;
+    padding-bottom:env(safe-area-inset-bottom);
+  }
+
+  /* Thinking block: smaller font */
+  .thinking-block{font-size:11px}
+
+  /* Suggestions: smaller chips */
+  .suggestion-chip{font-size:12px;padding:5px 11px}
+  .empty-icon{font-size:36px}
+  .empty-title{font-size:16px}
+}
+
+/* Desktop: always show full button labels, hide icon-only spans */
+@media (min-width:701px){
+  .btn-icon-only{display:none}
+  .hint-full{display:inline}
+  .hint-short{display:none}
+}
 
 /* ── Sidebar ──────────────────────────────────────────────────────── */
 .sidebar{
@@ -241,6 +425,7 @@ textarea::placeholder{color:var(--muted)}
 }
 .session-item.active .session-label{color:#fff}
 
+.session-running-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--yellow);animation:pulse 1.2s infinite;margin-right:5px;vertical-align:middle;flex-shrink:0}
 .session-actions{
   display:flex;gap:2px;flex-shrink:0;
   opacity:0;transition:opacity .12s;

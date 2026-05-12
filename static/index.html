@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover,interactive-widget=resizes-content"/>
 <title>AI Assistant</title>
 <link rel="stylesheet" href="/static/style.css"/>
 </head>
@@ -40,12 +40,15 @@
         </div>
       </div>
       <div class="header-right">
+        <button class="btn-icon stop-btn" id="stop-btn" onclick="stopAI()" title="Stop AI" style="display:none">
+          <span class="btn-label">⏹ Stop</span><span class="btn-icon-only">⏹</span>
+        </button>
         <button class="btn-icon tasks-btn" id="tasks-btn" onclick="openTasksPanel()" title="Background tasks">
-          ⚙ Tasks
+          <span class="btn-label">⚙ Tasks</span><span class="btn-icon-only">⚙</span>
           <span class="badge" id="tasks-badge"></span>
         </button>
         <button class="btn-icon" onclick="clearChat()" title="Clear conversation">
-          🗑 Clear
+          <span class="btn-label">🗑 Clear</span><span class="btn-icon-only">🗑</span>
         </button>
       </div>
     </header>
@@ -53,13 +56,14 @@
     <div class="status-bar">
       <div class="status-dot" id="status-dot"></div>
       <span id="status-text">Initialising…</span>
+      <span class="activity-text" id="activity-text"></span>
     </div>
 
     <div class="messages" id="messages">
       <div class="empty-state" id="empty-state">
         <div class="empty-icon">🤖</div>
         <div class="empty-title">AI Assistant</div>
-        <div class="empty-subtitle">Ask me anything — I can search the web, run commands, read files, and more.</div>
+        <div class="empty-subtitle"><span class="hint-full">Ask me anything — I can search the web, run commands, read files, and more.</span><span class="hint-short">Ask me anything</span></div>
         <div class="suggestions">
           <span class="suggestion-chip" onclick="useSuggestion('What time is it?')">🕐 What time is it?</span>
           <span class="suggestion-chip" onclick="useSuggestion('List files in current directory')">📁 List files</span>
@@ -70,6 +74,7 @@
     </div>
 
     <div class="input-area">
+      <div class="file-previews" id="file-previews"></div>
       <div class="input-row">
         <div class="input-wrap">
           <textarea
@@ -80,11 +85,18 @@
         </div>
         <button class="send-btn" id="send-btn" title="Send">➤</button>
       </div>
-      <div class="input-hint">Enter to send · Shift+Enter for new line · Tools: web search, files, commands, browser</div>
+      <div class="input-hint"><span class="hint-full">Enter to send · Shift+Enter for new line · Tools: web search, files, commands, browser</span><span class="hint-short">Enter to send · Shift+Enter new line</span></div>
     </div>
 
   </div><!-- /.app -->
 </div><!-- /.layout -->
+
+<!-- Drag-and-drop overlay (full-page) -->
+<div class="drop-overlay" id="drop-overlay">
+  <span style="font-size:48px">📂</span>
+  <span>Drop file to attach to chat</span>
+  <span style="font-size:13px;opacity:.7">Images, text, code, CSV, JSON…</span>
+</div>
 
 <!-- Toast -->
 <div class="toast" id="toast"></div>
@@ -105,7 +117,10 @@
       ⚙ Background Tasks
       <span class="tasks-badge" id="tasks-count">0</span>
     </div>
-    <button class="tasks-close" onclick="closeTasksPanel()">✕</button>
+    <div style="display:flex;gap:6px;align-items:center">
+      <button class="tasks-stop-all-btn" id="tasks-stop-all-btn" onclick="stopAllTasks()" title="Stop and clear all tasks">⏹ Stop All</button>
+      <button class="tasks-close" onclick="closeTasksPanel()">✕</button>
+    </div>
   </div>
   <div class="tasks-list" id="tasks-list">
     <div class="tasks-empty" id="tasks-empty">No background tasks running</div>

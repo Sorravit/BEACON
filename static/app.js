@@ -20,14 +20,193 @@ let currentSessionId = null;
 let _renameTarget    = null;
 let taskLogStreams   = {};
 let _dragInit        = false;
+let _currentReader   = null;   // active SSE reader so we can cancel client-side too
+let _activityPollTimer = null; // activity polling interval
 // Per-session streaming check
 function isStreamingSession(sid) { return _streamingSet.has(sid); }
 
+// ── Stop button + activity bar refs ───────────────────────────────────────────
+const stopBtn      = document.getElementById('stop-btn');
+const activityText = document.getElementById('activity-text');
+
+function showStopBtn()  { if (stopBtn) stopBtn.style.display = 'flex'; }
+function hideStopBtn()  { if (stopBtn) stopBtn.style.display = 'none'; }
+function setActivity(t) { if (activityText) activityText.textContent = t || ''; }
+
+async function stopAI() {
+  if (!currentSessionId) return;
+  if (_currentReader) { try { _currentReader.cancel(); } catch(e) {} _currentReader = null; }
+  try { await fetch('/chat/stop/' + currentSessionId, { method: 'POST' }); } catch(e) {}
+  hideStopBtn();
+  setActivity('');
+  stopActivityPoll();
+  _streamingSet.delete(currentSessionId);
+  sendBtn.disabled = false;
+  setStatus('ready', 'Stopped');
+}
+
+function startActivityPoll(sid) {
+  stopActivityPoll();
+  _activityPollTimer = setInterval(async () => {
+    if (!_streamingSet.has(sid)) { stopActivityPoll(); return; }
+    try {
+      const r = await fetch('/chat/status/' + sid);
+      const d = await r.json();
+      if (d.running && d.activity) setActivity('\u2699 ' + d.activity);
+      else if (!d.running) stopActivityPoll();
+    } catch(e) {}
+  }, 800);
+}
+
+function stopActivityPoll() {
+  if (_activityPollTimer) { clearInterval(_activityPollTimer); _activityPollTimer = null; }
+}
+
+// ── File attachment state ─────────────────────────────────────────────────────
+let _attachedFiles = [];  // [{name, size, type, content}]
+const filePreviewsEl = document.getElementById('file-previews');
+const dropOverlay    = document.getElementById('drop-overlay');
+
+function fmtSize(b){return b<1024?b+'B':b<1048576?(b/1024).toFixed(1)+'KB':(b/1048576).toFixed(1)+'MB';}
+
+function addAttachedFile(name, size, type, content) {
+  _attachedFiles.push({name, size, type, content});
+  renderFilePreviews();
+}
+
+function removeAttachedFile(idx) {
+  _attachedFiles.splice(idx, 1);
+  renderFilePreviews();
+}
+
+function renderFilePreviews() {
+  if (!filePreviewsEl) return;
+  filePreviewsEl.innerHTML = '';
+  _attachedFiles.forEach((f, i) => {
+    const chip = document.createElement('div');
+    const isImg = f.type.startsWith('image/');
+    chip.className = 'file-chip' + (isImg ? ' image-chip' : '');
+    if (isImg) {
+      chip.innerHTML = '<img src="'+escHtml(f.content)+'" alt="'+escHtml(f.name)+'">';
+    } else {
+      const icon = f.type.includes('pdf') ? '📄' : f.type.includes('zip') ? '📦' : f.type.startsWith('text') ? '📝' : '📎';
+      chip.innerHTML = '<span class="file-chip-icon">'+icon+'</span>';
+    }
+    chip.innerHTML += '<span class="file-chip-name" title="'+escHtml(f.name)+'">'+escHtml(f.name)+'</span>'
+      +'<span class="file-chip-size">'+fmtSize(f.size)+'</span>'
+      +'<button class="file-chip-remove" title="Remove" onclick="removeAttachedFile('+i+')">✕</button>';
+    filePreviewsEl.appendChild(chip);
+  });
+}
+
+function readFileAsAttachment(file) {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    const isImg  = file.type.startsWith('image/');
+    const isText = file.type.startsWith('text/') || /\.(txt|md|json|csv|xml|yaml|yml|js|ts|py|sh|css|html|log)$/i.test(file.name);
+    reader.onload = e => resolve({
+      name: file.name, size: file.size, type: file.type,
+      content: e.target.result,
+      isImg, isText
+    });
+    if (isImg) reader.readAsDataURL(file);
+    else reader.readAsText(file);
+  });
+}
+
+async function processDroppedFiles(files) {
+  for (const file of files) {
+    if (file.size > 50 * 1024 * 1024) { showToast(file.name + ' is too large (max 50 MB)'); continue; }
+    // Upload file to server so AI knows the path
+    let serverPath = null;
+    try {
+      const fd = new FormData();
+      fd.append('file', file);
+      const res = await fetch('/upload', { method: 'POST', body: fd });
+      if (res.ok) {
+        const d = await res.json();
+        serverPath = d.path;
+      }
+    } catch(e) { console.warn('Upload failed, falling back to inline content', e); }
+
+    // Also read content for text/code files so AI sees it immediately
+    let content = null;
+    const isImg = file.type.startsWith('image/');
+    const isText = file.type.startsWith('text/') || /\.(txt|md|json|csv|xml|yaml|yml|js|ts|py|sh|css|html|log|ini|toml|conf|sql)$/i.test(file.name);
+    if (isImg) {
+      const att = await readFileAsAttachment(file);
+      content = att.content; // data URL for preview
+    } else if (isText && file.size <= 2 * 1024 * 1024) {
+      const att = await readFileAsAttachment(file);
+      content = att.content; // full text
+    }
+
+    _attachedFiles.push({ name: file.name, size: file.size, type: file.type, content, serverPath, isImg, isText });
+    renderFilePreviews();
+  }
+}
+
+// ── Drag-and-drop event handlers (document-level so whole page is a drop zone) ─
+let _dragCounter = 0;
+
+document.addEventListener('dragenter', e => {
+  if (!e.dataTransfer || !e.dataTransfer.types.includes('Files')) return;
+  e.preventDefault(); _dragCounter++;
+  if (_dragCounter === 1 && dropOverlay) dropOverlay.classList.add('active');
+});
+document.addEventListener('dragleave', e => {
+  // Only count leaves that exit the browser window entirely
+  if (e.relatedTarget) return;
+  _dragCounter = 0;
+  if (dropOverlay) dropOverlay.classList.remove('active');
+});
+document.addEventListener('dragover', e => {
+  if (!e.dataTransfer || !e.dataTransfer.types.includes('Files')) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'copy';
+});
+document.addEventListener('drop', async e => {
+  e.preventDefault(); _dragCounter = 0;
+  if (dropOverlay) dropOverlay.classList.remove('active');
+  const files = Array.from(e.dataTransfer.files);
+  if (files.length) await processDroppedFiles(files);
+});
+
+// Also allow paste of files (Ctrl+V image paste)
+document.addEventListener('paste', async e => {
+  const items = Array.from(e.clipboardData?.items || []);
+  const files = items.filter(i => i.kind === 'file').map(i => i.getAsFile()).filter(Boolean);
+  if (files.length) { e.preventDefault(); await processDroppedFiles(files); }
+});
+
 // ── Markdown renderer ─────────────────────────────────────────────────────────
+function copyCode(btn) {
+  const pre = btn.closest('pre');
+  const code = pre ? pre.querySelector('code') : null;
+  if (!code) return;
+  navigator.clipboard.writeText(code.innerText).then(() => {
+    btn.textContent = '✓ Copied';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 1800);
+  }).catch(() => {
+    // Fallback for older browsers
+    const sel = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(code);
+    sel.removeAllRanges();
+    sel.addRange(range);
+    document.execCommand('copy');
+    sel.removeAllRanges();
+    btn.textContent = '✓ Copied';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 1800);
+  });
+}
+
 function renderMarkdown(text) {
   let html = text
     .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-    .replace(/```(\w*)\n?([\s\S]*?)```/g,(_,lang,code)=>`<pre><code class="lang-${lang}">${code.trim()}</code></pre>`)
+    .replace(/```(\w*)\n?([\s\S]*?)```/g,(_,lang,code)=>`<pre><button class="copy-btn" onclick="copyCode(this)">Copy</button><code class="lang-${lang}">${code.trim()}</code></pre>`)
     .replace(/`([^`]+)`/g,'<code>$1</code>')
     .replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>')
     .replace(/\*(.+?)\*/g,'<em>$1</em>')
@@ -62,16 +241,37 @@ function showToast(msg) {
   setTimeout(() => toast.classList.remove('show'), 2500);
 }
 
-function createMessage(role) {
+function fmtTs(ts) {
+  if (!ts) return '';
+  try {
+    const d = new Date(ts);
+    const now = new Date();
+    const sameDay = d.toDateString() === now.toDateString();
+    const time = d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+    return sameDay ? time : d.toLocaleDateString([], {month:'short', day:'numeric'}) + ' ' + time;
+  } catch(e) { return ''; }
+}
+
+function createMessage(role, ts) {
   const row    = document.createElement('div');
   row.className = `msg ${role}`;
   const avatar = document.createElement('div');
   avatar.className = 'avatar';
   avatar.textContent = role === 'user' ? '👤' : '🤖';
+  const wrap = document.createElement('div');
+  wrap.style.cssText = 'display:flex;flex-direction:column;max-width:76%';
   const bubble = document.createElement('div');
   bubble.className = 'bubble';
+  bubble.style.maxWidth = '100%';
+  wrap.appendChild(bubble);
+  if (ts) {
+    const tsEl = document.createElement('div');
+    tsEl.className = 'msg-ts';
+    tsEl.textContent = fmtTs(ts);
+    wrap.appendChild(tsEl);
+  }
   row.appendChild(avatar);
-  row.appendChild(bubble);
+  row.appendChild(wrap);
   messagesEl.appendChild(row);
   scrollToBottom();
   return bubble;
@@ -81,6 +281,13 @@ function createMessage(role) {
 function openSidebar() {
   sidebar.classList.remove('collapsed');
   if (sidebarOpenBtn) sidebarOpenBtn.style.display = 'none';
+}
+
+function closeSidebarOnMobile() {
+  if (window.innerWidth <= 700) {
+    sidebar.classList.add('collapsed');
+    if (sidebarOpenBtn) sidebarOpenBtn.style.display = 'flex';
+  }
 }
 
 if (sidebarToggle) {
@@ -112,9 +319,10 @@ function renderSessionsList(sessions) {
 
     const label  = document.createElement('div');
     label.className = 'session-label';
-    label.textContent = s.title || 'New Chat';
-    label.title = s.title || 'New Chat';
-    label.onclick = () => switchSession(s.id);
+    const prefix = s.running ? '<span class="session-running-dot" title="AI working\u2026"></span>' : '';
+    label.innerHTML = prefix + escHtml(s.title || 'New Chat');
+    label.title = (s.running ? '\u2699 Working\u2026 ' : '') + (s.title || 'New Chat');
+    label.onclick = () => { switchSession(s.id); closeSidebarOnMobile(); };
 
     const actions = document.createElement('div');
     actions.className = 'session-actions';
@@ -145,28 +353,31 @@ async function newChat() {
     const data = await res.json();
     await loadSessions();
     await switchSession(data.id);
+    closeSidebarOnMobile();
   } catch(e) { showToast('Failed to create chat'); }
 }
 
 async function switchSession(id) {
   if (id === currentSessionId) return;
-  // Allow switching even while AI is streaming — just change the view
-  // The ongoing stream will finish in the background for the original session
   currentSessionId = id;
   document.querySelectorAll('.session-item').forEach(el => {
     el.classList.toggle('active', el.dataset.id === id);
   });
-  // Update send button state for the new session
   sendBtn.disabled = isStreamingSession(id);
   if (!isStreamingSession(id)) setStatus('ready', 'Ready');
-  // Make the header title editable by double-clicking
-  chatTitleEl.title = 'Double-click to rename';
+  chatTitleEl.title = 'Click to rename this chat';
   try {
     const res  = await fetch(`/sessions/${id}`);
     const data = await res.json();
     chatTitleEl.textContent = data.title || 'New Chat';
     messagesEl.innerHTML = '';
-    if (!data.messages || data.messages.length === 0) {
+    if (data.messages && data.messages.length > 0) {
+      data.messages.forEach(msg => {
+        if (msg.role === 'user') { const b=createMessage('user', msg.ts); b.innerHTML=renderMarkdown(msg.content||''); }
+        else if (msg.role === 'assistant') { const b=createMessage('ai', msg.ts); b.innerHTML=renderMarkdown(msg.content||''); }
+      });
+      scrollToBottom();
+    } else {
       const es = document.createElement('div');
       es.className = 'empty-state'; es.id = 'empty-state-active';
       es.innerHTML = `<div class="empty-icon">🤖</div><div class="empty-title">AI Assistant</div>
@@ -177,14 +388,60 @@ async function switchSession(id) {
           <span class="suggestion-chip" onclick="useSuggestion('Search for latest AI news')">🔍 Latest AI news</span>
         </div>`;
       messagesEl.appendChild(es);
-    } else {
-      data.messages.forEach(msg => {
-        if (msg.role === 'user') { const b=createMessage('user'); b.innerHTML=renderMarkdown(msg.content||''); }
-        else if (msg.role === 'assistant') { const b=createMessage('ai'); b.innerHTML=renderMarkdown(msg.content||''); }
-      });
-      scrollToBottom();
     }
+    if (data.running && !isStreamingSession(id)) reconnectToSession(id);
   } catch(e) { showToast('Failed to load session'); }
+}
+
+// ── Reconnect to a session whose agent is still running in the background ────
+async function reconnectToSession(id) {
+  if (isStreamingSession(id)) return;
+  _streamingSet.add(id);
+  if (id === currentSessionId) {
+    sendBtn.disabled = true; showStopBtn(); startActivityPoll(id);
+    setStatus('thinking', 'Working\u2026');
+  }
+  const ab = createMessage('ai');
+  const tBl=document.createElement('div');tBl.className='thinking-block';
+  const tHd=document.createElement('div');tHd.className='thinking-header';
+  const tIc=document.createElement('span');tIc.className='thinking-icon';
+  const sp=document.createElement('span');sp.className='thinking-spinner';tIc.appendChild(sp);
+  const tLb=document.createElement('span');tLb.className='thinking-label';tLb.textContent='\u2699 Reconnecting\u2026';
+  const tTg=document.createElement('span');tTg.className='thinking-toggle';tTg.textContent=' \u25bc';
+  tHd.appendChild(tIc);tHd.appendChild(tLb);tHd.appendChild(tTg);
+  const tBo=document.createElement('div');tBo.className='thinking-body open';
+  tHd.addEventListener('click',()=>{tBo.classList.toggle('open');tTg.textContent=tBo.classList.contains('open')?' \u25b2':' \u25bc';});
+  tBl.appendChild(tHd);tBl.appendChild(tBo);ab.appendChild(tBl);
+  const tn=document.createElement('div');ab.appendChild(tn);
+  let acc='',steps=0;
+  function atl(txt,cls){const l=document.createElement('div');l.className='thinking-line '+(cls||'');l.textContent=txt;tBo.appendChild(l);tBo.scrollTop=tBo.scrollHeight;scrollToBottom();}
+  try {
+    const resp=await fetch('/chat/reconnect/'+id);
+    if(!resp.ok)throw new Error('HTTP '+resp.status);
+    const reader=resp.body.getReader();
+    if(id===currentSessionId)_currentReader=reader;
+    const dec=new TextDecoder();let buf='';
+    while(true){
+      const{done,value}=await reader.read();if(done)break;
+      buf+=dec.decode(value,{stream:true});
+      const lines=buf.split('\n');buf=lines.pop();
+      for(const line of lines){
+        if(!line.trim()||line.trim().startsWith(':'))continue;
+        let ev;try{ev=JSON.parse(line.trim());}catch{continue;}
+        if(ev.type==='tool'){steps++;if(id===currentSessionId)setStatus('thinking','Running '+ev.name+'\u2026');tLb.textContent='\u2699 Step '+steps+': '+ev.name;atl('\uD83D\uDD27 '+ev.name+(ev.args?'('+ev.args+')':'()'),'tool-call');}
+        else if(ev.type==='result'){(ev.content||'').split('\n').forEach(l=>{if(l.trim())atl('   '+l,'tool-result');});if(id===currentSessionId)setStatus('thinking','Processing\u2026');}
+        else if(ev.type==='token'){acc+=ev.content||'';tn.innerHTML=renderMarkdown(acc);scrollToBottom();if(id===currentSessionId)setStatus('thinking','Responding\u2026');}
+        else if(ev.type==='done'){tBo.classList.remove('open');tIc.innerHTML=steps>0?'<span style="color:var(--green);font-size:13px">\u2713</span>':'<span style="color:var(--muted);font-size:13px">\u2014</span>';tLb.textContent=steps>0?('\u2699 '+steps+' step'+(steps>1?'s':'')+' completed'):'\u2699 No tools used';tn.innerHTML=renderMarkdown(acc);scrollToBottom();refreshTasksBadge();await loadSessions();if(id===currentSessionId){const ud=await(await fetch('/sessions/'+id)).json();chatTitleEl.textContent=ud.title||'New Chat';}}
+        else if(ev.type==='stopped'){tBo.classList.remove('open');tIc.innerHTML='<span style="color:var(--yellow);font-size:13px">\u23F9</span>';tLb.textContent='\u2699 Stopped';if(acc)tn.innerHTML=renderMarkdown(acc);scrollToBottom();}
+        else if(ev.type==='error'){atl('\u26a0 '+(ev.content||'Unknown error'),'error');tBo.classList.add('open');if(id===currentSessionId)setStatus('error','Error');}
+      }
+    }
+  } catch(err) {
+    if(err.name!=='AbortError'){const ed=document.createElement('div');ed.style.cssText='color:#f87171;font-size:13px';ed.textContent='\u26a0 '+err.message;ab.appendChild(ed);}
+  } finally {
+    if(id===currentSessionId){_currentReader=null;hideStopBtn();stopActivityPoll();setActivity('');setStatus('ready','Ready');}
+    _streamingSet.delete(id);sendBtn.disabled=false;scrollToBottom();
+  }
 }
 
 async function deleteSession(id) {
@@ -241,7 +498,7 @@ async function clearChat(){
 
 async function sendMessage(){
   const text=textarea.value.trim();
-  if(!text||isStreamingSession(currentSessionId))return;
+  if((!text && _attachedFiles.length===0)||isStreamingSession(currentSessionId))return;
   // Auto-create a session if none is active
   if(!currentSessionId){
     try{
@@ -254,11 +511,39 @@ async function sendMessage(){
   }
   document.getElementById('empty-state-active')?.remove();
   const eo=document.getElementById('empty-state');if(eo)eo.style.display='none';
-  const ub=createMessage('user');ub.innerHTML=renderMarkdown(text);
+  // Build full message including any attached files
+  let fullText = text;
+  if (_attachedFiles.length > 0) {
+    const parts = [];
+    for (const f of _attachedFiles) {
+      if (f.isImg) {
+        const pathInfo = f.serverPath ? ' (saved to: '+f.serverPath+')' : '';
+        parts.push('[Attached image: '+f.name+' ('+fmtSize(f.size)+')'+pathInfo+']');
+      } else if (f.serverPath) {
+        // File is on disk — instruct AI to read it
+        const preview = (f.content && typeof f.content === 'string' && f.content.length > 0)
+          ? '\nFirst 500 chars preview:\n```\n'+f.content.slice(0,500)+(f.content.length>500?'\n...(truncated)':'')+'\n```'
+          : '';
+        parts.push('I have attached the file "'+f.name+'" ('+fmtSize(f.size)+'). It has been saved to the server at path: '+f.serverPath+'\nPlease use read_file("'+f.serverPath+'") to read its full contents and then respond based on what is in the file.'+preview);
+      } else {
+        // Upload failed — include what we have
+        const preview = (f.content && typeof f.content === 'string')
+          ? '\n```\n'+f.content.slice(0,2000)+(f.content.length>2000?'\n...(truncated)':'')+'\n```'
+          : '';
+        parts.push('[Attached file: '+f.name+' ('+fmtSize(f.size)+')'+preview+']');
+      }
+    }
+    if (text) parts.push(text);
+    fullText = parts.join('\n\n');
+  }
+  const _msgNow = new Date().toISOString();
+  const ub=createMessage('user', _msgNow);ub.innerHTML=renderMarkdown(fullText||text);
   textarea.value='';textarea.style.height='auto';
+  _attachedFiles=[];renderFilePreviews();
   _streamingSet.add(currentSessionId);sendBtn.disabled=true;setStatus('thinking','Thinking\u2026');
+  showStopBtn();startActivityPoll(currentSessionId);
 
-  const ab=createMessage('ai');
+  const ab=createMessage('ai', _msgNow);
   const tBl=document.createElement('div');tBl.className='thinking-block';
   const tHd=document.createElement('div');tHd.className='thinking-header';
   const tIc=document.createElement('span');tIc.className='thinking-icon';
@@ -278,9 +563,9 @@ async function sendMessage(){
   }
 
   try{
-    const resp=await fetch('/chat/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text,session_id:currentSessionId})});
+    const resp=await fetch('/chat/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:fullText||text,session_id:currentSessionId})});
     if(!resp.ok)throw new Error('HTTP '+resp.status);
-    const reader=resp.body.getReader();const dec=new TextDecoder();let buf='';
+    const reader=resp.body.getReader();_currentReader=reader;const dec=new TextDecoder();let buf='';
     while(true){
       const{done,value}=await reader.read();if(done)break;
       buf+=dec.decode(value,{stream:true});
@@ -306,15 +591,30 @@ async function sendMessage(){
           await loadSessions();
           const ud=await(await fetch('/sessions/'+currentSessionId)).json();
           chatTitleEl.textContent=ud.title||'New Chat';
+        }else if(ev.type==='stopped'){
+          tBo.classList.remove('open');
+          tIc.innerHTML='<span style="color:var(--yellow);font-size:13px">\u23F9</span>';
+          tLb.textContent='\u2699 Stopped by user after '+steps+' step'+(steps!==1?'s':'');
+          if(acc)tn.innerHTML=renderMarkdown(acc);
+          scrollToBottom();
         }else if(ev.type==='error'){
           atl('\u26a0 '+(ev.content||'Unknown error'),'error');tBo.classList.add('open');setStatus('error','Error');
         }
       }
     }
   }catch(err){
-    const ed=document.createElement('div');ed.style.cssText='color:#f87171;font-size:13px';ed.textContent='\u26a0 Connection error: '+err.message;ab.appendChild(ed);setStatus('error','Error');
+    if(err.name!=='AbortError'){
+      const ed=document.createElement('div');ed.style.cssText='color:#f87171;font-size:13px';ed.textContent='\u26a0 Connection error: '+err.message;ab.appendChild(ed);setStatus('error','Error');
+    }
   }finally{
-    _streamingSet.delete(currentSessionId);sendBtn.disabled=false;setStatus('ready','Ready');scrollToBottom();
+    _currentReader=null;
+    _streamingSet.delete(currentSessionId);
+    sendBtn.disabled=false;
+    hideStopBtn();
+    stopActivityPoll();
+    setActivity('');
+    setStatus('ready','Ready');
+    scrollToBottom();
   }
 }
 
@@ -464,6 +764,20 @@ function renderTasksList(tasks){
 
 function toggleTaskLog(name){const l=document.getElementById('log-'+name);if(!l)return;if(l.classList.toggle('expanded'))startLogStream(name);else stopLogStream(name);}
 
+async function stopAllTasks(){
+  const btn=document.getElementById('tasks-stop-all-btn');
+  if(btn){btn.disabled=true;btn.textContent='\u2026';}
+  try{
+    await fetch('/tasks/stop-all',{method:'POST'});
+    document.querySelectorAll('.task-item').forEach(el=>el.remove());
+    const empty=document.getElementById('tasks-empty');if(empty)empty.style.display='block';
+    const cnt=document.getElementById('tasks-count');if(cnt)cnt.textContent='0';
+    const badge=document.getElementById('tasks-badge');if(badge){badge.textContent='0';badge.classList.remove('visible');}
+    showToast('All tasks stopped and cleared');
+  }catch(e){showToast('Failed to stop all tasks');}
+  finally{if(btn){btn.disabled=false;btn.textContent='\u23F9 Stop All';}}
+}
+
 async function startLogStream(name){
   if(taskLogStreams[name])return;
   const ce=document.getElementById('logcontent-'+name);if(!ce)return;
@@ -521,15 +835,55 @@ async function stopAndClear(name){
   catch(e){showToast('Failed to stop and clear');if(btn){btn.disabled=false;btn.textContent='Stop';}}
 }
 
-// Double-click the header title to rename the current chat
-chatTitleEl.style.cursor = 'pointer';
-chatTitleEl.title = 'Double-click to rename';
-chatTitleEl.addEventListener('dblclick', () => {
-  if (currentSessionId) openRenameModal(currentSessionId, chatTitleEl.textContent);
+// ── Inline title editing (single click) ──────────────────────────────────────
+chatTitleEl.style.cursor = 'text';
+chatTitleEl.title = 'Click to rename this chat';
+
+chatTitleEl.addEventListener('click', () => {
+  if (!currentSessionId) return;
+  if (chatTitleEl.querySelector('input')) return; // already editing
+
+  const originalTitle = chatTitleEl.textContent.trim();
+  chatTitleEl.textContent = '';
+
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.value = originalTitle;
+  input.className = 'title-edit-input';
+  input.maxLength = 80;
+  chatTitleEl.appendChild(input);
+  input.focus();
+  input.select();
+
+  async function commitRename() {
+    const newTitle = input.value.trim() || originalTitle;
+    chatTitleEl.textContent = newTitle;
+    if (newTitle !== originalTitle) {
+      try {
+        await fetch('/sessions/' + currentSessionId + '/rename', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title: newTitle }),
+        });
+        await loadSessions();
+      } catch(e) { showToast('Failed to rename'); }
+    }
+  }
+
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); input.blur(); }
+    if (e.key === 'Escape') { chatTitleEl.textContent = originalTitle; }
+  });
+  input.addEventListener('blur', commitRename);
 });
 
 window.addEventListener('load',async()=>{
   try{
+    // Auto-collapse sidebar on small screens
+    if(window.innerWidth<=700){
+      sidebar.classList.add('collapsed');
+      if(sidebarOpenBtn)sidebarOpenBtn.style.display='flex';
+    }
     setStatus('ready','Ready');
     textarea.focus();
     refreshTasksBadge();
@@ -538,4 +892,14 @@ window.addEventListener('load',async()=>{
     if(data.sessions&&data.sessions.length>0)await switchSession(data.sessions[0].id);
     else await newChat();
   }catch(e){console.error('Init error:',e);setStatus('ready','Ready');}
+});
+
+// Also close sidebar overlay on mobile when clicking outside it
+document.addEventListener('click', e => {
+  if(window.innerWidth > 700) return;
+  if(sidebar.classList.contains('collapsed')) return;
+  if(!sidebar.contains(e.target) && !sidebarOpenBtn?.contains(e.target)){
+    sidebar.classList.add('collapsed');
+    if(sidebarOpenBtn) sidebarOpenBtn.style.display='flex';
+  }
 });
