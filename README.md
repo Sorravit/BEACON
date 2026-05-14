@@ -81,7 +81,7 @@ Weaviate runs in Docker. Start it with `docker compose up -d`.
 | `AI_MODEL` | Model name | `gpt-3.5-turbo` |
 | `AI_TEMPERATURE` | Response creativity (0-2) | `0.7` |
 | `AI_MAX_TOKENS` | Max response tokens | `2000` |
-| `SLACK_WEBHOOK_URL` | Slack webhook for notifications | optional |
+| `SLACK_NOTIFICATION_URL` | Slack webhook for notifications | optional |
 | `TRANSFORMERS_OFFLINE` | Skip HuggingFace update checks | `1` (after first run) |
 
 ---
