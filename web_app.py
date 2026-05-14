@@ -611,7 +611,7 @@ async def stop_all_tasks():
 
 @app.get("/tasks/notifications")
 async def get_notifications():
-    """Read and consume all pending background task notification files."""
+    """Read and consume all pending background task notification files, saving to session."""
     notes = []
     os.makedirs("logs", exist_ok=True)
     for f in sorted(Path("logs").glob("notify_*.json")):
@@ -619,6 +619,26 @@ async def get_notifications():
             data = json.loads(f.read_text())
             notes.append(data)
             f.unlink()  # consume once — delete after reading
+
+            # Save notification as assistant message in the session so it persists
+            sid = data.get("session_id")
+            msg = data.get("message", "")
+            level = data.get("level", "info")
+            ts = data.get("ts") or datetime.now().isoformat()
+
+            if sid and sid in _sessions and msg:
+                s = _sessions[sid]
+                # Add a special marker so the frontend knows this is a notification
+                s["messages"].append({
+                    "role": "assistant",
+                    "content": msg,
+                    "ts": ts,
+                    "notification": True,
+                    "level": level,
+                    "task_name": data.get("task_name", "")
+                })
+                s["updated_at"] = ts
+                _save_session(sid)
         except Exception as e:
             logger.warning(f"Could not read notification {f}: {e}")
     return {"notifications": notes}

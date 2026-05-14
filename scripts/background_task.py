@@ -44,6 +44,26 @@ LOCK_DIR = "/tmp"
 LOG_DIR = "logs"
 
 
+def _write_notify(session_id: str, task_name: str, message: str, level: str = "info"):
+    """Write a notification file for the web server to pick up within 3 seconds."""
+    import json as _j, time as _t
+    from datetime import datetime as _dt
+    os.makedirs("logs", exist_ok=True)
+    ts = _t.strftime("%Y%m%d_%H%M%S") + f"_{int(_t.time() * 1000) % 1_000_000:06d}"
+    path = os.path.join("logs", f"notify_{ts}.json")
+    try:
+        with open(path, "w") as f:
+            _j.dump({
+                "session_id": session_id,
+                "task_name": task_name,
+                "message": message,
+                "level": level,
+                "ts": _dt.now().isoformat()
+            }, f)
+    except Exception:
+        pass
+
+
 def lockfile_path(name: str) -> str:
     return os.path.join(LOCK_DIR, f"bg_task_{name}.lock")
 
@@ -96,19 +116,46 @@ def is_running(name: str) -> tuple[bool, int | None]:
     return False, None
 
 
-def run_once(name: str, command: str) -> int:
-    """Run command, write PID, wait for completion. Returns exit code."""
+def run_once(name: str, command: str, session_id: str = None) -> int:
+    """Run command, write PID, stream output line-by-line (intercept NOTIFY markers). Returns exit code."""
     log(name, f"▶ Running: {command}")
     lf = logfile_path(name)
+    # Force unbuffered output so NOTIFY: lines are delivered line-by-line even when
+    # the child process is a Python script writing to a pipe (which would otherwise
+    # use 8 KB block-buffering, causing lines to be lost on SIGTERM).
+    child_env = os.environ.copy()
+    child_env["PYTHONUNBUFFERED"] = "1"
     proc = subprocess.Popen(
         command,
         shell=True,
-        stdout=open(lf, "a"),
+        stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        cwd=str(Path(__file__).parent.parent)
+        cwd=str(Path(__file__).parent.parent),
+        env=child_env,
     )
     write_pid(name, proc.pid)
     log(name, f"  PID: {proc.pid}")
+
+    # Stream output line-by-line: write to log AND intercept NOTIFY markers
+    NOTIFY_PREFIXES = [
+        ("ALERT:", "alert"),
+        ("WARNING:", "warning"),
+        ("SUCCESS:", "success"),
+        ("NOTIFY:", "info"),
+    ]
+    with open(lf, "a") as log_f:
+        for raw in proc.stdout:
+            line = raw.decode("utf-8", errors="replace").rstrip()
+            log_f.write(line + "\n")
+            log_f.flush()
+            # Check for notification marker
+            if session_id:
+                for prefix, level in NOTIFY_PREFIXES:
+                    if line.startswith(prefix):
+                        msg = line[len(prefix):].strip()
+                        _write_notify(session_id, name, msg, level)
+                        break
+
     proc.wait()
     log(name, f"  Exited with code: {proc.returncode}")
     return proc.returncode
@@ -135,7 +182,7 @@ def start_loop(name: str, command: str, interval: int, max_runs: int, session_id
         while True:
             log(name, f"─── Run #{runs + 1} {'(loop forever)' if max_runs == -1 else f'of {max_runs}'} ───")
             log(name, f"📋 Prompt/Command: {command}")
-            run_once(name, command)
+            run_once(name, command, session_id=session_id)
             runs += 1
 
             if max_runs != -1 and runs >= max_runs:
@@ -151,22 +198,10 @@ def start_loop(name: str, command: str, interval: int, max_runs: int, session_id
     finally:
         remove_lock(name)
         log(name, f"Task '{name}' stopped. Total runs: {runs}")
-        # Write notification for the originating chat session
         if session_id:
-            import json as _json
-            from datetime import datetime as _dt
-            notif_path = os.path.join("logs", f"notify_{name}.json")
-            os.makedirs("logs", exist_ok=True)
-            try:
-                with open(notif_path, "w") as _f:
-                    _json.dump({
-                        "session_id": session_id,
-                        "task_name": name,
-                        "message": f"✅ Background task '{name}' completed after {runs} run(s).",
-                        "ts": _dt.now().isoformat()
-                    }, _f)
-            except Exception:
-                pass
+            _write_notify(session_id, name,
+                          f"✅ Background task '{name}' completed after {runs} run(s).",
+                          "success")
 
 
 def cmd_start(name: str, command: str, interval: int, max_runs: int, detach: bool, session_id: str = None):

@@ -317,12 +317,19 @@ function renderSessionsList(sessions) {
     item.className = 'session-item' + (s.id === currentSessionId ? ' active' : '');
     item.dataset.id = s.id;
 
-    const label  = document.createElement('div');
+    const label  = document.createElement('a');
     label.className = 'session-label';
+    label.href = '/?session=' + encodeURIComponent(s.id);
     const prefix = s.running ? '<span class="session-running-dot" title="AI working\u2026"></span>' : '';
     label.innerHTML = prefix + escHtml(s.title || 'New Chat');
     label.title = (s.running ? '\u2699 Working\u2026 ' : '') + (s.title || 'New Chat');
-    label.onclick = () => { switchSession(s.id); closeSidebarOnMobile(); };
+    label.addEventListener('click', e => {
+        // Normal click — stay in same tab (prevent navigation)
+        e.preventDefault();
+        switchSession(s.id);
+        closeSidebarOnMobile();
+    });
+    // Cmd+Click and middle-click fall through to the browser's default new-tab behaviour
 
     const actions = document.createElement('div');
     actions.className = 'session-actions';
@@ -373,8 +380,24 @@ async function switchSession(id) {
     messagesEl.innerHTML = '';
     if (data.messages && data.messages.length > 0) {
       data.messages.forEach(msg => {
-        if (msg.role === 'user') { const b=createMessage('user', msg.ts); b.innerHTML=renderMarkdown(msg.content||''); }
-        else if (msg.role === 'assistant') { const b=createMessage('ai', msg.ts); b.innerHTML=renderMarkdown(msg.content||''); }
+        if (msg.role === 'user') {
+          const b = createMessage('user', msg.ts);
+          b.innerHTML = renderMarkdown(msg.content || '');
+        } else if (msg.role === 'assistant') {
+          const isNotif = msg.notification === true;
+          const b = createMessage('ai', msg.ts);
+          b.innerHTML = renderMarkdown(msg.content || '');
+          if (isNotif) {
+            const levelIcon = {alert: '🚨', warning: '⚠️', success: '✅', info: '📋'};
+            const icon = levelIcon[msg.level] || '⚙';
+            const msgRow = b.closest ? b.closest('.msg') : null;
+            if (msgRow) {
+              const avatar = msgRow.querySelector('.avatar');
+              if (avatar) avatar.textContent = icon;
+              msgRow.classList.add('notif-' + (msg.level || 'info'));
+            }
+          }
+        }
       });
       scrollToBottom();
     } else {
@@ -729,10 +752,23 @@ async function checkTaskNotifications() {
       if (sid === currentSessionId) {
         const b = createMessage('ai', note.ts || new Date().toISOString());
         b.innerHTML = renderMarkdown(msg);
+        // Change avatar icon based on notification level
+        const levelIcon = {alert: '🚨', warning: '⚠️', success: '✅', info: '📋'};
+        const icon = levelIcon[note.level] || '⚙';
+        const msgRow = b.closest ? b.closest('.msg') : null;
+        if (msgRow) {
+          const avatar = msgRow.querySelector('.avatar');
+          if (avatar) avatar.textContent = icon;
+          // Apply level-based styling to the message row
+          const level = note.level || 'info';
+          msgRow.classList.add('notif-' + level);
+        }
         scrollToBottom();
       }
       // Show a toast regardless
-      showToast('📋 ' + msg.slice(0, 60) + (msg.length > 60 ? '\u2026' : ''));
+      const levelEmoji = {alert:'🚨', warning:'⚠️', success:'✅', info:'📋'};
+      const emoji = levelEmoji[note.level] || '📋';
+      showToast(emoji + ' ' + msg.slice(0, 60) + (msg.length > 60 ? '\u2026' : ''));
       // Reload sessions list to update sidebar
       await loadSessions();
     }
@@ -766,15 +802,7 @@ function renderTasksList(tasks){
         <div class="task-name"><span class="task-running-dot ${task.running?'':'stopped'}" id="dot-${n}"></span>${escHtml(n)}</div>
         <div class="task-actions" id="actions-${n}">
           <button class="task-stop-btn" id="stop-${n}" onclick="event.stopPropagation();stopTask('${n}')" ${task.running?'':'disabled style="opacity:.35"'}>&#9646; Stop</button>
-          <button class="task-clear-btn" onclick="event.stopPropagation();showClearConfirm('${n}')">&#128465; Clear</button>
-          <div class="task-confirm" id="confirm-${n}">
-            <div class="task-confirm-title">What to do?</div>
-            <div class="task-confirm-btns">
-              <button class="task-confirm-btn clear-only" onclick="event.stopPropagation();clearLogOnly('${n}')">&#128465; Clear log</button>
-              <button class="task-confirm-btn stop-clear" onclick="event.stopPropagation();stopAndClear('${n}')">&#9646; Stop+clear</button>
-              <button class="task-confirm-btn cancel" onclick="event.stopPropagation();hideClearConfirm('${n}')">Cancel</button>
-            </div>
-          </div>
+          <button class="task-clear-btn" onclick="event.stopPropagation();clearLogOnly('${n}')">&#128465; Clear</button>
         </div></div>
         <div class="task-log" id="log-${n}"><div class="task-log-content" id="logcontent-${n}"></div></div>`;
       list.appendChild(item);
@@ -913,8 +941,16 @@ window.addEventListener('load',async()=>{
     refreshTasksBadge();
     await loadSessions();
     const res=await fetch('/sessions');const data=await res.json();
-    if(data.sessions&&data.sessions.length>0)await switchSession(data.sessions[0].id);
-    else await newChat();
+    // Check for ?session= URL param (e.g. from Cmd+Click opening a new tab)
+    const urlParams = new URLSearchParams(window.location.search);
+    const requestedSession = urlParams.get('session');
+    if (requestedSession && data.sessions && data.sessions.find(s => s.id === requestedSession)) {
+        await switchSession(requestedSession);
+    } else if(data.sessions&&data.sessions.length>0) {
+        await switchSession(data.sessions[0].id);
+    } else {
+        await newChat();
+    }
   }catch(e){console.error('Init error:',e);setStatus('ready','Ready');}
 });
 
