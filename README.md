@@ -29,7 +29,7 @@ cd beacon
 python3 -m venv venv
 source venv/bin/activate.fish   # fish shell
 pip install -r requirements.txt
-playwrigh install chromium
+playwright install chromium
 
 # 2. Configure
 cp config.example.env .env
@@ -64,7 +64,6 @@ Weaviate runs in Docker. Start it with `docker compose up -d`.
 | Files | `read_file`, `write_file`, `list_files` |
 | Web | `web_search`, `browser_navigate`, `browser_click`, `browser_type`, `browser_screenshot`, `browser_get_text`, `browser_close` |
 | HTTP | `http_get`, `http_post` |
-| Notifications | `slack_notify` |
 | Memory | `memory_list_facts`, `memory_add_fact`, `memory_delete_fact`, `memory_delete_research`, `memory_clear_research` |
 | Background Tasks | `delegate_background_task`, `stop_background_task`, `background_task_status` |
 | MCP (Playwright) | 21 additional browser automation tools |
@@ -76,12 +75,11 @@ Weaviate runs in Docker. Start it with `docker compose up -d`.
 
 | Variable | Description | Default |
 |---|---|---|
-| `OPENAI_API_KEY` | API key (OpenAI or IBM ICA) | required |
+| `OPENAI_API_KEY` | OpenAI API key | required |
 | `OPENAI_BASE_URL` | API endpoint | `https://api.openai.com/v1` |
 | `AI_MODEL` | Model name | `gpt-3.5-turbo` |
 | `AI_TEMPERATURE` | Response creativity (0-2) | `0.7` |
 | `AI_MAX_TOKENS` | Max response tokens | `2000` |
-| `SLACK_NOTIFICATION_URL` | Slack webhook for notifications | optional |
 | `TRANSFORMERS_OFFLINE` | Skip HuggingFace update checks | `1` (after first run) |
 
 ---
@@ -126,7 +124,7 @@ docs/                — Documentation
 - [ ] Specialized sub-agents (researcher, coder, tester)
 - [ ] Agent-to-agent communication
 - [ ] Web dashboard for agent monitoring
-- [ ] What ever Big wants to do
+- [ ] Whatever Big wants to do
 
 ---
 
