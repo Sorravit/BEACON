@@ -36,7 +36,7 @@ from main import AIAgent, Config
 logger = logging.getLogger(__name__)
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
-app = FastAPI(title="AI Assistant", version="4.4.0")
+app = FastAPI(title="Big's Personal AI Assistant", version="4.4.0")
 
 static_dir = Path("static")
 static_dir.mkdir(exist_ok=True)
@@ -54,9 +54,6 @@ _sessions: Dict[str, dict] = {}
 
 # ── Per-session background state ─────────────────────────────────────────────
 _bg: Dict[str, dict] = {}
-
-# Global agent lock – only one request may use _shared_agent at a time
-_agent_lock: Optional[asyncio.Lock] = None
 
 
 def _bg_state(session_id: str) -> dict:
@@ -107,22 +104,20 @@ def _load_all_sessions():
 
 
 async def _prepare_agent_for_session(session_id: str) -> Optional[AIAgent]:
+    """
+    DEPRECATED — do not call from web paths.
+    Previously mutated agent.conversation directly, which is unsafe for concurrent sessions.
+    The web path now uses _build_conversation() + get_response(conversation=...) instead.
+    Kept here only for backward-compatibility with any CLI callers; it is a no-op in web mode.
+    """
     if _shared_agent is None:
         return None
     s = _sessions.get(session_id)
     if s is None:
         return None
-    agent = _shared_agent
-    if agent.conversation and agent.conversation[0]["role"] == "system":
-        agent.conversation = [agent.conversation[0]]
-    else:
-        agent.conversation = []
-    for msg in s["messages"]:
-        role = msg.get("role")
-        content = msg.get("content", "")
-        if role in ("user", "assistant"):
-            agent.conversation.append({"role": role, "content": content})
-    return agent
+    # Return the agent without touching agent.conversation — callers must use
+    # _build_conversation() and pass the result as conversation= to get_response().
+    return _shared_agent
 
 
 def _create_session() -> str:
@@ -145,8 +140,7 @@ def _auto_title(text: str) -> str:
 
 @app.on_event("startup")
 async def startup_event():
-    global _config, _shared_agent, _agent_lock
-    _agent_lock = asyncio.Lock()
+    global _config, _shared_agent
     _config = Config()
     if not _config.validate():
         logger.error("API key not configured - set OPENAI_API_KEY in .env")
@@ -163,7 +157,9 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    if _shared_agent:
+    if _shared_agent and hasattr(_shared_agent, "shutdown"):
+        await _shared_agent.shutdown()
+    elif _shared_agent:
         if _shared_agent.tools:
             await _shared_agent.tools.cleanup()
         if _shared_agent.vector_memory:
@@ -300,17 +296,12 @@ async def chat_stream(req: ChatRequest):
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    agent = await _prepare_agent_for_session(sid)
-    if not agent:
+    if _shared_agent is None:
         async def err_gen2():
             yield " " + json.dumps({"type": "error", "content": "Agent not initialised"}) + "\n\n"
         return StreamingResponse(err_gen2(), media_type="text/event-stream")
 
-    # Reject if agent is busy with another session
-    if _agent_lock and _agent_lock.locked():
-        async def busy_gen():
-            yield " " + json.dumps({"type": "error", "content": "Agent is busy with another session. Please wait and try again."}) + "\n\n"
-        return StreamingResponse(busy_gen(), media_type="text/event-stream")
+    agent = _shared_agent
 
     # Reset buffer for the new request
     bg["event_buf"] = []
@@ -382,11 +373,31 @@ async def health():
 
 
 # ── Background agent task ─────────────────────────────────────────────────────
+def _build_conversation(agent: AIAgent, session_id: str) -> list:
+    """Build a fresh conversation list for this session (stateless per-request)."""
+    s = _sessions.get(session_id)
+    conv = []
+
+    # Start with system message from agent
+    if agent.conversation and agent.conversation[0]["role"] == "system":
+        conv.append(agent.conversation[0])
+
+    # Replay this session's messages
+    if s:
+        for msg in s["messages"]:
+            role = msg.get("role")
+            content = msg.get("content", "")
+            if role in ("user", "assistant"):
+                conv.append({"role": role, "content": content})
+
+    return conv
+
+
 async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent):
     """
     Run the agent completely decoupled from any HTTP connection.
-    Holds _agent_lock for the entire duration so no other session can
-    corrupt the shared agent state concurrently.
+    Each call gets its own ToolManager and conversation list, enabling
+    true parallel multi-session execution without any shared lock.
     """
     bg = _bg_state(session_id)
     s = _sessions.get(session_id)
@@ -409,48 +420,63 @@ async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent):
             s["updated_at"] = now
             _save_session(session_id)
 
+    # Build conversation from session history for stateless call
+    conversation = _build_conversation(agent, session_id)
+
     try:
-        async with _agent_lock:
-            original_execute = agent.tools.execute_tool if agent.tools else None
-            if original_execute:
-                async def instrumented_execute(name, args):
-                    args_preview = ", ".join(
-                        f"{k}={str(v)[:50]}" for k, v in args.items()
-                    ) if args else ""
-                    bg["activity"] = f"{name}({args_preview})"
-                    _emit({"type": "tool", "name": name, "args": args_preview})
-                    result = await original_execute(name, args)
-                    preview = str(result)
-                    if len(preview) > 400:
-                        preview = preview[:400] + "\u2026"
-                    bg["activity"] = f"Processing result from {name}..."
-                    _emit({"type": "result", "name": name, "content": preview})
-                    return result
-                agent.tools.execute_tool = instrumented_execute
+        # Create per-request ToolManager with shared browser
+        from main import ToolManager
+        per_request_tools = ToolManager(
+            vector_memory=agent.vector_memory,
+            mcp_manager=agent.mcp_manager,
+            shared_browser=agent._shared_browser,
+        )
+        await per_request_tools.initialize()
+        per_request_tools.session_id = session_id
 
-            bg["activity"] = "Thinking..."
-            try:
-                response = await agent.get_response(user_input)
-            finally:
-                if original_execute and agent.tools:
-                    agent.tools.execute_tool = original_execute
+        original_execute = per_request_tools.execute_tool
 
-            bg["activity"] = "Responding..."
-            content = response or ""
-            words = content.split(" ")
-            for i, word in enumerate(words):
-                chunk = word + (" " if i < len(words) - 1 else "")
-                _emit({"type": "token", "content": chunk})
-                await asyncio.sleep(0.008)
+        async def instrumented_execute(name, args):
+            args_preview = ", ".join(
+                f"{k}={str(v)[:50]}" for k, v in args.items()
+            ) if args else ""
+            bg["activity"] = f"{name}({args_preview})"
+            _emit({"type": "tool", "name": name, "args": args_preview})
+            result = await original_execute(name, args)
+            preview = str(result)
+            if len(preview) > 400:
+                preview = preview[:400] + "\u2026"
+            bg["activity"] = f"Processing result from {name}..."
+            _emit({"type": "result", "name": name, "content": preview})
+            return result
 
-            if s is not None:
-                now = datetime.now().isoformat()
-                # Only append the assistant reply — user message was already saved above
-                s["messages"].append({"role": "assistant", "content": content, "ts": now})
-                s["updated_at"] = now
-                _save_session(session_id)
+        per_request_tools.execute_tool = instrumented_execute
 
-            _emit({"type": "done"})
+        bg["activity"] = "Thinking..."
+        try:
+            # Pass per_request_tools directly — never swap agent.tools on the shared agent.
+            # This is the key fix: concurrent sessions each have their own ToolManager and
+            # pass it as tools= so get_response() uses it without touching self.tools.
+            response = await agent.get_response(user_input, conversation=conversation, tools=per_request_tools)
+        finally:
+            await per_request_tools.cleanup()
+
+        bg["activity"] = "Responding..."
+        content = response or ""
+        words = content.split(" ")
+        for i, word in enumerate(words):
+            chunk = word + (" " if i < len(words) - 1 else "")
+            _emit({"type": "token", "content": chunk})
+            await asyncio.sleep(0.008)
+
+        if s is not None:
+            now = datetime.now().isoformat()
+            # Only append the assistant reply — user message was already saved above
+            s["messages"].append({"role": "assistant", "content": content, "ts": now})
+            s["updated_at"] = now
+            _save_session(session_id)
+
+        _emit({"type": "done"})
 
     except asyncio.CancelledError:
         _emit({"type": "stopped", "content": "Stopped by user"})
@@ -581,6 +607,21 @@ async def stop_all_tasks():
             pass
         results[name] = status
     return {"status": "done", "tasks": results}
+
+
+@app.get("/tasks/notifications")
+async def get_notifications():
+    """Read and consume all pending background task notification files."""
+    notes = []
+    os.makedirs("logs", exist_ok=True)
+    for f in sorted(Path("logs").glob("notify_*.json")):
+        try:
+            data = json.loads(f.read_text())
+            notes.append(data)
+            f.unlink()  # consume once — delete after reading
+        except Exception as e:
+            logger.warning(f"Could not read notification {f}: {e}")
+    return {"notifications": notes}
 
 
 @app.post("/tasks/{name}/stop")

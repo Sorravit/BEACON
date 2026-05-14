@@ -114,7 +114,7 @@ def run_once(name: str, command: str) -> int:
     return proc.returncode
 
 
-def start_loop(name: str, command: str, interval: int, max_runs: int):
+def start_loop(name: str, command: str, interval: int, max_runs: int, session_id: str = None):
     """
     Run command in a loop.
     - interval=0  → run once, no repeat
@@ -151,9 +151,25 @@ def start_loop(name: str, command: str, interval: int, max_runs: int):
     finally:
         remove_lock(name)
         log(name, f"Task '{name}' stopped. Total runs: {runs}")
+        # Write notification for the originating chat session
+        if session_id:
+            import json as _json
+            from datetime import datetime as _dt
+            notif_path = os.path.join("logs", f"notify_{name}.json")
+            os.makedirs("logs", exist_ok=True)
+            try:
+                with open(notif_path, "w") as _f:
+                    _json.dump({
+                        "session_id": session_id,
+                        "task_name": name,
+                        "message": f"✅ Background task '{name}' completed after {runs} run(s).",
+                        "ts": _dt.now().isoformat()
+                    }, _f)
+            except Exception:
+                pass
 
 
-def cmd_start(name: str, command: str, interval: int, max_runs: int, detach: bool):
+def cmd_start(name: str, command: str, interval: int, max_runs: int, detach: bool, session_id: str = None):
     """Start the task, optionally detached."""
     alive, pid = is_running(name)
     if alive:
@@ -171,6 +187,8 @@ def cmd_start(name: str, command: str, interval: int, max_runs: int, detach: boo
             "--max-runs", str(max_runs),
             "--no-detach"
         ]
+        if session_id:
+            args += ["--session-id", session_id]
         proc = subprocess.Popen(
             args,
             stdout=open(lf, "a"),
@@ -183,7 +201,7 @@ def cmd_start(name: str, command: str, interval: int, max_runs: int, detach: boo
         print(f"   Log: {lf}")
         print(f"   Stop: python scripts/background_task.py --stop --name {name}")
     else:
-        start_loop(name, command, interval, max_runs)
+        start_loop(name, command, interval, max_runs, session_id=session_id)
 
 
 def cmd_stop(name: str):
@@ -231,6 +249,8 @@ def main():
     parser.add_argument("--status", action="store_true", help="Show task status")
     parser.add_argument("--no-detach", action="store_true",
                         help="Run in foreground (used internally for detached launch)")
+    parser.add_argument("--session-id", default=None,
+                        help="Chat session ID to notify when task completes")
     args = parser.parse_args()
 
     if args.status:
@@ -245,7 +265,7 @@ def main():
             print("Error: --name required with --command")
             sys.exit(1)
         detach = not args.no_detach
-        cmd_start(args.name, args.command, args.interval, args.max_runs, detach)
+        cmd_start(args.name, args.command, args.interval, args.max_runs, detach, session_id=args.session_id)
     else:
         parser.print_help()
 

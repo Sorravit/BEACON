@@ -380,7 +380,7 @@ async function switchSession(id) {
     } else {
       const es = document.createElement('div');
       es.className = 'empty-state'; es.id = 'empty-state-active';
-      es.innerHTML = `<div class="empty-icon">🤖</div><div class="empty-title">AI Assistant</div>
+      es.innerHTML = `<div class="empty-icon">🤖</div><div class="empty-title">Big's Personal AI Assistant</div>
         <div class="empty-subtitle">Ask me anything.</div>
         <div class="suggestions">
           <span class="suggestion-chip" onclick="useSuggestion('What time is it?')">🕐 What time is it?</span>
@@ -448,7 +448,7 @@ async function deleteSession(id) {
   if (!confirm('Delete this chat? This cannot be undone.')) return;
   try {
     await fetch(`/sessions/${id}`, {method:'DELETE'});
-    if (id === currentSessionId) { currentSessionId=null; chatTitleEl.textContent='AI Assistant'; messagesEl.innerHTML=''; }
+    if (id === currentSessionId) { currentSessionId=null; chatTitleEl.textContent="Big's Personal AI Assistant"; messagesEl.innerHTML=''; }
     await loadSessions();
     if (!currentSessionId) {
       const res=await fetch('/sessions'); const data=await res.json();
@@ -492,7 +492,7 @@ async function clearChat(){
   await fetch('/chat/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:'',session_id:currentSessionId})});
   messagesEl.innerHTML='';
   const es=document.createElement('div');es.className='empty-state';es.id='empty-state-active';
-  es.innerHTML='<div class="empty-icon">🤖</div><div class="empty-title">AI Assistant</div><div class="empty-subtitle">Ask me anything.</div>';
+  es.innerHTML='<div class="empty-icon">🤖</div><div class="empty-title">Big\'s Personal AI Assistant</div><div class="empty-subtitle">Ask me anything.</div>';
   messagesEl.appendChild(es);showToast('Conversation cleared');
 }
 
@@ -717,6 +717,28 @@ function initDrag(panel){
 async function refreshTasksList(){
   try{const r=await fetch('/tasks');const d=await r.json();renderTasksList(d.tasks||[]);}catch(e){}
 }
+async function checkTaskNotifications() {
+  try {
+    const r = await fetch('/tasks/notifications');
+    const d = await r.json();
+    const notes = d.notifications || [];
+    for (const note of notes) {
+      const sid = note.session_id;
+      const msg = note.message || ('Background task \'' + (note.task_name||'') + '\' completed.');
+      // Inject into chat if it's the currently viewed session
+      if (sid === currentSessionId) {
+        const b = createMessage('ai', note.ts || new Date().toISOString());
+        b.innerHTML = renderMarkdown(msg);
+        scrollToBottom();
+      }
+      // Show a toast regardless
+      showToast('📋 ' + msg.slice(0, 60) + (msg.length > 60 ? '\u2026' : ''));
+      // Reload sessions list to update sidebar
+      await loadSessions();
+    }
+  } catch(e) {}
+}
+
 async function refreshTasksBadge(){
   try{
     const r=await fetch('/tasks');const d=await r.json();
@@ -724,6 +746,8 @@ async function refreshTasksBadge(){
     const b=document.getElementById('tasks-badge');if(b){b.textContent=run;b.classList.toggle('visible',run>0);}
     const c=document.getElementById('tasks-count');if(c)c.textContent=(d.tasks||[]).length;
   }catch(e){}
+  // Check for background task completion notifications
+  await checkTaskNotifications();
   setTimeout(refreshTasksBadge,3000);
 }
 

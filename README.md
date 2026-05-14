@@ -1,8 +1,22 @@
-# AI Assistant
+# 🔦 BEACON
+### Big's Executing Agent for Control, Automation & Orchestration Network
 
-**Version:** 4.2.0 | **Status:** Production Ready
+**Version:** 4.2.0 | **Status:** Production Ready | **Author:** Big (Sorravit)
 
-Autonomous AI agent with browser automation, web search, file operations, and persistent vector memory.
+> BEACON is a personal autonomous AI agent that executes tasks, automates workflows, browses the web, manages files, and remembers everything — designed to evolve into a full multi-agent orchestration system.
+
+---
+
+## ✨ What is BEACON?
+
+BEACON started as a single intelligent agent and is built to grow. Whether running solo or orchestrating a network of specialized agents, BEACON remains your central command — the lighthouse that guides every task to completion.
+
+| Today | Tomorrow |
+|-------|----------|
+| Single autonomous agent | Multi-agent orchestration network |
+| Personal task automation | Distributed intelligent services |
+| Tool execution & memory | Agents with specialized roles |
+| One BEACON | Many agents, one BEACON at the center |
 
 ---
 
@@ -11,11 +25,11 @@ Autonomous AI agent with browser automation, web search, file operations, and pe
 ```bash
 # 1. Setup
 git clone <repository>
-cd ClineSandbox
+cd beacon
 python3 -m venv venv
 source venv/bin/activate.fish   # fish shell
 pip install -r requirements.txt
-playwright install chromium
+playwrigh install chromium
 
 # 2. Configure
 cp config.example.env .env
@@ -32,10 +46,10 @@ python main.py
 
 ## 🧠 Vector Memory (Weaviate)
 
-The agent has persistent semantic memory backed by Weaviate:
+BEACON has persistent semantic memory backed by Weaviate. It remembers across sessions — you never have to repeat yourself.
 
-- **Personal facts** — tells the agent things about you ("I have a Samsung oven") and it remembers permanently across sessions
-- **Research memory** — every tool result is stored and retrieved semantically, so the agent never re-fetches what it already knows
+- **Personal facts** — tell BEACON things about you once, it remembers permanently
+- **Research memory** — every tool result is stored and retrieved semantically, so BEACON never re-fetches what it already knows
 - **Memory tools** — `memory_list_facts`, `memory_add_fact`, `memory_delete_fact`, `memory_delete_research`, `memory_clear_research`
 
 Weaviate runs in Docker. Start it with `docker compose up -d`.
@@ -52,7 +66,9 @@ Weaviate runs in Docker. Start it with `docker compose up -d`.
 | HTTP | `http_get`, `http_post` |
 | Notifications | `slack_notify` |
 | Memory | `memory_list_facts`, `memory_add_fact`, `memory_delete_fact`, `memory_delete_research`, `memory_clear_research` |
+| Background Tasks | `delegate_background_task`, `stop_background_task`, `background_task_status` |
 | MCP (Playwright) | 21 additional browser automation tools |
+| MCP (Atlassian) | Jira, Confluence, Compass integrations |
 
 ---
 
@@ -73,7 +89,7 @@ Weaviate runs in Docker. Start it with `docker compose up -d`.
 ## 📁 Project Structure
 
 ```
-main.py              — Main agent entry point
+main.py              — BEACON main entry point
 agent_api.py         — Programmatic API wrapper
 agent_executor.py    — Autonomous task execution engine
 lib/
@@ -94,8 +110,23 @@ docs/                — Documentation
 | Command | Action |
 |---|---|
 | `clear` | Clear conversation history |
-| `quit` / `exit` | Exit the agent |
+| `quit` / `exit` | Exit BEACON |
 | `help` | Show usage examples |
+
+---
+
+## 🗺️ Roadmap
+
+- [x] Single autonomous agent
+- [x] Persistent vector memory (Weaviate)
+- [x] Browser automation (Playwright)
+- [x] MCP integrations (Jira, Confluence)
+- [x] Background task delegation
+- [ ] Multi-agent orchestration
+- [ ] Specialized sub-agents (researcher, coder, tester)
+- [ ] Agent-to-agent communication
+- [ ] Web dashboard for agent monitoring
+- [ ] What ever Big wants to do
 
 ---
 
@@ -105,3 +136,7 @@ docs/                — Documentation
 - [Configuration](docs/CONFIGURATION.md)
 - [API Reference](docs/API_REFERENCE.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
+
+---
+
+<p align="center">Built by Big · Powered by BEACON 🔦</p>

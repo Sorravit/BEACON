@@ -67,3 +67,7 @@ htmlcov/
 output/
 
 .chat_history
+
+# Temporary and session data
+temp/
+sessions/

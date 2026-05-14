@@ -80,15 +80,18 @@ logger = logging.getLogger(__name__)
 class ToolManager:
     """Manages all agent tools including file, browser, and HTTP operations."""
     
-    def __init__(self, vector_memory=None, mcp_manager=None):
+    def __init__(self, vector_memory=None, mcp_manager=None, shared_browser=None):
         """Initialize the tool manager."""
         self.tools: List[Dict[str, Any]] = []
         self.tool_handlers: Dict[str, Callable] = {}
-        self.browser = None
-        self.page = None
+        self._shared_browser = shared_browser  # optionally receive a shared browser process
+        self.browser = None        # the browser process (can be shared)
+        self.page = None           # per-request page (from a per-request context)
+        self._context = None       # per-request browser context
         self.playwright = None
         self.vector_memory = vector_memory
         self.mcp_manager = mcp_manager
+        self.session_id = None     # set by web_app.py before each request
         
     async def initialize(self):
         """Initialize tools"""
@@ -286,13 +289,22 @@ class ToolManager:
     
     # Browser tools
     async def _ensure_browser(self):
-        """Ensure browser is running"""
-        if not self.browser:
+        """Get or create a per-request browser context and page."""
+        if self._shared_browser:
+            # Use shared browser process, create isolated context
+            self.browser = self._shared_browser
+        elif not self.browser:
+            # Create our own browser process
             from playwright.async_api import async_playwright
             self.playwright = await async_playwright().start()
             self.browser = await self.playwright.chromium.launch(headless=False)
-            self.page = await self.browser.new_page()
             logger.info("Browser launched")
+
+        # Create a per-request context if not already done
+        if not self._context:
+            self._context = await self.browser.new_context()
+            self.page = await self._context.new_page()
+            logger.info("Browser context created")
         return self.page
     
     async def _browser_navigate(self, url: str):
@@ -392,6 +404,8 @@ class ToolManager:
                 "--max-runs", "-1" if interval > 0 else "1",
                 "--no-detach",   # already launching detached below; skip the double-fork
             ]
+            if self.session_id:
+                args += ["--session-id", self.session_id]
             proc = subprocess.Popen(
                 args,
                 stdout=open(f"logs/bg_{name}.log", "a"),
@@ -576,12 +590,28 @@ class ToolManager:
         return normalized
     
     async def cleanup(self):
-        """Cleanup resources"""
+        """Clean up per-request resources (context/page only, not shared browser)."""
         try:
-            if self.browser:
-                await self._browser_close()
+            if self._context:
+                await self._context.close()
+                self._context = None
+                self.page = None
         except:
             pass
+        # Only close the browser process if WE own it (not shared)
+        if not self._shared_browser:
+            try:
+                if self.browser:
+                    await self.browser.close()
+                    self.browser = None
+            except:
+                pass
+            try:
+                if self.playwright:
+                    await self.playwright.stop()
+                    self.playwright = None
+            except:
+                pass
 
 
 class Config:
@@ -639,6 +669,8 @@ class AIAgent:
         self.tools_available = False
         self.vector_memory: Optional[VectorMemory] = None
         self.memory_available = False
+        self._shared_browser = None  # shared Playwright browser process
+        self._playwright = None
     
     async def initialize(self) -> bool:
         """
@@ -841,11 +873,15 @@ class AIAgent:
                 f'Respond ONLY with JSON like: {{"topic": "oven", "fact": "I have a Samsung NV75K5571RS oven"}}\n'
                 f'If no personal fact found, respond: {{"topic": null, "fact": null}}'
             )
-            extraction_response = self.client.chat.completions.create(
+            _loop = asyncio.get_running_loop()
+            _extract_params = dict(
                 model=self.config.model,
                 messages=[{"role": "user", "content": extraction_prompt}],
                 temperature=0,
                 max_tokens=100
+            )
+            extraction_response = await _loop.run_in_executor(
+                None, lambda: self.client.chat.completions.create(**_extract_params)
             )
             text = extraction_response.choices[0].message.content or ""
             # Parse JSON
@@ -960,26 +996,39 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
         
         return tool_calls
     
-    async def get_response(self, user_input: str) -> Optional[str]:
+    async def get_response(self, user_input: str, conversation: Optional[List[Dict]] = None, tools: Optional["ToolManager"] = None) -> Optional[str]:
         """
         Get AI response with prompt-based tool execution loop (Cline/Roo style).
         
         Args:
             user_input: User's message
+            conversation: Optional external conversation list (stateless/per-request mode).
+                          If None, falls back to self.conversation (CLI/backward-compat mode).
+            tools: Optional per-request ToolManager. If provided, used instead of self.tools so
+                   concurrent requests never share or mutate the agent's tool reference.
             
         Returns:
             Optional[str]: AI response or None if error occurred
         """
         if not self.client:
             return None
+
+        # Resolve which ToolManager to use for this call — never mutate self.tools
+        effective_tools = tools if tools is not None else self.tools
+
+        # Use passed-in conversation or fall back to self.conversation (backward compat)
+        if conversation is not None:
+            conv = conversation  # stateless mode: caller owns this list
+        else:
+            conv = self.conversation  # CLI mode: mutate self.conversation as before
         
         try:
             # Add tools description to system message if not already present (once only)
-            if self.tools_available and len(self.conversation) > 0:
-                if self.conversation[0]["role"] == "system":
+            if self.tools_available and len(conv) > 0:
+                if conv[0]["role"] == "system":
                     tools_prompt = self._build_tools_prompt()
-                    if tools_prompt not in self.conversation[0]["content"]:
-                        self.conversation[0]["content"] += tools_prompt
+                    if tools_prompt not in conv[0]["content"]:
+                        conv[0]["content"] += tools_prompt
 
             # --- Vector memory: detect and store personal facts from user input ---
             if self.memory_available and self.vector_memory:
@@ -995,10 +1044,10 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                 memory_prefix = raw_prefix
 
             user_message = (memory_prefix + user_input) if memory_prefix else user_input
-            self.conversation.append({"role": "user", "content": user_message})
+            conv.append({"role": "user", "content": user_message})
 
             # Trim AFTER adding the new message so trimming sees the full picture
-            self._trim_conversation()
+            self._trim_conversation(conv)
             
             # Agent loop - allow multiple tool calls
             # For long-running tasks (courses, etc.), use a very high limit
@@ -1006,14 +1055,17 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
             for iteration in range(MAX_TOOL_ITERATIONS):
                 params = {
                     "model": self.config.model,
-                    "messages": self.conversation,
+                    "messages": conv,
                     "temperature": self.config.temperature,
                     "max_tokens": self.config.max_tokens
                 }
                 
                 # NO tools parameter - use prompt-based approach instead
                 
-                response = self.client.chat.completions.create(**params)
+                _loop = asyncio.get_running_loop()
+                response = await _loop.run_in_executor(
+                    None, lambda: self.client.chat.completions.create(**params)
+                )
                 response_text = response.choices[0].message.content
                 
                 if not response_text:
@@ -1024,7 +1076,7 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                 
                 if tool_calls:
                     # Add assistant's response with tool calls
-                    self.conversation.append({
+                    conv.append({
                         "role": "assistant",
                         "content": response_text
                     })
@@ -1039,15 +1091,16 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                         
                         # Check if it's a built-in tool first, then MCP tool
                         # NOTE: mcp_list_servers / mcp_restart_* are built-in tools despite the mcp_ prefix
-                        is_builtin = self.tools and tool_name in self.tools.tool_handlers
+                        # Use effective_tools (per-request or self.tools) — never read self.tools here
+                        is_builtin = effective_tools and tool_name in effective_tools.tool_handlers
                         if is_builtin:
-                            tool_result = await self.tools.execute_tool(tool_name, tool_args)
+                            tool_result = await effective_tools.execute_tool(tool_name, tool_args)
                         elif tool_name.startswith("mcp_") and self.mcp_manager:
                             tool_result = await self.mcp_manager.call_tool(tool_name, tool_args)
                             if tool_result is None:
                                 tool_result = json.dumps({"error": f"Unknown tool: {tool_name}"})
-                        elif self.tools:
-                            tool_result = await self.tools.execute_tool(tool_name, tool_args)
+                        elif effective_tools:
+                            tool_result = await effective_tools.execute_tool(tool_name, tool_args)
                         else:
                             tool_result = json.dumps({"error": "No tool manager available"})
                         
@@ -1070,7 +1123,7 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                     
                     # Add tool results as user message
                     results_text = "\n\n".join(tool_results)
-                    self.conversation.append({
+                    conv.append({
                         "role": "user",
                         "content": f"Tool execution results:\n\n{results_text}\n\nPlease provide your final response based on these results."
                     })
@@ -1079,7 +1132,7 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                     continue
                 else:
                     # No tool calls found, this is the final response
-                    self.conversation.append({"role": "assistant", "content": response_text})
+                    conv.append({"role": "assistant", "content": response_text})
                     return response_text
             
             # If we hit max iterations, inform user but don't fail
@@ -1090,8 +1143,8 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
             logger.error(f"Error: {e}")
             import traceback
             traceback.print_exc()
-            if self.conversation and self.conversation[-1]["role"] == "user":
-                self.conversation.pop()
+            if conv and conv[-1]["role"] == "user":
+                conv.pop()
             return None
     
     def _estimate_tokens(self, text: str) -> int:
@@ -1101,20 +1154,22 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
         """
         return len(text) // 4
     
-    def _get_conversation_tokens(self) -> int:
-        """Calculate total tokens in current conversation"""
+    def _get_conversation_tokens(self, conv: List[Dict]) -> int:
+        """Calculate total tokens in a conversation list"""
         total = 0
-        for msg in self.conversation:
+        for msg in conv:
             content = msg.get("content", "")
             total += self._estimate_tokens(content)
         return total
     
-    def _trim_conversation(self):
+    def _trim_conversation(self, conv: List[Dict]):
         """
         Dynamically trim conversation history based on token count.
         Keeps system message and as many recent messages as possible within token limit.
+        Operates on the passed-in conversation list (works for both self.conversation and
+        per-request conversation lists).
         """
-        total_tokens = self._get_conversation_tokens()
+        total_tokens = self._get_conversation_tokens(conv)
         
         # If under limit, no trimming needed
         if total_tokens <= MAX_CONVERSATION_TOKENS:
@@ -1123,8 +1178,8 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
         # Keep system message (first message with tools description)
         system_msg = None
         start_idx = 0
-        if self.conversation and self.conversation[0]["role"] == "system":
-            system_msg = self.conversation[0]
+        if conv and conv[0]["role"] == "system":
+            system_msg = conv[0]
             start_idx = 1
         
         # Calculate tokens for system message
@@ -1136,7 +1191,7 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
         current_tokens = 0
         
         # Iterate from most recent to oldest
-        for msg in reversed(self.conversation[start_idx:]):
+        for msg in reversed(conv[start_idx:]):
             msg_tokens = self._estimate_tokens(msg.get("content", ""))
             if current_tokens + msg_tokens <= available_tokens:
                 kept_messages.insert(0, msg)  # Insert at beginning to maintain order
@@ -1144,19 +1199,39 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
             else:
                 break  # Stop when we would exceed limit
         
-        # Rebuild conversation
-        self.conversation.clear()
+        # Rebuild conversation in-place
+        conv.clear()
         if system_msg:
-            self.conversation.append(system_msg)
-        self.conversation.extend(kept_messages)
+            conv.append(system_msg)
+        conv.extend(kept_messages)
         
-        new_total = self._get_conversation_tokens()
+        new_total = self._get_conversation_tokens(conv)
         logger.info(f"Trimmed conversation: {total_tokens} → {new_total} tokens ({len(kept_messages)} messages kept)")
     
     def clear(self):
         """Clear all conversation history"""
         self.conversation.clear()
-    
+
+    async def shutdown(self):
+        """Shut down agent resources including the shared browser process."""
+        if self.tools:
+            await self.tools.cleanup()
+        # Close shared browser process owned by this agent
+        try:
+            if self._shared_browser:
+                await self._shared_browser.close()
+                self._shared_browser = None
+        except:
+            pass
+        try:
+            if self._playwright:
+                await self._playwright.stop()
+                self._playwright = None
+        except:
+            pass
+        if self.vector_memory:
+            self.vector_memory.close()
+
     async def run(self, mode: str = "chat"):
         """
         Run the agent in specified mode.
@@ -1260,10 +1335,7 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                 logger.error(f"Error: {e}")
                 print("❌ An error occurred")
         
-        if self.tools:
-            await self.tools.cleanup()
-        if self.vector_memory:
-            self.vector_memory.close()
+        await self.shutdown()
 
 
 async def main():
