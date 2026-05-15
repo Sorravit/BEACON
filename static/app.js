@@ -21,9 +21,33 @@ let _renameTarget    = null;
 let taskLogStreams   = {};
 let _dragInit        = false;
 let _currentReader   = null;   // active SSE reader so we can cancel client-side too
-let _activityPollTimer = null; // activity polling interval
 // Per-session streaming check
 function isStreamingSession(sid) { return _streamingSet.has(sid); }
+
+// ── Tab visibility + title flash ──────────────────────────────────────────────
+let _tabHidden = false;
+let _origTitle = document.title;
+let _flashInterval = null;
+
+function flashTabTitle(msg) {
+    if (!_tabHidden) return;
+    if (_flashInterval) return; // already flashing
+    let alt = false;
+    _flashInterval = setInterval(() => {
+        document.title = alt ? msg : _origTitle;
+        alt = !alt;
+    }, 1000);
+}
+
+function stopFlashTitle() {
+    if (_flashInterval) { clearInterval(_flashInterval); _flashInterval = null; }
+    document.title = _origTitle;
+}
+
+document.addEventListener('visibilitychange', () => {
+    _tabHidden = document.hidden;
+    if (!document.hidden) stopFlashTitle();
+});
 
 // ── Stop button + activity bar refs ───────────────────────────────────────────
 const stopBtn      = document.getElementById('stop-btn');
@@ -39,27 +63,9 @@ async function stopAI() {
   try { await fetch('/chat/stop/' + currentSessionId, { method: 'POST' }); } catch(e) {}
   hideStopBtn();
   setActivity('');
-  stopActivityPoll();
   _streamingSet.delete(currentSessionId);
   sendBtn.disabled = false;
   setStatus('ready', 'Stopped');
-}
-
-function startActivityPoll(sid) {
-  stopActivityPoll();
-  _activityPollTimer = setInterval(async () => {
-    if (!_streamingSet.has(sid)) { stopActivityPoll(); return; }
-    try {
-      const r = await fetch('/chat/status/' + sid);
-      const d = await r.json();
-      if (d.running && d.activity) setActivity('\u2699 ' + d.activity);
-      else if (!d.running) stopActivityPoll();
-    } catch(e) {}
-  }, 800);
-}
-
-function stopActivityPoll() {
-  if (_activityPollTimer) { clearInterval(_activityPollTimer); _activityPollTimer = null; }
 }
 
 // ── File attachment state ─────────────────────────────────────────────────────
@@ -207,6 +213,17 @@ function renderMarkdown(text) {
   let html = text
     .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
     .replace(/```(\w*)\n?([\s\S]*?)```/g,(_,lang,code)=>`<pre><button class="copy-btn" onclick="copyCode(this)">Copy</button><code class="lang-${lang}">${code.trim()}</code></pre>`)
+    // Markdown tables
+    .replace(/^(\|.+\|)\n\|([-| :]+)\|\n((?:\|.+\|\n?)*)/gm, (_, header, sep, rows) => {
+        const ths = header.split('|').filter((_,i,a) => i > 0 && i < a.length-1)
+            .map(h => `<th>${h.trim()}</th>`).join('');
+        const trs = rows.trim().split('\n').map(row => {
+            const tds = row.split('|').filter((_,i,a) => i > 0 && i < a.length-1)
+                .map(c => `<td>${c.trim()}</td>`).join('');
+            return `<tr>${tds}</tr>`;
+        }).join('');
+        return `<table><thead><tr>${ths}</tr></thead><tbody>${trs}</tbody></table>`;
+    })
     .replace(/`([^`]+)`/g,'<code>$1</code>')
     .replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>')
     .replace(/\*(.+?)\*/g,'<em>$1</em>')
@@ -421,7 +438,7 @@ async function reconnectToSession(id) {
   if (isStreamingSession(id)) return;
   _streamingSet.add(id);
   if (id === currentSessionId) {
-    sendBtn.disabled = true; showStopBtn(); startActivityPoll(id);
+    sendBtn.disabled = true; showStopBtn();
     setStatus('thinking', 'Working\u2026');
   }
   const ab = createMessage('ai');
@@ -462,7 +479,7 @@ async function reconnectToSession(id) {
   } catch(err) {
     if(err.name!=='AbortError'){const ed=document.createElement('div');ed.style.cssText='color:#f87171;font-size:13px';ed.textContent='\u26a0 '+err.message;ab.appendChild(ed);}
   } finally {
-    if(id===currentSessionId){_currentReader=null;hideStopBtn();stopActivityPoll();setActivity('');setStatus('ready','Ready');}
+    if(id===currentSessionId){_currentReader=null;hideStopBtn();setActivity('');setStatus('ready','Ready');}
     _streamingSet.delete(id);sendBtn.disabled=false;scrollToBottom();
   }
 }
@@ -564,7 +581,7 @@ async function sendMessage(){
   textarea.value='';textarea.style.height='auto';
   _attachedFiles=[];renderFilePreviews();
   _streamingSet.add(currentSessionId);sendBtn.disabled=true;setStatus('thinking','Thinking\u2026');
-  showStopBtn();startActivityPoll(currentSessionId);
+  showStopBtn();
 
   const ab=createMessage('ai', _msgNow);
   const tBl=document.createElement('div');tBl.className='thinking-block';
@@ -614,6 +631,7 @@ async function sendMessage(){
           await loadSessions();
           const ud=await(await fetch('/sessions/'+currentSessionId)).json();
           chatTitleEl.textContent=ud.title||'New Chat';
+          flashTabTitle("✅ Big's AI replied");
         }else if(ev.type==='stopped'){
           tBo.classList.remove('open');
           tIc.innerHTML='<span style="color:var(--yellow);font-size:13px">\u23F9</span>';
@@ -634,7 +652,6 @@ async function sendMessage(){
     _streamingSet.delete(currentSessionId);
     sendBtn.disabled=false;
     hideStopBtn();
-    stopActivityPoll();
     setActivity('');
     setStatus('ready','Ready');
     scrollToBottom();
@@ -740,41 +757,76 @@ function initDrag(panel){
 async function refreshTasksList(){
   try{const r=await fetch('/tasks');const d=await r.json();renderTasksList(d.tasks||[]);}catch(e){}
 }
-async function checkTaskNotifications() {
-  try {
-    const r = await fetch('/tasks/notifications');
-    const d = await r.json();
-    const notes = d.notifications || [];
-    for (const note of notes) {
-      const sid = note.session_id;
-      const msg = note.message || ('Background task \'' + (note.task_name||'') + '\' completed.');
-      // Inject into chat if it's the currently viewed session
-      if (sid === currentSessionId) {
-        const b = createMessage('ai', note.ts || new Date().toISOString());
-        b.innerHTML = renderMarkdown(msg);
-        // Change avatar icon based on notification level
-        const levelIcon = {alert: '🚨', warning: '⚠️', success: '✅', info: '📋'};
-        const icon = levelIcon[note.level] || '⚙';
-        const msgRow = b.closest ? b.closest('.msg') : null;
-        if (msgRow) {
-          const avatar = msgRow.querySelector('.avatar');
-          if (avatar) avatar.textContent = icon;
-          // Apply level-based styling to the message row
-          const level = note.level || 'info';
-          msgRow.classList.add('notif-' + level);
-        }
-        scrollToBottom();
+
+// ── SSE event stream (replaces polling) ──────────────────────────────────────
+let _eventSource = null;
+
+function initEventStream() {
+  if (_eventSource) { _eventSource.close(); _eventSource = null; }
+  _eventSource = new EventSource('/events');
+
+  _eventSource.onmessage = async (e) => {
+    try {
+      const d = JSON.parse(e.data);
+
+      // Update tasks badge
+      const tasks = d.tasks || [];
+      const run = tasks.filter(t => t.running).length;
+      const b = document.getElementById('tasks-badge');
+      if (b) { b.textContent = run; b.classList.toggle('visible', run > 0); }
+      const c = document.getElementById('tasks-count');
+      if (c) c.textContent = tasks.length;
+
+      // Update tasks list if panel is open
+      const panel = document.getElementById('tasks-panel');
+      if (panel && panel.classList.contains('open')) {
+        renderTasksList(tasks);
       }
-      // Show a toast regardless
-      const levelEmoji = {alert:'🚨', warning:'⚠️', success:'✅', info:'📋'};
-      const emoji = levelEmoji[note.level] || '📋';
-      showToast(emoji + ' ' + msg.slice(0, 60) + (msg.length > 60 ? '\u2026' : ''));
-      // Reload sessions list to update sidebar
-      await loadSessions();
-    }
-  } catch(e) {}
+
+      // Process notifications
+      const notes = d.notifications || [];
+      for (const note of notes) {
+        const sid = note.session_id;
+        const msg = note.message || ('Background task \'' + (note.task_name || '') + '\' completed.');
+        if (sid === currentSessionId) {
+          const b2 = createMessage('ai', note.ts || new Date().toISOString());
+          b2.innerHTML = renderMarkdown(msg);
+          const levelIcon = {alert: '🚨', warning: '⚠️', success: '✅', info: '📋'};
+          const icon = levelIcon[note.level] || '⚙';
+          const msgRow = b2.closest ? b2.closest('.msg') : null;
+          if (msgRow) {
+            const avatar = msgRow.querySelector('.avatar');
+            if (avatar) avatar.textContent = icon;
+            msgRow.classList.add('notif-' + (note.level || 'info'));
+          }
+          scrollToBottom();
+        }
+        const levelEmoji = {alert: '🚨', warning: '⚠️', success: '✅', info: '📋'};
+        const emoji = levelEmoji[note.level] || '📋';
+        showToast(emoji + ' ' + msg.slice(0, 60) + (msg.length > 60 ? '\u2026' : ''));
+        flashTabTitle('🔔 ' + msg.slice(0, 30));
+        await loadSessions();
+      }
+
+      // Update activity status for current session via SSE (replaces /chat/status/ polling)
+      const activity = d.activity || {};
+      const currentActivity = activity[currentSessionId];
+      if (currentActivity) {
+        setActivity('\u2699 ' + currentActivity);
+      } else if (currentSessionId && !isStreamingSession(currentSessionId)) {
+        setActivity('');
+      }
+    } catch(err) { console.warn('Event stream parse error:', err); }
+  };
+
+  _eventSource.onerror = () => {
+    _eventSource.close();
+    _eventSource = null;
+    setTimeout(initEventStream, 5000);
+  };
 }
 
+// Keep refreshTasksBadge as a one-shot helper (used after task stop/clear actions)
 async function refreshTasksBadge(){
   try{
     const r=await fetch('/tasks');const d=await r.json();
@@ -782,9 +834,6 @@ async function refreshTasksBadge(){
     const b=document.getElementById('tasks-badge');if(b){b.textContent=run;b.classList.toggle('visible',run>0);}
     const c=document.getElementById('tasks-count');if(c)c.textContent=(d.tasks||[]).length;
   }catch(e){}
-  // Check for background task completion notifications
-  await checkTaskNotifications();
-  setTimeout(refreshTasksBadge,3000);
 }
 
 function renderTasksList(tasks){
@@ -938,7 +987,7 @@ window.addEventListener('load',async()=>{
     }
     setStatus('ready','Ready');
     textarea.focus();
-    refreshTasksBadge();
+    initEventStream();
     await loadSessions();
     const res=await fetch('/sessions');const data=await res.json();
     // Check for ?session= URL param (e.g. from Cmd+Click opening a new tab)

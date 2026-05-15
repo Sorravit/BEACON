@@ -90,6 +90,11 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 .bubble blockquote{border-left:3px solid var(--accent);padding-left:12px;margin:8px 0;color:var(--muted)}
 .bubble a{color:var(--accent2);text-decoration:none}
 .bubble a:hover{text-decoration:underline}
+.bubble table{border-collapse:collapse;width:100%;margin:8px 0;font-size:13px}
+.bubble th,.bubble td{border:1px solid var(--border);padding:6px 10px;text-align:left}
+.bubble th{background:var(--surface2);font-weight:600;color:var(--text)}
+.bubble td{color:var(--muted)}
+.bubble tr:nth-child(even) td{background:rgba(255,255,255,.02)}
 .tool-card{background:#0d1117;border:1px solid var(--border);border-radius:8px;padding:8px 12px;margin:6px 0}
 .tool-header{display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:13px}
 .tool-name{color:var(--yellow);font-weight:600}

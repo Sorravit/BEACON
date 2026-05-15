@@ -35,6 +35,7 @@ class MCPClient:
         self.tools: List[MCPTool] = []
         self.request_id = 0
         self._stderr_task: Optional[asyncio.Task] = None
+        self._lock: asyncio.Lock = asyncio.Lock()  # serialise send→read pairs per server
 
     # ── lifecycle ────────────────────────────────────────────────────────
 
@@ -135,42 +136,45 @@ class MCPClient:
         """
         Send a JSON-RPC request and return the matching response.
         Non-JSON lines from stdout (e.g. mcp-remote OAuth messages) are skipped.
+        Uses asyncio.Lock to serialise send→read pairs — safe for concurrent requests,
+        does NOT block the event loop (asyncio lock yields while waiting).
         """
         if not self.process or not self.process.stdin or not self.process.stdout:
             logger.error(f"MCP server {self.server_name} not running")
             return None
 
-        self.request_id += 1
-        req_id = self.request_id
-        payload = json.dumps({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
+        async with self._lock:  # only one send→read in flight per server at a time
+            self.request_id += 1
+            req_id = self.request_id
+            payload = json.dumps({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
 
-        try:
-            self.process.stdin.write((payload + "\n").encode())
-            await self.process.stdin.drain()
+            try:
+                self.process.stdin.write((payload + "\n").encode())
+                await self.process.stdin.drain()
 
-            # Read lines, skipping non-JSON, until we find our response id
-            while True:
-                raw = await self.process.stdout.readline()
-                if not raw:
-                    logger.error(f"MCP server {self.server_name} closed stdout unexpectedly")
-                    return None
-                line = raw.decode(errors="replace").strip()
-                if not line:
-                    continue
-                try:
-                    resp = json.loads(line)
-                except json.JSONDecodeError:
-                    logger.debug(f"[{self.server_name}] skipping non-JSON stdout: {line[:120]}")
-                    continue
-                # Accept response only if id matches (ignore notifications/other messages)
-                if resp.get("id") == req_id:
-                    if "error" in resp:
-                        logger.error(f"MCP error from {self.server_name}: {resp['error']}")
+                # Read lines, skipping non-JSON, until we find our response id
+                while True:
+                    raw = await self.process.stdout.readline()
+                    if not raw:
+                        logger.error(f"MCP server {self.server_name} closed stdout unexpectedly")
                         return None
-                    return resp
-        except Exception as e:
-            logger.error(f"Error communicating with {self.server_name}: {e}")
-            return None
+                    line = raw.decode(errors="replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        resp = json.loads(line)
+                    except json.JSONDecodeError:
+                        logger.debug(f"[{self.server_name}] skipping non-JSON stdout: {line[:120]}")
+                        continue
+                    # Accept response only if id matches (ignore notifications/other messages)
+                    if resp.get("id") == req_id:
+                        if "error" in resp:
+                            logger.error(f"MCP error from {self.server_name}: {resp['error']}")
+                            return None
+                        return resp
+            except Exception as e:
+                logger.error(f"Error communicating with {self.server_name}: {e}")
+                return None
 
     async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Optional[str]:
         try:

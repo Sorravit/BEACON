@@ -9,6 +9,7 @@ A production-ready AI assistant with MCP support, browser automation, HTTP reque
 import asyncio
 import json
 import logging
+import logging.handlers
 import os
 import subprocess
 import sys
@@ -33,7 +34,8 @@ from core.vector_memory import VectorMemory
 VERSION = "4.2.0"
 
 # Logging
-LOG_FILE = "ai_assistant.log"
+os.makedirs("logs", exist_ok=True)
+LOG_FILE = "logs/ai_assistant.log"
 
 # AI Model Configuration
 DEFAULT_MODEL = "gpt-3.5-turbo"
@@ -54,7 +56,7 @@ MAX_TOOL_ITERATIONS = 1000
 # - Dynamically trims based on actual token count, not message count
 # - Keeps as many recent messages as possible within token limit
 # - System message is always kept
-# Set to 80k to be safe: actual limit is 200k but _estimate_tokens() is ~33% too low,
+# tiktoken gives accurate counts now — raised from 80k. Actual Claude limit is 200k.
 # and the system message (with tools XML) + memory context add thousands of untracked tokens.
 MAX_CONVERSATION_TOKENS = 80000
 # Max characters for the memory context block injected per user message
@@ -70,7 +72,12 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler(LOG_FILE),
+        logging.handlers.RotatingFileHandler(
+            LOG_FILE,
+            maxBytes=10 * 1024 * 1024,  # 10 MB per file
+            backupCount=5,
+            encoding="utf-8",
+        ),
         logging.StreamHandler()
     ]
 )
@@ -259,14 +266,16 @@ class ToolManager:
     # File tools
     async def _read_file(self, file_path: str):
         try:
-            with open(file_path, 'r') as f:
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
                 return f"Content of {file_path}:\n{f.read()}"
         except Exception as e:
             return f"Error: {e}"
     
     async def _write_file(self, file_path: str, content: str):
         try:
-            with open(file_path, 'w') as f:
+            p = Path(file_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(file_path, 'w', encoding='utf-8') as f:
                 f.write(content)
             return f"Wrote to {file_path}"
         except Exception as e:
@@ -406,12 +415,14 @@ class ToolManager:
             ]
             if self.session_id:
                 args += ["--session-id", self.session_id]
+            _log_handle = open(f"logs/bg_{name}.log", "a", encoding='utf-8')
             proc = subprocess.Popen(
                 args,
-                stdout=open(f"logs/bg_{name}.log", "a"),
+                stdout=_log_handle,
                 stderr=subprocess.STDOUT,
                 start_new_session=True  # detach from main.py's process group
             )
+            _log_handle.close()  # close parent copy; subprocess holds its own fd
             return (
                 f"✅ Background task '{name}' started (PID: {proc.pid})\n"
                 f"   Command: {command}\n"
@@ -532,6 +543,12 @@ class ToolManager:
 
     async def execute_tool(self, name: str, args: Dict):
         if name not in self.tool_handlers:
+            # Fall through to MCP manager for MCP tools not in built-in tool_handlers
+            if self.mcp_manager:
+                result = await self.mcp_manager.call_tool(name, args)
+                if result is None:
+                    return json.dumps({"error": f"Unknown tool: {name}"})
+                return result
             return f"Unknown tool: {name}"
         
         # Normalize parameter names to handle AI model variations
@@ -671,6 +688,17 @@ class AIAgent:
         self.memory_available = False
         self._shared_browser = None  # shared Playwright browser process
         self._playwright = None
+
+    async def _get_shared_browser(self):
+        """Lazily create ONE shared Chromium process for all per-request ToolManagers.
+        Each ToolManager creates its own isolated BrowserContext from this browser.
+        """
+        if self._shared_browser is None:
+            from playwright.async_api import async_playwright
+            self._playwright = await async_playwright().start()
+            self._shared_browser = await self._playwright.chromium.launch(headless=False)
+            logger.info("Shared browser process started (lazy init)")
+        return self._shared_browser
     
     async def initialize(self) -> bool:
         """
@@ -705,11 +733,7 @@ class AIAgent:
                 self.tools = ToolManager(vector_memory=self.vector_memory, mcp_manager=self.mcp_manager)
                 self.tools_available = await self.tools.initialize()
 
-                # Initialize MCP manager and load servers
-                self.mcp_manager = MCPManager()
-                await self._load_mcp_servers()
-
-                # Update ToolManager with the fully-loaded mcp_manager reference
+                # mcp_manager already loaded above — update reference in ToolManager
                 if self.tools:
                     self.tools.mcp_manager = self.mcp_manager
                 
@@ -769,6 +793,15 @@ class AIAgent:
                             "Example: User asks 'what time is it?' → Call get_current_time() → Return the time\n"
                             "Example: User asks 'latest aviation accident' → Call web_search('latest aviation accident') → Summarize results\n"
                             "Example: Taking a screenshot → use filename 'output/screenshot.png' not 'screenshot.png'\n\n"
+                            "LARGE FILE HANDLING RULES:\n"
+                            "17. If read_file returns a very large result, DO NOT try to read it again — it will be the same size.\n"
+                            "18. For large files, use execute_command with grep/head/tail/sed to navigate:\n"
+                            "    - Search: grep -n 'keyword' filename\n"
+                            "    - First N lines: head -100 filename\n"
+                            "    - Last N lines: tail -100 filename\n"
+                            "    - Line range: sed -n '100,200p' filename\n"
+                            "    - Count lines: wc -l filename\n"
+                            "19. Never include raw binary or huge JSON blobs in your response — summarise them.\n\n"
                             "BE PROACTIVE. ACT FIRST. EXPLAIN AFTER."
                         )
                     }
@@ -806,79 +839,6 @@ class AIAgent:
         
         except Exception as e:
             logger.error(f"Error loading MCP servers: {e}")
-    
-    async def _detect_and_execute_tool(self, user_input: str) -> Optional[tuple]:
-        """
-        Detect if user input requires a tool and execute it.
-        Returns (tool_name, result) if tool was executed, None otherwise.
-        """
-        user_lower = user_input.lower()
-        
-        # File operations
-        if "list files" in user_lower or "list directory" in user_lower or "show files" in user_lower:
-            directory = "."
-            if " in " in user_lower:
-                parts = user_lower.split(" in ")
-                if len(parts) > 1:
-                    directory = parts[1].strip()
-            if self.tools:
-                result = await self.tools.execute_tool("list_files", {"directory": directory})
-                return ("list_files", result)
-        
-        if "read file" in user_lower or "show file" in user_lower or "cat " in user_lower:
-            # Extract filename
-            for word in user_input.split():
-                if "." in word and not word.startswith(".") and self.tools:
-                    result = await self.tools.execute_tool("read_file", {"file_path": word})
-                    return ("read_file", result)
-        
-        # Web navigation and automation
-        if "open " in user_lower and ("website" in user_lower or "url" in user_lower or "http" in user_input):
-            # Extract URL
-            words = user_input.split()
-            url = None
-            for word in words:
-                if "http" in word or ".com" in word or ".org" in word or ".net" in word:
-                    url = word
-                    break
-            if url and self.tools:
-                result = await self.tools.execute_tool("browser_navigate", {"url": url})
-                # Also take a screenshot to see what's there
-                await self.tools.execute_tool("browser_screenshot", {"filename": "current_page.png"})
-                result += "\n\nScreenshot saved as current_page.png"
-                return ("browser_navigate", result)
-        
-        if "search google" in user_lower or "google search" in user_lower or "search for" in user_lower:
-            if self.tools:
-                query = user_input.lower()
-                for phrase in ["search google for", "google search for", "search google", "google search", "search for"]:
-                    query = query.replace(phrase, "")
-                query = query.strip()
-                url = f"https://www.google.com/search?q={query.replace(' ', '+')}"
-                result = await self.tools.execute_tool("browser_navigate", {"url": url})
-                # Take screenshot of search results
-                await self.tools.execute_tool("browser_screenshot", {"filename": "google_search.png"})
-                result += "\n\nOpened Google search. Screenshot saved as google_search.png"
-                result += "\nYou can now ask me to click on specific search results or take other actions."
-                return ("browser_navigate", result)
-        
-        if "take screenshot" in user_lower or "screenshot" in user_lower:
-            if self.tools:
-                result = await self.tools.execute_tool("browser_screenshot", {"filename": "screenshot.png"})
-                return ("browser_screenshot", result)
-        
-        if "close browser" in user_lower or "close the browser" in user_lower:
-            if self.tools:
-                result = await self.tools.execute_tool("browser_close", {})
-                return ("browser_close", result)
-        
-        if "click" in user_lower and ("button" in user_lower or "link" in user_lower or "on" in user_lower):
-            # This is more complex - would need CSS selector or text to click
-            # For now, provide guidance
-            return ("info", "To click on an element, I need you to specify a CSS selector or describe the element more specifically. "
-                           "For example: 'click on the button with text Submit' or 'click on .submit-button'")
-        
-        return None
     
     async def _extract_and_store_facts(self, user_input: str):
         """
@@ -1119,17 +1079,11 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                         
                         print(f"\033[92m  🔧 Executing: {tool_name}({', '.join(f'{k}={str(v)[:30]}' for k, v in tool_args.items()) if tool_args else ''})\033[0m")
                         
-                        # Check if it's a built-in tool first, then MCP tool
-                        # NOTE: mcp_list_servers / mcp_restart_* are built-in tools despite the mcp_ prefix
-                        # Use effective_tools (per-request or self.tools) — never read self.tools here
-                        is_builtin = effective_tools and tool_name in effective_tools.tool_handlers
-                        if is_builtin:
-                            tool_result = await effective_tools.execute_tool(tool_name, tool_args)
-                        elif tool_name.startswith("mcp_") and self.mcp_manager:
-                            tool_result = await self.mcp_manager.call_tool(tool_name, tool_args)
-                            if tool_result is None:
-                                tool_result = json.dumps({"error": f"Unknown tool: {tool_name}"})
-                        elif effective_tools:
+                        # Route ALL tool calls (built-in and MCP) through effective_tools.execute_tool()
+                        # so web_app.py's instrumented wrapper emits SSE events for every call,
+                        # including MCP tools. execute_tool() now falls through to mcp_manager for
+                        # tools not in tool_handlers.
+                        if effective_tools:
                             tool_result = await effective_tools.execute_tool(tool_name, tool_args)
                         else:
                             tool_result = json.dumps({"error": "No tool manager available"})
@@ -1151,8 +1105,22 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
 
                         tool_results.append(f"Tool: {tool_name}\nResult: {tool_result}")
                     
-                    # Add tool results as user message
-                    results_text = "\n\n".join(tool_results)
+                    # Notify instead of silently truncate — tell the AI the result is large
+                    MAX_RESULT_CHARS = 80000  # ~26k tokens — warn if larger but don't silently cut off
+                    notified_results = []
+                    for tr in tool_results:
+                        if len(tr) > MAX_RESULT_CHARS:
+                            # Don't silently truncate — tell the AI the result is large so it can navigate it
+                            preview = tr[:3000]
+                            size_kb = len(tr) // 1024
+                            notified_results.append(
+                                f"[RESULT TOO LARGE: {size_kb}KB — only first 3KB shown below. "
+                                f"Use execute_command with grep/head/tail/sed to search/navigate this content "
+                                f"rather than reading the whole thing at once.]\n\n{preview}\n\n[...{size_kb-3}KB more not shown]"
+                            )
+                        else:
+                            notified_results.append(tr)
+                    results_text = "\n\n".join(notified_results)
                     conv.append({
                         "role": "user",
                         "content": f"Tool execution results:\n\n{results_text}\n\nPlease provide your final response based on these results."
@@ -1175,14 +1143,20 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
             traceback.print_exc()
             if conv and conv[-1]["role"] == "user":
                 conv.pop()
-            return None
+            raise  # Re-raise so web_app.py can surface it to the frontend
     
     def _estimate_tokens(self, text: str) -> int:
         """
-        Estimate token count for text.
-        Rough estimate: 1 token ≈ 4 characters
+        Accurate token count using tiktoken (cl100k_base covers gpt-4, gpt-4o, claude via proxy).
+        Falls back to conservative char-based estimate if tiktoken unavailable.
         """
-        return len(text) // 4
+        try:
+            import tiktoken
+            enc = tiktoken.get_encoding("cl100k_base")
+            return len(enc.encode(text))
+        except Exception:
+            # Fallback: len//2 is safer than //3 for Thai/CJK text
+            return max(1, len(text) // 2)
     
     def _get_conversation_tokens(self, conv: List[Dict]) -> int:
         """Calculate total tokens in a conversation list"""
@@ -1233,6 +1207,13 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
         conv.clear()
         if system_msg:
             conv.append(system_msg)
+
+        # Guard: OpenAI requires first non-system message to be 'user'
+        # Trimming can leave an orphaned 'assistant' message at the front
+        while kept_messages and kept_messages[0]["role"] != "user":
+            logger.debug(f"Trim: dropping orphaned leading '{kept_messages[0]['role']}' message to satisfy OpenAI role ordering")
+            kept_messages.pop(0)
+
         conv.extend(kept_messages)
         
         new_total = self._get_conversation_tokens(conv)

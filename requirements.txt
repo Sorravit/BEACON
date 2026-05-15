@@ -10,4 +10,4 @@ sentence-transformers>=3.0.0
 # Web application
 fastapi>=0.111.0
 uvicorn>=0.29.0
-python-multipart>=0.0.9
+python-multipart>=0.0.9tiktoken>=0.5.0
