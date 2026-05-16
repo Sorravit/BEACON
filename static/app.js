@@ -323,52 +323,141 @@ async function loadSessions() {
   } catch(e) { console.error('Failed to load sessions', e); }
 }
 
+function createSessionItem(s) {
+  const item = document.createElement('div');
+  item.className = 'session-item'
+    + (s.id === currentSessionId ? ' active' : '')
+    + (s.pinned ? ' pinned' : '');
+  item.dataset.id = s.id;
+
+  const label = document.createElement('a');
+  label.className = 'session-label';
+  label.href = '/?session=' + encodeURIComponent(s.id);
+  const prefix = s.running ? '<span class="session-running-dot" title="AI working\u2026"></span>' : '';
+  label.innerHTML = prefix + escHtml(s.title || 'New Chat');
+  label.title = (s.running ? '\u2699 Working\u2026 ' : '') + (s.title || 'New Chat');
+  label.addEventListener('click', e => {
+    e.preventDefault();
+    switchSession(s.id);
+    closeSidebarOnMobile();
+  });
+
+  const actions = document.createElement('div');
+  actions.className = 'session-actions';
+
+  const pinBtn = document.createElement('button');
+  pinBtn.className = 'session-action-btn' + (s.pinned ? ' pinned-active' : '');
+  pinBtn.title = s.pinned ? 'Unpin' : 'Pin to top';
+  pinBtn.textContent = s.pinned ? '\uD83D\uDCCC' : '\u2606';
+  pinBtn.onclick = e => { e.stopPropagation(); togglePin(s.id); };
+
+  const renameBtn = document.createElement('button');
+  renameBtn.className = 'session-action-btn';
+  renameBtn.title = 'Rename';
+  renameBtn.textContent = '\u270F';
+  renameBtn.onclick = e => { e.stopPropagation(); openRenameModal(s.id, s.title); };
+
+  const deleteBtn = document.createElement('button');
+  deleteBtn.className = 'session-action-btn danger';
+  deleteBtn.title = 'Delete';
+  deleteBtn.textContent = '\uD83D\uDDD1';
+  deleteBtn.onclick = e => { e.stopPropagation(); deleteSession(s.id); };
+
+  actions.appendChild(pinBtn);
+  actions.appendChild(renameBtn);
+  actions.appendChild(deleteBtn);
+  item.appendChild(label);
+  item.appendChild(actions);
+  return item;
+}
+
+async function togglePin(id) {
+  try {
+    await fetch('/sessions/' + id + '/pin', { method: 'PATCH' });
+    await loadSessions();
+  } catch(e) { showToast('Failed to toggle pin'); }
+}
+
+function initPinnedDrag(listEl) {
+  let dragging = null;
+  listEl.querySelectorAll('.session-item').forEach(item => {
+    item.setAttribute('draggable', 'true');
+    item.addEventListener('dragstart', e => {
+      dragging = item;
+      item.classList.add('drag-ghost');
+      e.dataTransfer.effectAllowed = 'move';
+    });
+    item.addEventListener('dragend', () => {
+      dragging = null;
+      item.classList.remove('drag-ghost');
+      listEl.querySelectorAll('.session-item').forEach(i => i.classList.remove('drop-before','drop-after'));
+      const order = Array.from(listEl.querySelectorAll('.session-item')).map(i => i.dataset.id);
+      fetch('/sessions/reorder-pins', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ order }),
+      }).catch(err => console.warn('reorder-pins failed', err));
+    });
+    item.addEventListener('dragover', e => {
+      if (!dragging || dragging === item) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      // Remove indicators from all items first
+      listEl.querySelectorAll('.drop-before,.drop-after').forEach(el => {
+        el.classList.remove('drop-before','drop-after');
+      });
+      // Determine top vs bottom half
+      const rect = item.getBoundingClientRect();
+      const midY = rect.top + rect.height / 2;
+      if (e.clientY < midY) {
+        item.classList.add('drop-before');
+      } else {
+        item.classList.add('drop-after');
+      }
+    });
+    item.addEventListener('dragleave', () => {
+      item.classList.remove('drop-before','drop-after');
+    });
+    item.addEventListener('drop', e => {
+      if (!dragging || dragging === item) return;
+      e.preventDefault();
+      // Find where to insert based on drop-before/drop-after class
+      const dropBefore = item.classList.contains('drop-before');
+      item.classList.remove('drop-before','drop-after');
+      dragging.classList.remove('drag-ghost');
+      if (dropBefore) {
+        listEl.insertBefore(dragging, item);
+      } else {
+        listEl.insertBefore(dragging, item.nextSibling);
+      }
+    });
+  });
+}
+
 function renderSessionsList(sessions) {
   sessionsList.innerHTML = '';
   if (!sessions.length) {
     sessionsList.innerHTML = '<div class="sessions-empty">No chats yet</div>';
     return;
   }
-  sessions.forEach(s => {
-    const item   = document.createElement('div');
-    item.className = 'session-item' + (s.id === currentSessionId ? ' active' : '');
-    item.dataset.id = s.id;
-
-    const label  = document.createElement('a');
-    label.className = 'session-label';
-    label.href = '/?session=' + encodeURIComponent(s.id);
-    const prefix = s.running ? '<span class="session-running-dot" title="AI working\u2026"></span>' : '';
-    label.innerHTML = prefix + escHtml(s.title || 'New Chat');
-    label.title = (s.running ? '\u2699 Working\u2026 ' : '') + (s.title || 'New Chat');
-    label.addEventListener('click', e => {
-        // Normal click — stay in same tab (prevent navigation)
-        e.preventDefault();
-        switchSession(s.id);
-        closeSidebarOnMobile();
-    });
-    // Cmd+Click and middle-click fall through to the browser's default new-tab behaviour
-
-    const actions = document.createElement('div');
-    actions.className = 'session-actions';
-
-    const renameBtn = document.createElement('button');
-    renameBtn.className = 'session-action-btn';
-    renameBtn.title = 'Rename';
-    renameBtn.textContent = '✏';
-    renameBtn.onclick = e => { e.stopPropagation(); openRenameModal(s.id, s.title); };
-
-    const deleteBtn = document.createElement('button');
-    deleteBtn.className = 'session-action-btn danger';
-    deleteBtn.title = 'Delete';
-    deleteBtn.textContent = '🗑';
-    deleteBtn.onclick = e => { e.stopPropagation(); deleteSession(s.id); };
-
-    actions.appendChild(renameBtn);
-    actions.appendChild(deleteBtn);
-    item.appendChild(label);
-    item.appendChild(actions);
-    sessionsList.appendChild(item);
-  });
+  const pinned   = sessions.filter(s => s.pinned);
+  const unpinned = sessions.filter(s => !s.pinned);
+  if (pinned.length > 0) {
+    const header = document.createElement('div');
+    header.className = 'sessions-section-header';
+    header.textContent = '\uD83D\uDCCC Pinned';
+    sessionsList.appendChild(header);
+    const pinnedList = document.createElement('div');
+    pinnedList.id = 'pinned-sessions';
+    pinnedList.className = 'pinned-sessions-list';
+    pinned.forEach(s => pinnedList.appendChild(createSessionItem(s)));
+    sessionsList.appendChild(pinnedList);
+    initPinnedDrag(pinnedList);
+    const divider = document.createElement('div');
+    divider.className = 'sessions-divider';
+    sessionsList.appendChild(divider);
+  }
+  unpinned.forEach(s => sessionsList.appendChild(createSessionItem(s)));
 }
 
 async function newChat() {
@@ -877,6 +966,14 @@ async function stopAllTasks(){
     showToast('All tasks stopped and cleared');
   }catch(e){showToast('Failed to stop all tasks');}
   finally{if(btn){btn.disabled=false;btn.textContent='\u23F9 Stop All';}}
+}
+
+function collapseAllLogs(){
+  document.querySelectorAll('.task-log.expanded').forEach(log=>{
+    const name=log.id.replace('log-','');
+    log.classList.remove('expanded');
+    stopLogStream(name);
+  });
 }
 
 async function startLogStream(name){

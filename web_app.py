@@ -34,7 +34,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from main import AIAgent, Config
 
@@ -185,6 +185,8 @@ def _save_session(session_id: str):
         "updated_at":     s["updated_at"],
         "messages":       s["messages"],
         "manually_named": s.get("manually_named", False),
+        "pinned":         s.get("pinned", False),
+        "pin_order":      s.get("pin_order", 0),
     }
     try:
         _session_file(session_id).write_text(json.dumps(data, ensure_ascii=False, indent=2))
@@ -203,6 +205,8 @@ def _load_all_sessions():
                 "updated_at":     data.get("updated_at", datetime.now().isoformat()),
                 "messages":       data.get("messages", []),
                 "manually_named": data.get("manually_named", False),
+                "pinned":         data.get("pinned", False),
+                "pin_order":      data.get("pin_order", 0),
             }
         except Exception as e:
             logger.warning(f"Could not load session file {f}: {e}")
@@ -217,6 +221,8 @@ def _create_session() -> str:
         "updated_at":     now,
         "messages":       [],
         "manually_named": False,
+        "pinned":         False,
+        "pin_order":      0,
     }
     _save_session(sid)
     return sid
@@ -299,6 +305,10 @@ class RenameRequest(BaseModel):
     title: str
 
 
+class ReorderRequest(BaseModel):
+    order: list
+
+
 # ── File upload ───────────────────────────────────────────────────────────────
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
@@ -350,15 +360,51 @@ async def list_sessions():
             "updated_at":    s["updated_at"],
             "message_count": len(s["messages"]),
             "running":       running,
+            "pinned":        s.get("pinned", False),
+            "pin_order":     s.get("pin_order", 0),
         })
-    result.sort(key=lambda x: x["updated_at"], reverse=True)
-    return {"sessions": result}
+    pinned   = [x for x in result if x["pinned"]]
+    unpinned = [x for x in result if not x["pinned"]]
+    pinned.sort(key=lambda x: x.get("pin_order", 0))
+    unpinned.sort(key=lambda x: x["updated_at"], reverse=True)
+    return {"sessions": pinned + unpinned}
 
 
 @app.post("/sessions")
 async def create_session():
     sid = _create_session()
     return {"id": sid, "title": "New Chat"}
+
+
+# NOTE: /sessions/reorder-pins must be registered BEFORE /sessions/{session_id}
+# so FastAPI does not treat "reorder-pins" as a session_id path parameter.
+@app.patch("/sessions/reorder-pins")
+async def reorder_pins(req: ReorderRequest):
+    for i, sid in enumerate(req.order):
+        s = _sessions.get(sid)
+        if s and s.get("pinned"):
+            s["pin_order"] = i
+            _save_session(sid)
+    return {"status": "ok"}
+
+
+@app.patch("/sessions/{session_id}/pin")
+async def pin_session(session_id: str):
+    s = _sessions.get(session_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Session not found")
+    s["pinned"] = not s.get("pinned", False)
+    if s["pinned"]:
+        max_order = max(
+            (v.get("pin_order", 0) for v in _sessions.values() if v.get("pinned")),
+            default=-1,
+        )
+        s["pin_order"] = max_order + 1
+    else:
+        s["pin_order"] = 0
+    s["updated_at"] = datetime.now().isoformat()
+    _save_session(session_id)
+    return {"id": session_id, "pinned": s["pinned"], "pin_order": s["pin_order"]}
 
 
 @app.get("/sessions/{session_id}")

@@ -123,7 +123,7 @@ class ToolManager:
             ("list_files", "Returns a list of files and directories in the specified directory path", {"directory": "string"}, self._list_files),
             
             # Web search tool
-            ("web_search", "Searches Google and returns the search results. Use this for any question requiring current/recent information, news, facts, etc.", {"query": "string"}, self._web_search),
+            ("web_search", "Searches DuckDuckGo and returns results. Use for current info, news, facts, definitions.", {"query": "string"}, self._web_search),
             
             # Browser tools
             ("browser_navigate", "Opens a web browser and navigates to the specified URL", {"url": "string"}, self._browser_navigate),
@@ -181,87 +181,64 @@ class ToolManager:
             return f"Error: {e}"
     
     async def _web_search(self, query: str):
-        """Perform a Google search and return results"""
+        """Search using DuckDuckGo Instant Answer API (no API key required)."""
         try:
             import httpx
             from urllib.parse import quote
-            
-            # Use Google search with httpx
-            encoded_query = quote(query)
-            url = f"https://www.google.com/search?q={encoded_query}"
-            
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
-            }
-            
-            async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
-                response = await client.get(url, headers=headers)
-                html = response.text
-                
-                # Use BeautifulSoup for better parsing
-                try:
-                    from bs4 import BeautifulSoup
-                    soup = BeautifulSoup(html, 'html.parser')
-                    
-                    results = []
-                    
-                    # Find all search result divs
-                    # Google uses various div structures, try multiple selectors
-                    search_divs = soup.find_all('div', class_='g') or soup.find_all('div', {'data-sokoban-container': True})
-                    
-                    for i, div in enumerate(search_divs[:10]):
-                        # Extract title
-                        title_elem = div.find('h3')
-                        if title_elem:
-                            title = title_elem.get_text(strip=True)
-                            
-                            # Extract snippet/description
-                            snippet_elem = div.find('div', class_=['VwiC3b', 'yXK7lf', 'lVm3ye'])
-                            if not snippet_elem:
-                                # Try alternative selectors
-                                snippet_elem = div.find('span', class_='aCOpRe')
-                            
-                            snippet = snippet_elem.get_text(strip=True) if snippet_elem else ""
-                            
-                            # Extract URL
-                            link_elem = div.find('a')
-                            url = link_elem.get('href', '') if link_elem else ""
-                            
-                            if title:
-                                results.append(f"\n{i+1}. {title}")
-                                if snippet:
-                                    results.append(f"   {snippet[:200]}...")
-                                if url and url.startswith('http'):
-                                    results.append(f"   URL: {url}")
-                    
-                    if results:
-                        return f"Google search results for '{query}':\n" + "\n".join(results)
-                    else:
-                        # Fallback: return raw text content
-                        text_content = soup.get_text()
-                        # Extract first few meaningful lines
-                        lines = [line.strip() for line in text_content.split('\n') if line.strip() and len(line.strip()) > 20]
-                        if lines:
-                            return f"Search results for '{query}' (extracted text):\n\n" + "\n".join(lines[:15])
-                        else:
-                            return f"Searched Google for '{query}' but couldn't extract results. Try using browser_navigate for interactive search."
-                
-                except ImportError:
-                    # BeautifulSoup not available, use simple regex
-                    import re
-                    results = []
-                    
-                    # Try to extract any text that looks like search results
-                    text_blocks = re.findall(r'<div[^>]*>(.*?)</div>', html, re.DOTALL)
-                    meaningful_blocks = [re.sub('<[^<]+?>', '', block).strip() for block in text_blocks if len(block) > 50]
-                    
-                    if meaningful_blocks:
-                        return f"Search results for '{query}':\n\n" + "\n\n".join(meaningful_blocks[:10])
-                    else:
-                        return f"Searched Google for '{query}' but couldn't extract results. Try using browser_navigate for interactive search."
-                    
+
+            url = f"https://api.duckduckgo.com/?q={quote(query)}&format=json&no_redirect=1&no_html=1"
+            headers = {'User-Agent': 'Mozilla/5.0 (compatible; BigAI/1.0)'}
+
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(url, headers=headers)
+                data = resp.json()
+
+            results = []
+
+            # Instant answer (e.g. "What is Python?" → direct answer)
+            if data.get("AbstractText"):
+                results.append(f"**{data.get('Heading', 'Answer')}**: {data['AbstractText']}")
+                if data.get("AbstractURL"):
+                    results.append(f"Source: {data['AbstractURL']}")
+                results.append("")
+
+            # Related topics (search results)
+            for i, topic in enumerate(data.get("RelatedTopics", [])[:8]):
+                # RelatedTopics can be flat items or grouped
+                if "Topics" in topic:
+                    for sub in topic.get("Topics", [])[:3]:
+                        text = sub.get("Text", "")
+                        url2 = sub.get("FirstURL", "")
+                        if text:
+                            results.append(f"{len(results)+1}. {text}")
+                            if url2:
+                                results.append(f"   {url2}")
+                else:
+                    text = topic.get("Text", "")
+                    url2 = topic.get("FirstURL", "")
+                    if text:
+                        results.append(f"{i+1}. {text}")
+                        if url2:
+                            results.append(f"   {url2}")
+
+            # Results from DuckDuckGo News/Definitions
+            for item in data.get("Results", [])[:5]:
+                text = item.get("Text", "")
+                url2 = item.get("FirstURL", "")
+                if text:
+                    results.append(f"- {text}")
+                    if url2:
+                        results.append(f"  {url2}")
+
+            if results:
+                return f"DuckDuckGo search results for '{query}':\n\n" + "\n".join(results)
+            else:
+                # Fallback: no results from instant API, suggest browser search
+                return (f"No instant results for '{query}'. "
+                        f"Try: browser_navigate('https://duckduckgo.com/?q={quote(query)}')")
+
         except Exception as e:
-            return f"Error searching: {e}. Try using browser_navigate to search interactively."
+            return f"Search error: {e}. Try browser_navigate('https://duckduckgo.com/?q={query}')"
     
     # File tools
     async def _read_file(self, file_path: str):
@@ -420,7 +397,8 @@ class ToolManager:
                 args,
                 stdout=_log_handle,
                 stderr=subprocess.STDOUT,
-                start_new_session=True  # detach from main.py's process group
+                start_new_session=True,  # detach from main.py's process group
+                cwd=str(Path(__file__).parent),  # ensure child resolves logs/ relative to project root
             )
             _log_handle.close()  # close parent copy; subprocess holds its own fd
             return (
