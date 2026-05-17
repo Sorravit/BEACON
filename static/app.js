@@ -21,6 +21,7 @@ let _renameTarget    = null;
 let taskLogStreams   = {};
 let _dragInit        = false;
 let _currentReader   = null;   // active SSE reader so we can cancel client-side too
+let _currentSessionEmpty = true; // true when current session has no messages yet
 // Per-session streaming check
 function isStreamingSession(sid) { return _streamingSet.has(sid); }
 
@@ -465,12 +466,18 @@ async function newChat() {
     const res  = await fetch('/sessions', {method:'POST'});
     const data = await res.json();
     await loadSessions();
+    _currentSessionEmpty = true; // new chat starts empty
     await switchSession(data.id);
     closeSidebarOnMobile();
   } catch(e) { showToast('Failed to create chat'); }
 }
 
 async function switchSession(id) {
+  // Auto-delete the current session if it's empty (no messages sent)
+  if (currentSessionId && currentSessionId !== id && _currentSessionEmpty) {
+    fetch('/sessions/' + currentSessionId, {method: 'DELETE'}).catch(() => {});
+    await loadSessions();
+  }
   if (id === currentSessionId) return;
   currentSessionId = id;
   document.querySelectorAll('.session-item').forEach(el => {
@@ -484,6 +491,7 @@ async function switchSession(id) {
     const data = await res.json();
     chatTitleEl.textContent = data.title || 'New Chat';
     messagesEl.innerHTML = '';
+    _currentSessionEmpty = (!data.messages || data.messages.length === 0);
     if (data.messages && data.messages.length > 0) {
       data.messages.forEach(msg => {
         if (msg.role === 'user') {
@@ -577,13 +585,9 @@ async function deleteSession(id) {
   if (!confirm('Delete this chat? This cannot be undone.')) return;
   try {
     await fetch(`/sessions/${id}`, {method:'DELETE'});
-    if (id === currentSessionId) { currentSessionId=null; chatTitleEl.textContent="Big's Personal AI Assistant"; messagesEl.innerHTML=''; }
+    currentSessionId = null;
     await loadSessions();
-    if (!currentSessionId) {
-      const res=await fetch('/sessions'); const data=await res.json();
-      if (data.sessions&&data.sessions.length>0) await switchSession(data.sessions[0].id);
-      else await newChat();
-    }
+    await newChat();
   } catch(e) { showToast('Failed to delete chat'); }
 }
 
@@ -666,6 +670,7 @@ async function sendMessage(){
     fullText = parts.join('\n\n');
   }
   const _msgNow = new Date().toISOString();
+  _currentSessionEmpty = false; // a message is being sent — session is no longer empty
   const ub=createMessage('user', _msgNow);ub.innerHTML=renderMarkdown(fullText||text);
   textarea.value='';textarea.style.height='auto';
   _attachedFiles=[];renderFilePreviews();
@@ -1075,6 +1080,13 @@ chatTitleEl.addEventListener('click', () => {
   input.addEventListener('blur', commitRename);
 });
 
+window.addEventListener('pagehide', () => {
+    // Clean up empty chat sessions when user closes/refreshes the tab
+    if (currentSessionId && _currentSessionEmpty) {
+        navigator.sendBeacon('/sessions/' + currentSessionId + '/delete-if-empty');
+    }
+});
+
 window.addEventListener('load',async()=>{
   try{
     // Auto-collapse sidebar on small screens
@@ -1086,14 +1098,21 @@ window.addEventListener('load',async()=>{
     textarea.focus();
     initEventStream();
     await loadSessions();
+    // Clean up any empty sessions left over from previous page loads
+    try {
+        const allSess = await (await fetch('/sessions')).json();
+        for (const s of (allSess.sessions || [])) {
+            if (s.message_count === 0 && !s.running) {
+                await fetch('/sessions/' + s.id, {method: 'DELETE'});
+            }
+        }
+    } catch(e) {}
     const res=await fetch('/sessions');const data=await res.json();
     // Check for ?session= URL param (e.g. from Cmd+Click opening a new tab)
     const urlParams = new URLSearchParams(window.location.search);
     const requestedSession = urlParams.get('session');
     if (requestedSession && data.sessions && data.sessions.find(s => s.id === requestedSession)) {
         await switchSession(requestedSession);
-    } else if(data.sessions&&data.sessions.length>0) {
-        await switchSession(data.sessions[0].id);
     } else {
         await newChat();
     }

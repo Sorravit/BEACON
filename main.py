@@ -233,13 +233,23 @@ class ToolManager:
             if results:
                 return f"DuckDuckGo search results for '{query}':\n\n" + "\n".join(results)
             else:
-                # Fallback: no results from instant API, suggest browser search
-                return (f"No instant results for '{query}'. "
-                        f"Try: browser_navigate('https://duckduckgo.com/?q={quote(query)}')")
+                # No DDG instant results — fall back to browser + Google
+                try:
+                    google_url = f"https://www.google.com/search?q={quote(query)}"
+                    nav_result = await self._browser_navigate(google_url)
+                    # Get text from the search results page
+                    text_result = await self._browser_get_text("body")
+                    # Take a screenshot for reference
+                    await self._browser_screenshot(f"output/search_{query[:20].replace(' ','_')}.png")
+                    return (f"DDG had no instant results for '{query}'. "
+                            f"Opened Google: {google_url}\n\n"
+                            f"Page text (first 2000 chars):\n{str(text_result)[:2000]}")
+                except Exception as fe:
+                    return f"No results for '{query}'. Browser fallback also failed: {fe}"
 
         except Exception as e:
             return f"Search error: {e}. Try browser_navigate('https://duckduckgo.com/?q={query}')"
-    
+
     # File tools
     async def _read_file(self, file_path: str):
         try:

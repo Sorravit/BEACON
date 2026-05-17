@@ -449,6 +449,22 @@ async def delete_session(session_id: str):
     return {"status": "deleted", "id": session_id}
 
 
+@app.post("/sessions/{session_id}/delete-if-empty")
+async def delete_session_if_empty(session_id: str):
+    """Delete a session only if it has no messages. Called on page unload."""
+    s = _sessions.get(session_id)
+    if not s:
+        return {"status": "not_found"}
+    if len(s.get("messages", [])) == 0:
+        _sessions.pop(session_id, None)
+        fp = _session_file(session_id)
+        if fp.exists():
+            fp.unlink()
+        _bg.pop(session_id, None)
+        return {"status": "deleted"}
+    return {"status": "kept", "message_count": len(s["messages"])}
+
+
 # ── Chat streaming endpoints ──────────────────────────────────────────────────
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
