@@ -474,9 +474,13 @@ async function newChat() {
 
 async function switchSession(id) {
   // Auto-delete the current session if it's empty (no messages sent)
-  if (currentSessionId && currentSessionId !== id && _currentSessionEmpty) {
-    fetch('/sessions/' + currentSessionId, {method: 'DELETE'}).catch(() => {});
-    await loadSessions();
+  if (currentSessionId && currentSessionId !== id) {
+    // Use server-side check to safely delete only if truly empty
+    // This prevents the client-side flag from incorrectly deleting sessions
+    // that have server-side messages (e.g., background notifications)
+    try {
+      await fetch('/sessions/' + currentSessionId + '/delete-if-empty', {method: 'POST'});
+    } catch(e) {}
   }
   if (id === currentSessionId) return;
   currentSessionId = id;
@@ -490,6 +494,7 @@ async function switchSession(id) {
     const res  = await fetch(`/sessions/${id}`);
     const data = await res.json();
     chatTitleEl.textContent = data.title || 'New Chat';
+    window.history.replaceState({}, '', '/?session=' + encodeURIComponent(id));
     messagesEl.innerHTML = '';
     _currentSessionEmpty = (!data.messages || data.messages.length === 0);
     if (data.messages && data.messages.length > 0) {
@@ -1098,15 +1103,6 @@ window.addEventListener('load',async()=>{
     textarea.focus();
     initEventStream();
     await loadSessions();
-    // Clean up any empty sessions left over from previous page loads
-    try {
-        const allSess = await (await fetch('/sessions')).json();
-        for (const s of (allSess.sessions || [])) {
-            if (s.message_count === 0 && !s.running) {
-                await fetch('/sessions/' + s.id, {method: 'DELETE'});
-            }
-        }
-    } catch(e) {}
     const res=await fetch('/sessions');const data=await res.json();
     // Check for ?session= URL param (e.g. from Cmd+Click opening a new tab)
     const urlParams = new URLSearchParams(window.location.search);

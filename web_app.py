@@ -805,7 +805,7 @@ async def _events_generator(request: Request) -> AsyncGenerator[str, None]:
                 "notifications": payload["notifications"],
                 "activity": activity,
             }
-            yield " " + json.dumps(full_payload) + "\n\n"
+            yield "data: " + json.dumps(full_payload) + "\n\n"
 
             tick += 1
             await asyncio.sleep(3)
