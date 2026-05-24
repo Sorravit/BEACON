@@ -138,6 +138,20 @@ class VectorMemory:
             )
             logger.info("Created PersonalFacts collection")
 
+        if "AutoLearned" not in existing:
+            self.client.collections.create(
+                name="AutoLearned",
+                vectorizer_config=wc.Configure.Vectorizer.none(),
+                properties=[
+                    wc.Property(name="topic",       data_type=wc.DataType.TEXT),
+                    wc.Property(name="fact",        data_type=wc.DataType.TEXT),
+                    wc.Property(name="confidence",  data_type=wc.DataType.TEXT),
+                    wc.Property(name="stored_at",   data_type=wc.DataType.TEXT),
+                    wc.Property(name="updated_at",  data_type=wc.DataType.TEXT),
+                ]
+            )
+            logger.info("Created AutoLearned collection")
+
     # -------------------------------------------------------------------------
     # Embedding helper
     # -------------------------------------------------------------------------
@@ -341,14 +355,140 @@ class VectorMemory:
             logger.error(f"Failed to clear research memory: {e}")
             return 0
 
+
+    # -------------------------------------------------------------------------
+    # Auto-learned memory (extracted by hook after each conversation turn)
+    # -------------------------------------------------------------------------
+
+    async def store_auto_fact(self, topic: str, fact: str, confidence: str = "medium") -> bool:
+        """Store an auto-extracted fact. Updates existing entry if topic matches."""
+        if not self._ready:
+            return False
+        try:
+            # Check if topic already exists — update instead of duplicate
+            collection = self.client.collections.get("AutoLearned")
+            existing = collection.query.fetch_objects(
+                limit=200,
+                return_properties=["topic", "fact"]
+            )
+            lower_topic = topic.lower()
+            for obj in existing.objects:
+                if (obj.properties.get("topic") or "").lower() == lower_topic:
+                    # Update in place
+                    collection.data.update(
+                        uuid=obj.uuid,
+                        properties={
+                            "fact": fact,
+                            "confidence": confidence,
+                            "updated_at": datetime.now().isoformat(),
+                        }
+                    )
+                    logger.info(f"Updated auto-fact [{topic}]")
+                    return True
+
+            # New fact — insert
+            vector = self._embed(f"{topic}: {fact}", label="Auto-learning")
+            if vector is None:
+                return False
+            collection.data.insert(
+                properties={
+                    "topic":      topic,
+                    "fact":       fact,
+                    "confidence": confidence,
+                    "stored_at":  datetime.now().isoformat(),
+                    "updated_at": datetime.now().isoformat(),
+                },
+                vector=vector
+            )
+            logger.info(f"Stored auto-fact [{topic}]: {fact[:80]}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to store auto-fact: {e}")
+            return False
+
+    async def get_all_auto_facts(self) -> List[Dict[str, Any]]:
+        """Return all auto-learned facts."""
+        if not self._ready:
+            return []
+        try:
+            collection = self.client.collections.get("AutoLearned")
+            response = collection.query.fetch_objects(
+                limit=200,
+                return_properties=["topic", "fact", "confidence", "stored_at", "updated_at"]
+            )
+            return [obj.properties for obj in response.objects]
+        except Exception as e:
+            logger.error(f"Failed to fetch auto-facts: {e}")
+            return []
+
+    async def search_auto_facts(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """Semantic search over AutoLearned collection."""
+        if not self._ready:
+            return []
+        try:
+            vector = self._embed(query)
+            if vector is None:
+                return []
+            collection = self.client.collections.get("AutoLearned")
+            response = collection.query.near_vector(
+                near_vector=vector,
+                limit=limit,
+                return_properties=["topic", "fact", "confidence", "stored_at"]
+            )
+            return [obj.properties for obj in response.objects]
+        except Exception as e:
+            logger.error(f"Auto-facts search failed: {e}")
+            return []
+
+    async def delete_auto_facts(self, keyword: str) -> int:
+        """Delete auto-learned facts matching keyword."""
+        if not self._ready:
+            return 0
+        try:
+            collection = self.client.collections.get("AutoLearned")
+            response = collection.query.fetch_objects(
+                limit=500,
+                return_properties=["topic", "fact"]
+            )
+            lower_kw = keyword.lower()
+            to_delete = [
+                obj.uuid for obj in response.objects
+                if lower_kw in (obj.properties.get("topic") or "").lower()
+                or lower_kw in (obj.properties.get("fact") or "").lower()
+            ]
+            for uuid in to_delete:
+                collection.data.delete_by_id(uuid)
+            return len(to_delete)
+        except Exception as e:
+            logger.error(f"Failed to delete auto-facts: {e}")
+            return 0
+
+    async def clear_auto_facts(self) -> int:
+        """Clear all auto-learned facts."""
+        if not self._ready:
+            return 0
+        try:
+            collection = self.client.collections.get("AutoLearned")
+            response = collection.query.fetch_objects(limit=5000)
+            count = len(response.objects)
+            for obj in response.objects:
+                collection.data.delete_by_id(obj.uuid)
+            logger.info(f"Cleared {count} auto-learned facts")
+            return count
+        except Exception as e:
+            logger.error(f"Failed to clear auto-facts: {e}")
+            return 0
+
     # -------------------------------------------------------------------------
     # Context builder
+    # -------------------------------------------------------------------------
+    # Auto-learned memory (extracted by hook after each conversation turn)
     # -------------------------------------------------------------------------
 
     async def build_context_prompt(self, user_query: str) -> str:
         """
         Build a compact memory context string to inject into the prompt.
-        Searches both collections for the most relevant entries.
+        Searches all three collections for the most relevant entries.
         """
         sections = []
 
@@ -356,6 +496,11 @@ class VectorMemory:
         if facts:
             lines = [f"  - [{f['topic']}] {f['fact']}" for f in facts]
             sections.append("📋 What I know about you:\n" + "\n".join(lines))
+
+        auto_facts = await self.search_auto_facts(user_query, limit=8)
+        if auto_facts:
+            lines = [f"  - [{f['topic']}] {f['fact']}" for f in auto_facts]
+            sections.append("🧠 What I've learned about you:\n" + "\n".join(lines))
 
         research = await self.search_research(user_query, limit=3)
         if research:
@@ -375,7 +520,21 @@ class VectorMemory:
         )
 
     def close(self):
-        """Close the Weaviate connection."""
+        """Close the Weaviate connection and shut down the loky process pool.
+
+        sentence-transformers → joblib → loky creates a reusable worker pool
+        backed by a POSIX semaphore. Without an explicit shutdown() call the
+        semaphore is left alive at process exit and Python's resource_tracker
+        reports: "leaked semaphore objects to clean up at shutdown".
+        """
+        # Fix #2: shut down the loky reusable executor so its POSIX semaphore
+        # is released cleanly instead of being reported as a leak.
+        try:
+            from joblib.externals.loky import get_reusable_executor
+            get_reusable_executor().shutdown(wait=False)
+        except Exception:
+            pass
+
         if self.client:
             try:
                 self.client.close()

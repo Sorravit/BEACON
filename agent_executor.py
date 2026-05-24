@@ -90,7 +90,7 @@ class AgentExecutor:
     - Handle errors and retries
     """
     
-    def __init__(self, ai_agent, max_steps: int = 20, max_retries: int = 3):
+    def __init__(self, ai_agent, max_steps: int = 20, max_retries: int = 3, step_callback=None):
         """
         Initialize the agent executor.
         
@@ -104,7 +104,15 @@ class AgentExecutor:
         self.max_retries = max_retries
         self.tasks: Dict[str, Task] = {}
         self.current_task: Optional[Task] = None
+        self.step_callback = step_callback
         
+    def _emit(self, event, data):
+        if self.step_callback:
+            try:
+                self.step_callback(event, data)
+            except Exception:
+                pass
+
     async def execute_task(self, task_description: str, task_id: Optional[str] = None) -> Task:
         """
         Execute a task autonomously from start to finish.
@@ -129,11 +137,15 @@ class AgentExecutor:
         self.current_task = task
         
         logger.info(f"Starting task {task_id}: {task_description}")
+        self._emit('task_started', {'task_id': task_id, 'description': task_description})
+        # Immediately signal that planning is underway so the UI exits "Submitting…"
+        self._emit('task_planning', {'task_id': task_id})
         
         try:
             # Phase 1: Planning
             task.started_at = datetime.now()
             await self._plan_task(task)
+            self._emit('task_planned', {'task_id': task_id, 'steps': [{'step_id': s.step_id, 'description': s.description} for s in task.steps]})
             
             # Phase 2: Execution
             task.status = TaskStatus.EXECUTING
@@ -146,6 +158,7 @@ class AgentExecutor:
             # Compile results from all steps
             task.result = self._compile_task_result(task)
             
+            self._emit('task_completed', {'task_id': task_id, 'result': task.result})
             logger.info(f"Task {task_id} completed successfully")
             return task
             
@@ -153,6 +166,7 @@ class AgentExecutor:
             task.status = TaskStatus.FAILED
             task.error = str(e)
             task.completed_at = datetime.now()
+            self._emit('task_failed', {'task_id': task_id, 'error': str(e)})
             logger.error(f"Task {task_id} failed: {e}")
             return task
     
@@ -163,11 +177,17 @@ class AgentExecutor:
         Args:
             task: Task to plan
         """
+        # Get available tool names safely — tools may not be initialised yet
+        try:
+            tool_names = ', '.join([t['function']['name'] for t in self.ai_agent.tools.tools])
+        except Exception:
+            tool_names = '(tools unavailable at planning time)'
+
         planning_prompt = f"""You are an autonomous agent planning a task. Break down this task into concrete, executable steps.
 
 Task: {task.description}
 
-Available tools: {', '.join([t['function']['name'] for t in self.ai_agent.tools.tools])}
+Available tools: {tool_names}
 
 Create a step-by-step plan. For each step:
 1. Describe what needs to be done
@@ -243,6 +263,7 @@ Be specific and actionable. Each step should be independently executable."""
             
             step.status = TaskStatus.EXECUTING
             step.started_at = datetime.now()
+            self._emit('step_started', {'task_id': task.task_id, 'step': {'step_id': step.step_id, 'description': step.description, 'status': 'executing'}})
             
             try:
                 # Execute step with intelligent retries
@@ -289,6 +310,7 @@ Be specific and actionable. Each step should be independently executable."""
                         step.status = TaskStatus.COMPLETED
                         step.completed_at = datetime.now()
                         logger.info(f"Step {step.step_id} completed successfully")
+                        self._emit('step_completed', {'task_id': task.task_id, 'step': {'step_id': step.step_id, 'description': step.description, 'status': 'completed'}})
                         break
                         
                     except Exception as e:

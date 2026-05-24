@@ -27,8 +27,30 @@ from datetime import datetime
 from pathlib import Path
 from typing import AsyncGenerator, Dict, List, Optional
 
+import atexit
+import signal as _signal
 import sys as _sys
 _sys.stdout.reconfigure(line_buffering=True)
+
+# ── Fix #1: Ignore SIGHUP so the server survives terminal disconnects ─────────
+# When Fish shell / SSH closes the controlling terminal it sends SIGHUP to the
+# process group. Python's default disposition is SIG_DFL (terminate).
+# Ignoring it lets the server keep running — identical to nohup behaviour.
+_signal.signal(_signal.SIGHUP, _signal.SIG_IGN)
+
+# ── Fix #3: Belt-and-suspenders loky cleanup via atexit ───────────────────────
+# sentence-transformers → joblib → loky creates a reusable process pool backed
+# by a POSIX semaphore. If the loky executor is not explicitly shut down before
+# the interpreter exits, Python's resource_tracker reports a leaked semaphore.
+# This atexit handler guarantees cleanup even on abnormal exits (SIGTERM, etc.)
+def _cleanup_loky():
+    try:
+        from joblib.externals.loky import get_reusable_executor
+        get_reusable_executor().shutdown(wait=False)
+    except Exception:
+        pass
+
+atexit.register(_cleanup_loky)
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
@@ -613,7 +635,7 @@ async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent):
 
         async def instrumented_execute(name, args):
             args_preview = ", ".join(
-                f"{k}={str(v)[:50]}" for k, v in args.items()
+                f"{k}={str(v)}" for k, v in args.items()
             ) if args else ""
             bg["activity"] = f"{name}({args_preview})"
             _emit({"type": "tool", "name": name, "args": args_preview})
@@ -629,7 +651,9 @@ async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent):
 
         bg["activity"] = "Thinking..."
         try:
-            response = await agent.get_response(user_input, conversation=conversation, tools=per_request_tools)
+            def _token_cb(token: str):
+                _emit({"type": "token", "content": token})
+            response = await agent.get_response(user_input, conversation=conversation, tools=per_request_tools, token_callback=_token_cb)
         except Exception as api_err:
             err_msg = str(api_err)
             # Emit user-friendly error to the SSE stream
@@ -642,13 +666,8 @@ async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent):
         finally:
             await per_request_tools.cleanup()
 
-        bg["activity"] = "Responding..."
+        # Tokens already streamed live via token_callback during LLM inference.
         content = response or ""
-        words = content.split(" ")
-        for i, word in enumerate(words):
-            chunk = word + (" " if i < len(words) - 1 else "")
-            _emit({"type": "token", "content": chunk})
-            await asyncio.sleep(0.008)
 
         if s is not None:
             now = datetime.now().isoformat()
@@ -998,6 +1017,108 @@ async def _tail_log(name: str, log_file: str, request: Request) -> AsyncGenerato
             except Exception:
                 pass
 
+
+# AgentExecutor task routes
+from agent_executor import AgentExecutor, Task, TaskStatus
+_agent_tasks = {}
+
+class AgentTaskRequest(BaseModel):
+    description: str
+    session_id: str = None
+
+def _make_agent_executor(task_id):
+    state = _agent_tasks[task_id]
+    def _cb(event, data):
+        state["event_buf"].append({"type": event, **data})
+        if event in ("task_completed","task_failed","task_cancelled"): state["done"] = True
+    return AgentExecutor(_shared_agent, step_callback=_cb)
+
+@app.post("/agent/task")
+async def agent_submit_task(req: AgentTaskRequest):
+    if _shared_agent is None: raise HTTPException(status_code=503, detail="Agent not initialised")
+    task_id = "agt_" + uuid.uuid4().hex[:12]
+    _agent_tasks[task_id] = {"event_buf": [], "done": False, "asyncio_task": None}
+    executor = _make_agent_executor(task_id)
+    async def _run():
+        try:
+            await executor.execute_task(req.description, task_id=task_id)
+        except Exception as exc:
+            _agent_tasks[task_id]["event_buf"].append({"type": "task_failed", "task_id": task_id, "error": str(exc)})
+            _agent_tasks[task_id]["done"] = True
+        finally:
+            buf = _agent_tasks[task_id]["event_buf"]
+            if not buf or buf[-1].get("type") != "stream_done": buf.append({"type": "stream_done", "task_id": task_id})
+            _agent_tasks[task_id]["done"] = True
+    _agent_tasks[task_id]["asyncio_task"] = asyncio.create_task(_run())
+    return {"task_id": task_id, "status": "started"}
+
+@app.get("/agent/task/{task_id}")
+async def agent_get_task(task_id: str):
+    state = _agent_tasks.get(task_id)
+    if not state: raise HTTPException(status_code=404, detail="Task not found")
+    buf = state["event_buf"]
+    done = state["done"]
+    # Derive a human-readable status string
+    if done:
+        last_type = buf[-1].get("type") if buf else None
+        if last_type == "task_completed":
+            status = "completed"
+        elif last_type in ("task_failed", "task_cancelled"):
+            status = "failed"
+        else:
+            status = "done"
+    else:
+        status = "running"
+    # Extract steps list from the task_planned event if present
+    steps = []
+    result = None
+    current_step = None
+    for ev in buf:
+        if ev.get("type") == "task_planned" and ev.get("steps"):
+            steps = ev["steps"]
+        if ev.get("type") == "step_started":
+            current_step = ev.get("step_id") or (ev.get("step", {}) or {}).get("step_id")
+        if ev.get("type") == "task_completed":
+            result = ev.get("result")
+    return {
+        "task_id": task_id,
+        "done": done,
+        "status": status,
+        "steps": steps,
+        "current_step": current_step,
+        "result": result,
+        "event_count": len(buf),
+    }
+
+@app.get("/agent/task/{task_id}/stream")
+async def agent_stream_task(task_id: str, request: Request):
+    state = _agent_tasks.get(task_id)
+    if not state: raise HTTPException(status_code=404, detail="Task not found")
+    async def _gen():
+        cursor = 0
+        idle_ticks = 0
+        while True:
+            if await request.is_disconnected(): break
+            buf = state["event_buf"]
+            while cursor < len(buf):
+                yield "data: " + json.dumps(buf[cursor]) + "\n\n"
+                cursor += 1
+            if state["done"] and cursor >= len(state["event_buf"]): break
+            await asyncio.sleep(0.2)
+            idle_ticks += 1
+            if idle_ticks % 15 == 0:  # keepalive every ~3 s
+                yield ": keepalive\n\n"
+    return StreamingResponse(_gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+@app.post("/agent/task/{task_id}/cancel")
+async def agent_cancel_task(task_id: str):
+    state = _agent_tasks.get(task_id)
+    if not state: raise HTTPException(status_code=404, detail="Task not found")
+    at = state.get("asyncio_task")
+    if at and not at.done():
+        at.cancel(); _agent_tasks[task_id]["done"] = True
+        return {"status": "cancelled", "task_id": task_id}
+    return {"status": "already_done", "task_id": task_id}
 
 if __name__ == "__main__":
     uvicorn.run(

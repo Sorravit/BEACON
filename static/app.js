@@ -22,6 +22,12 @@ let taskLogStreams   = {};
 let _dragInit        = false;
 let _currentReader   = null;   // active SSE reader so we can cancel client-side too
 let _currentSessionEmpty = true; // true when current session has no messages yet
+// Per-conversation active agent task tracking: sessionId → { taskId, progressEl, done }
+const activeTaskByConversation = new Map();
+
+// Module-level refs to IIFE-internal functions (populated at IIFE bootstrap)
+let _streamTaskEvents = null;    // set by IIFE once ready
+let _appendTaskProgress = null;  // set by IIFE once ready
 // Per-session streaming check
 function isStreamingSession(sid) { return _streamingSet.has(sid); }
 
@@ -191,19 +197,27 @@ function copyCode(btn) {
   const pre = btn.closest('pre');
   const code = pre ? pre.querySelector('code') : null;
   if (!code) return;
-  navigator.clipboard.writeText(code.innerText).then(() => {
+  // Use textContent (not innerText) to get the full raw text regardless of
+  // layout/visibility — innerText is layout-dependent and truncates off-screen
+  // content. Then decode HTML entities introduced by renderMarkdown's escaping
+  // step (&amp; → &, &lt; → <, &gt; → >).
+  const raw = code.textContent
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>');
+  navigator.clipboard.writeText(raw).then(() => {
     btn.textContent = '✓ Copied';
     btn.classList.add('copied');
     setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 1800);
   }).catch(() => {
     // Fallback for older browsers
-    const sel = window.getSelection();
-    const range = document.createRange();
-    range.selectNodeContents(code);
-    sel.removeAllRanges();
-    sel.addRange(range);
+    const ta = document.createElement('textarea');
+    ta.value = raw;
+    ta.style.cssText = 'position:fixed;opacity:0;pointer-events:none';
+    document.body.appendChild(ta);
+    ta.select();
     document.execCommand('copy');
-    sel.removeAllRanges();
+    document.body.removeChild(ta);
     btn.textContent = '✓ Copied';
     btn.classList.add('copied');
     setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 1800);
@@ -483,6 +497,17 @@ async function switchSession(id) {
     } catch(e) {}
   }
   if (id === currentSessionId) return;
+
+  // Before clearing the DOM, mark any live task as needing re-attach on switch-back.
+  // We do NOT save HTML — we save only the taskId and let the stream replay from cursor=0.
+  if (currentSessionId) {
+    const record = activeTaskByConversation.get(currentSessionId);
+    if (record && !record.done) {
+      // Nullify progressEl — it will be re-created fresh on switch-back
+      record.progressEl = null;
+    }
+  }
+
   currentSessionId = id;
   document.querySelectorAll('.session-item').forEach(el => {
     el.classList.toggle('active', el.dataset.id === id);
@@ -532,6 +557,16 @@ async function switchSession(id) {
       messagesEl.appendChild(es);
     }
     if (data.running && !isStreamingSession(id)) reconnectToSession(id);
+
+    // Restore active agent task progress card and reconnect stream if still running.
+    const taskRecord = activeTaskByConversation.get(id);
+    if (taskRecord && !taskRecord.done && _streamTaskEvents && _appendTaskProgress) {
+      // Create a FRESH progress card (do not reuse or re-inject old DOM)
+      const freshCard = _appendTaskProgress('(reconnecting task…)');
+      taskRecord.progressEl = freshCard;
+      // Stream replays from cursor=0 — the card will fill in correctly
+      _streamTaskEvents(taskRecord.taskId, freshCard);
+    }
   } catch(e) { showToast('Failed to load session'); }
 }
 
@@ -1103,15 +1138,19 @@ window.addEventListener('load',async()=>{
     textarea.focus();
     initEventStream();
     await loadSessions();
-    const res=await fetch('/sessions');const data=await res.json();
-    // Check for ?session= URL param (e.g. from Cmd+Click opening a new tab)
+    // Check for ?session= URL param
     const urlParams = new URLSearchParams(window.location.search);
     const requestedSession = urlParams.get('session');
+    const res=await fetch('/sessions');const data=await res.json();
     if (requestedSession && data.sessions && data.sessions.find(s => s.id === requestedSession)) {
         await switchSession(requestedSession);
     } else {
         await newChat();
     }
+    // Recover any in-progress agent tasks from localStorage (page reload scenario).
+    // Run after session is established so currentSessionId is set.
+    // Use setTimeout(0) to ensure IIFE bootstrap has run and _streamTaskEvents is set.
+    setTimeout(() => recoverActiveTasksFromStorage(), 0);
   }catch(e){console.error('Init error:',e);setStatus('ready','Ready');}
 });
 
@@ -1124,3 +1163,477 @@ document.addEventListener('click', e => {
     if(sidebarOpenBtn) sidebarOpenBtn.style.display='flex';
   }
 });
+
+
+// ═══════════════════════════════════════════════════════════
+// TASK MODE — AgentExecutor wiring
+// Adds a ⚡ Task Mode toggle next to the Send button.
+// When active, messages go to POST /agent/task instead of
+// POST /chat/stream, and progress is streamed via SSE.
+// ═══════════════════════════════════════════════════════════
+
+(function () {
+  'use strict';
+
+  // ── State ────────────────────────────────────────────────
+  let taskModeActive = false;
+  let activeTaskId = null;
+  let taskEventSource = null;
+
+  // ── Inject toggle button into the input area ─────────────
+  function injectTaskToggle() {
+    // Find the send button — try common ids/classes
+    const sendBtn =
+      document.getElementById('send-btn') ||
+      document.getElementById('sendBtn') ||
+      document.querySelector('[data-action="send"]') ||
+      document.querySelector('button[type="submit"]') ||
+      document.querySelector('.send-btn') ||
+      document.querySelector('.input-area button') ||
+      document.querySelector('.chat-input-row button') ||
+      document.querySelector('#input-area button') ||
+      document.querySelector('form button');
+
+    if (!sendBtn) {
+      console.warn('[TaskMode] Could not find send button — retrying in 1s');
+      setTimeout(injectTaskToggle, 1000);
+      return;
+    }
+
+    if (document.getElementById('task-mode-toggle')) return; // already injected
+
+    const toggle = document.createElement('button');
+    toggle.id = 'task-mode-toggle';
+    toggle.type = 'button';
+    toggle.title = 'Task Mode — structured plan → execute → verify';
+    toggle.innerHTML = '⚡';
+    toggle.style.cssText = [
+      'width: 44px',
+      'height: 44px',
+      'background: transparent',
+      'border: 1.5px solid #44446a',
+      'border-radius: 10px',
+      'color: #888',
+      'cursor: pointer',
+      'font-size: 18px',
+      'flex-shrink: 0',
+      'display: flex',
+      'align-items: center',
+      'justify-content: center',
+      'transition: all .2s',
+      'padding: 0',
+    ].join(';');
+
+    toggle.addEventListener('mouseenter', () => {
+      if (!taskModeActive) toggle.style.background = 'rgba(108,99,255,0.15)';
+    });
+    toggle.addEventListener('mouseleave', () => {
+      if (!taskModeActive) toggle.style.background = 'transparent';
+    });
+    toggle.addEventListener('click', () => {
+      taskModeActive = !taskModeActive;
+      toggle.style.background = taskModeActive ? '#6c63ff' : 'transparent';
+      toggle.style.borderColor = taskModeActive ? '#6c63ff' : '#44446a';
+      toggle.style.color = taskModeActive ? '#fff' : '#888';
+      toggle.title = taskModeActive
+        ? 'Task Mode ON — structured plan → execute → verify (click to disable)'
+        : 'Task Mode — structured plan → execute → verify (click to enable)';
+    });
+
+    sendBtn.parentNode.insertBefore(toggle, sendBtn);
+    console.log('[TaskMode] Toggle injected');
+  }
+
+  // ── Intercept form submit / send button click ─────────────
+  function interceptSend() {
+    // Hook into the document-level keydown (Enter key) and click
+    document.addEventListener('keydown', (e) => {
+      if (!taskModeActive) return;
+      if (e.key !== 'Enter' || e.shiftKey) return;
+      const ta =
+        document.querySelector('textarea') ||
+        document.querySelector('input[type="text"]');
+      if (document.activeElement === ta) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        submitAsTask(ta.value.trim());
+        ta.value = '';
+        ta.style.height = '';
+      }
+    }, true); // capture phase — runs before app's own handler
+
+    // Also hook the send button
+    document.addEventListener('click', (e) => {
+      if (!taskModeActive) return;
+      const sendBtn =
+        document.getElementById('send-btn') ||
+        document.getElementById('sendBtn') ||
+        document.querySelector('[data-action="send"]') ||
+        document.querySelector('button[type="submit"]') ||
+        document.querySelector('.send-btn') ||
+        document.querySelector('.chat-input-row button:not(#task-mode-toggle)') ||
+        document.querySelector('#input-area button:not(#task-mode-toggle)');
+      if (e.target === sendBtn || (sendBtn && sendBtn.contains(e.target))) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        const ta =
+          document.querySelector('textarea') ||
+          document.querySelector('input[type="text"]');
+        if (ta) {
+          const msg = ta.value.trim();
+          if (msg) {
+            submitAsTask(msg);
+            ta.value = '';
+            ta.style.height = '';
+          }
+        }
+      }
+    }, true);
+  }
+
+  // ── Get current session id ────────────────────────────────
+  function getSessionId() {
+    // Try common globals used by app.js
+    if (typeof currentSessionId !== "undefined" && currentSessionId) return currentSessionId;
+    if (window.sessionId) return window.sessionId;
+    if (window.app && window.app.sessionId) return window.app.sessionId;
+    // Try URL param
+    const params = new URLSearchParams(location.search);
+    if (params.get('session')) return params.get('session');
+    // Last resort: read from a data attribute
+    const el = document.querySelector('[data-session-id]');
+    if (el) return el.dataset.sessionId;
+    return null;
+  }
+
+  // ── Submit message as AgentExecutor task ─────────────────
+  async function submitAsTask(description) {
+    if (!description) return;
+
+    const sessionId = getSessionId();
+    appendTaskMessage('user', description);
+    const progressEl = appendTaskProgress(description);
+
+    try {
+      const resp = await fetch('/agent/task', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ description, session_id: sessionId }),
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const { task_id } = await resp.json();
+      activeTaskId = task_id;
+
+      // Register in per-conversation map so switchSession() can restore it on switch-back
+      if (sessionId) {
+        activeTaskByConversation.set(sessionId, { taskId: task_id, progressEl, done: false });
+        // Persist to localStorage so page reload can recover the task
+        try {
+          localStorage.setItem(
+            'activeTask_' + sessionId,
+            JSON.stringify({ taskId: task_id, sessionId: sessionId })
+          );
+        } catch(e) {}
+      }
+
+      streamTaskEvents(task_id, progressEl);
+    } catch (err) {
+      progressEl.innerHTML = `<span style="color:#f38ba8">⚠️ Task submit failed: ${err.message}</span>`;
+    }
+  }
+
+  // ── Stream SSE events from /agent/task/{id}/stream ────────
+  // Uses fetch()+ReadableStream (same pattern as /chat/stream) instead of
+  // native EventSource. The backend yields lines like:
+  //   "data: {...}\n\n"  (proper SSE)  OR  " {...}\n\n" (space-prefix variant)
+  // Parsing manually handles both, and also fixes the EventSource onerror
+  // reconnect loop that could swallow all events on fast-completing tasks.
+  async function streamTaskEvents(taskId, progressEl) {
+    if (taskEventSource) { taskEventSource.close(); taskEventSource = null; }
+
+    const ctrl = new AbortController();
+    taskEventSource = { close: () => ctrl.abort() };
+
+    try {
+      const resp = await fetch(`/agent/task/${taskId}/stream`, { signal: ctrl.signal });
+      if (!resp.ok) {
+        updateProgress(progressEl, `\u274c Stream error: HTTP ${resp.status}`, 'failed');
+        taskEventSource = null;
+        return;
+      }
+
+      const reader = resp.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop();
+
+        for (const raw of lines) {
+          const trimmed = raw.trim();
+          if (!trimmed || trimmed.startsWith(':')) continue;
+
+          // Strip "data:" prefix (with or without leading space) then parse JSON
+          const jsonStr = trimmed.startsWith('data:')
+            ? trimmed.slice(5).trim()
+            : trimmed;
+
+          let ev;
+          try { ev = JSON.parse(jsonStr); } catch { continue; }
+
+          switch (ev.type) {
+            case 'task_started':
+            case 'task_planning':
+              updateProgress(progressEl, '\ud83d\udccb Planning steps\u2026', 'planning');
+              break;
+
+            case 'task_planned':
+              updateProgress(progressEl,
+                `\ud83d\udccb Plan ready \u2014 ${ev.steps ? ev.steps.length : '?'} steps`, 'planned');
+              renderStepList(progressEl, ev.steps || []);
+              break;
+
+            case 'task_executing':
+              updateProgress(progressEl, `\u2699\ufe0f Executing steps\u2026`, 'executing');
+              break;
+
+            case 'step_started': {
+              const sid = ev.step ? ev.step.step_id : ev.step_id;
+              const sdesc = ev.step ? ev.step.description : (ev.description || '');
+              updateProgress(progressEl, `\u2699\ufe0f Step ${sid}: ${sdesc}`, 'executing');
+              highlightStep(progressEl, sid, 'running');
+              break;
+            }
+
+            case 'step_completed': {
+              const sid = ev.step ? ev.step.step_id : ev.step_id;
+              highlightStep(progressEl, sid, 'done');
+              break;
+            }
+
+            case 'step_failed': {
+              const sid = ev.step ? ev.step.step_id : ev.step_id;
+              highlightStep(progressEl, sid, 'failed');
+              break;
+            }
+
+            case 'task_completed':
+              updateProgress(progressEl, '\u2705 Task completed', 'completed');
+              appendTaskMessage('assistant', ev.result || '(no result)');
+              taskEventSource = null;
+              activeTaskId = null;
+              // Mark done in the map and clean up localStorage
+              activeTaskByConversation.forEach((rec, sid) => {
+                if (rec.taskId === taskId) {
+                  rec.done = true;
+                  try { localStorage.removeItem('activeTask_' + sid); } catch(e) {}
+                }
+              });
+              return;
+
+            case 'task_failed':
+              updateProgress(progressEl, `\u274c Task failed: ${ev.error || 'unknown error'}`, 'failed');
+              taskEventSource = null;
+              activeTaskId = null;
+              // Mark done in the map and clean up localStorage
+              activeTaskByConversation.forEach((rec, sid) => {
+                if (rec.taskId === taskId) {
+                  rec.done = true;
+                  try { localStorage.removeItem('activeTask_' + sid); } catch(e) {}
+                }
+              });
+              return;
+
+            case 'stream_done':
+              taskEventSource = null;
+              return;
+          }
+        }
+      }
+    } catch (err) {
+      if (err.name !== 'AbortError') {
+        updateProgress(progressEl, `\u274c Connection error: ${err.message}`, 'failed');
+      }
+      taskEventSource = null;
+    }
+  }
+
+  // ── DOM helpers ───────────────────────────────────────────
+  function getMessagesContainer() {
+    return (
+      document.getElementById('messages') ||
+      document.getElementById('chat-messages') ||
+      document.getElementById('message-list') ||
+      document.querySelector('.messages') ||
+      document.querySelector('.chat-messages') ||
+      document.querySelector('.message-list') ||
+      document.querySelector('[data-messages]')
+    );
+  }
+
+  function appendTaskMessage(role, content) {
+    const container = getMessagesContainer();
+    if (!container) return;
+
+    const el = document.createElement('div');
+    el.className = role === 'user' ? 'message user-message' : 'message assistant-message';
+    el.style.cssText = [
+      'padding: 10px 16px',
+      'margin: 6px 0',
+      'border-radius: 12px',
+      role === 'user'
+        ? 'background:#3d3d6b; margin-left:20%; text-align:right'
+        : 'background:#1e1e3a; margin-right:20%',
+      'white-space: pre-wrap',
+      'word-break: break-word',
+    ].join(';');
+    el.textContent = content;
+    container.appendChild(el);
+    container.scrollTop = container.scrollHeight;
+    return el;
+  }
+
+  function appendTaskProgress(description) {
+    const container = getMessagesContainer();
+    if (!container) return document.createElement('div');
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'task-progress-card';
+    wrapper.style.cssText = [
+      'background: #12122a',
+      'border: 1.5px solid #44446a',
+      'border-radius: 12px',
+      'font-size: 13px',
+      'margin: 8px 0',
+      'margin-right: 20%',
+      'padding: 12px 16px',
+    ].join(';');
+
+    wrapper.innerHTML = `
+      <div style="color:#aaa;margin-bottom:6px;font-weight:600">
+        ⚡ Task Mode
+        <span style="font-size:11px;font-weight:400;color:#666;margin-left:8px">${description.slice(0, 60)}${description.length > 60 ? '…' : ''}</span>
+      </div>
+      <div class="task-status" style="color:#cdd6f4">⏳ Submitting…</div>
+      <div class="task-steps" style="margin-top:8px"></div>`;
+
+    container.appendChild(wrapper);
+    container.scrollTop = container.scrollHeight;
+    return wrapper;
+  }
+
+  function updateProgress(wrapper, text, state) {
+    if (!wrapper) return;
+    const el = wrapper.querySelector('.task-status');
+    if (!el) return;
+    el.textContent = text;
+    const colors = {
+      planning: '#89b4fa', planned: '#89b4fa',
+      executing: '#fab387', completed: '#a6e3a1',
+      failed: '#f38ba8', default: '#cdd6f4',
+    };
+    el.style.color = colors[state] || colors.default;
+    const cont = getMessagesContainer();
+    if (cont) cont.scrollTop = cont.scrollHeight;
+  }
+
+  function renderStepList(wrapper, steps) {
+    if (!wrapper) return;
+    const el = wrapper.querySelector('.task-steps');
+    if (!el) return;
+    // Backend emits step_id (not id) — use step_id for both the element id and display
+    el.innerHTML = steps.map(s => {
+      const sid = s.step_id !== undefined ? s.step_id : s.id;
+      return `<div id="step-${sid}" style="color:#666;padding:2px 0;font-size:12px">` +
+             `\u2b1c <span>${sid}. ${s.description}</span></div>`;
+    }).join('');
+  }
+
+  function highlightStep(wrapper, stepId, state) {
+    if (!wrapper) return;
+    const el = wrapper.querySelector(`#step-${stepId}`);
+    if (!el) return;
+    const icons = { running: '🔄', done: '✅', failed: '❌' };
+    const colors = { running: '#fab387', done: '#a6e3a1', failed: '#f38ba8' };
+    const icon = el.querySelector('span');
+    el.style.color = colors[state] || '#888';
+    el.firstChild.textContent = (icons[state] || '⬜') + ' ';
+    const cont = getMessagesContainer();
+    if (cont) cont.scrollTop = cont.scrollHeight;
+  }
+
+  // ── Bootstrap ─────────────────────────────────────────────
+  // Expose key functions to module scope so switchSession() and page-load
+  // recovery can call them without breaking the IIFE encapsulation.
+  function _doBootstrap() {
+    _streamTaskEvents   = streamTaskEvents;
+    _appendTaskProgress = appendTaskProgress;
+    injectTaskToggle();
+    interceptSend();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', _doBootstrap);
+  } else {
+    _doBootstrap();
+  }
+
+})();
+
+// ── Page-load recovery: restore in-progress agent tasks from localStorage ─────
+// Runs after the IIFE has bootstrapped (_streamTaskEvents is now set).
+async function recoverActiveTasksFromStorage() {
+  // Scan for all activeTask_* keys
+  const entries = [];
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith('activeTask_')) {
+        try {
+          const val = JSON.parse(localStorage.getItem(key));
+          if (val && val.taskId && val.sessionId) entries.push(val);
+        } catch(e) {}
+      }
+    }
+  } catch(e) { return; }
+
+  if (!entries.length) return;
+
+  for (const { taskId, sessionId } of entries) {
+    try {
+      // Ask backend if the task is still alive
+      const res = await fetch('/agent/task/' + taskId);
+      if (!res.ok) {
+        // Task not found — clean up stale localStorage entry
+        try { localStorage.removeItem('activeTask_' + sessionId); } catch(e) {}
+        continue;
+      }
+      const state = await res.json();
+      if (state.done) {
+        // Task already finished — clean up
+        try { localStorage.removeItem('activeTask_' + sessionId); } catch(e) {}
+        continue;
+      }
+
+      // Task is still running — register in the in-memory map if not already there
+      if (!activeTaskByConversation.has(sessionId)) {
+        activeTaskByConversation.set(sessionId, { taskId, progressEl: null, done: false });
+      }
+
+      // If the recovered task belongs to the session currently shown, show the card
+      if (sessionId === currentSessionId && _streamTaskEvents && _appendTaskProgress) {
+        const freshCard = _appendTaskProgress('(recovering task\u2026)');
+        activeTaskByConversation.get(sessionId).progressEl = freshCard;
+        _streamTaskEvents(taskId, freshCard);
+      }
+      // If the session is different from the current one, the card will be shown
+      // when the user switches back to that session (switchSession handles it).
+    } catch(e) {
+      console.warn('[TaskRecovery] Could not recover task', taskId, e);
+    }
+  }
+}
