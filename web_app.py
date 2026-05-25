@@ -1026,19 +1026,54 @@ class AgentTaskRequest(BaseModel):
     description: str
     session_id: str = None
 
-def _make_agent_executor(task_id):
+def _make_agent_executor(task_id, session_id=None):
     state = _agent_tasks[task_id]
+
     def _cb(event, data):
         state["event_buf"].append({"type": event, **data})
-        if event in ("task_completed","task_failed","task_cancelled"): state["done"] = True
-    return AgentExecutor(_shared_agent, step_callback=_cb)
+        if event == "task_completed":
+            state["done"] = True
+            # Save task description (user turn) + result (assistant turn) into
+            # the session's message history so regular chat can continue the
+            # conversation with full awareness of what Task Mode did.
+            if session_id and session_id in _sessions:
+                s = _sessions[session_id]
+                now = datetime.now().isoformat()
+                task_desc = data.get("description") or state.get("description", "")
+                result = data.get("result", "")
+                if task_desc:
+                    s["messages"].append({
+                        "role": "user",
+                        "content": f"[Task Mode] {task_desc}",
+                        "ts": now,
+                    })
+                if result:
+                    s["messages"].append({
+                        "role": "assistant",
+                        "content": f"[Task Mode completed]\n\n{result}",
+                        "ts": now,
+                    })
+                s["updated_at"] = now
+                _save_session(session_id)
+        elif event in ("task_failed", "task_cancelled"):
+            state["done"] = True
+
+    # Build session conversation context so Task Mode planning/execution is
+    # aware of everything discussed in regular chat before activation.
+    session_conv = None
+    if session_id:
+        session_conv = _build_conversation(_shared_agent, session_id)
+
+    return AgentExecutor(_shared_agent, step_callback=_cb, session_conversation=session_conv)
 
 @app.post("/agent/task")
 async def agent_submit_task(req: AgentTaskRequest):
     if _shared_agent is None: raise HTTPException(status_code=503, detail="Agent not initialised")
     task_id = "agt_" + uuid.uuid4().hex[:12]
-    _agent_tasks[task_id] = {"event_buf": [], "done": False, "asyncio_task": None}
-    executor = _make_agent_executor(task_id)
+    session_id = req.session_id or None
+    _agent_tasks[task_id] = {"event_buf": [], "done": False, "asyncio_task": None,
+                              "description": req.description}
+    executor = _make_agent_executor(task_id, session_id=session_id)
     async def _run():
         try:
             await executor.execute_task(req.description, task_id=task_id)

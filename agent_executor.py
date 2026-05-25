@@ -90,14 +90,19 @@ class AgentExecutor:
     - Handle errors and retries
     """
     
-    def __init__(self, ai_agent, max_steps: int = 20, max_retries: int = 3, step_callback=None):
+    def __init__(self, ai_agent, max_steps: int = 20, max_retries: int = 3, step_callback=None,
+                 session_conversation: Optional[List[Dict]] = None):
         """
         Initialize the agent executor.
-        
+
         Args:
             ai_agent: The AIAgent instance with tools
             max_steps: Maximum steps per task
             max_retries: Maximum retries per step
+            step_callback: Optional callback for task events
+            session_conversation: Conversation history from the current chat session.
+                When provided, planning and step-execution use this context so Task
+                Mode is aware of everything discussed in regular chat beforehand.
         """
         self.ai_agent = ai_agent
         self.max_steps = max_steps
@@ -105,6 +110,7 @@ class AgentExecutor:
         self.tasks: Dict[str, Task] = {}
         self.current_task: Optional[Task] = None
         self.step_callback = step_callback
+        self.session_conversation = session_conversation
         
     def _emit(self, event, data):
         if self.step_callback:
@@ -207,9 +213,14 @@ Respond in JSON format:
 
 Be specific and actionable. Each step should be independently executable."""
 
+        # Build conversation context: session history + planning prompt.
+        # This ensures the AI knows what was discussed in regular chat before
+        # Task Mode was activated (e.g. design decisions, requirements, etc.)
+        plan_conv = list(self.session_conversation) if self.session_conversation else None
+
         # Get plan from AI with encoding safety
         try:
-            raw_response = await self.ai_agent.get_response(planning_prompt)
+            raw_response = await self.ai_agent.get_response(planning_prompt, conversation=plan_conv)
             response = safe_encode_string(raw_response) if raw_response else None
         except Exception as e:
             logger.error(f"Error getting planning response: {e}")
@@ -277,11 +288,15 @@ Be specific and actionable. Each step should be independently executable."""
                             )
                             step.result = result
                         else:
-                            # Let AI choose and execute the appropriate tool using function calling
+                            # Let AI choose and execute the appropriate tool.
+                            # Pass session context so the AI knows the full picture
+                            # (design decisions, requirements discussed in regular chat).
+                            step_conv = list(self.session_conversation) if self.session_conversation else None
                             raw_result = await self.ai_agent.get_response(
                                 f"Execute this step: {step.description}\n\n"
                                 f"Context: This is step {step.step_id} of task '{task.description}'\n"
-                                f"Use the appropriate tool to complete this step."
+                                f"Use the appropriate tool to complete this step.",
+                                conversation=step_conv,
                             )
                             step.result = safe_encode_string(raw_result) if raw_result else None
                         
