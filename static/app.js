@@ -493,7 +493,14 @@ async function switchSession(id) {
     // This prevents the client-side flag from incorrectly deleting sessions
     // that have server-side messages (e.g., background notifications)
     try {
-      await fetch('/sessions/' + currentSessionId + '/delete-if-empty', {method: 'POST'});
+      const delRes = await fetch('/sessions/' + currentSessionId + '/delete-if-empty', {method: 'POST'});
+      if (delRes.ok) {
+        const delData = await delRes.json();
+        if (delData.status === 'deleted') {
+          // Session was empty and deleted — refresh sidebar so the stale item disappears
+          await loadSessions();
+        }
+      }
     } catch(e) {}
   }
   if (id === currentSessionId) return;
@@ -1327,7 +1334,6 @@ document.addEventListener('click', e => {
       // Register in per-conversation map so switchSession() can restore it on switch-back
       if (sessionId) {
         activeTaskByConversation.set(sessionId, { taskId: task_id, progressEl, done: false });
-        // Persist to localStorage so page reload can recover the task
         try {
           localStorage.setItem(
             'activeTask_' + sessionId,
@@ -1338,7 +1344,7 @@ document.addEventListener('click', e => {
 
       streamTaskEvents(task_id, progressEl);
     } catch (err) {
-      progressEl.innerHTML = `<span style="color:#f38ba8">⚠️ Task submit failed: ${err.message}</span>`;
+      progressEl.innerHTML = '<span style="color:#f38ba8">\u26a0\ufe0f Task submit failed: ' + err.message + '</span>';
     }
   }
 
@@ -1387,43 +1393,77 @@ document.addEventListener('click', e => {
 
           switch (ev.type) {
             case 'task_started':
+              updateProgress(progressEl, '\u23f3 Starting task\u2026', 'planning');
+              break;
+
+            case 'task_researching':
+              updateProgress(progressEl, '\ud83d\udd0d Researching requirements and context\u2026', 'researching');
+              if (ev.summary) appendPhaseLog(progressEl, '\ud83d\udd0d', 'Research Summary', ev.summary);
+              break;
+
             case 'task_planning':
-              updateProgress(progressEl, '\ud83d\udccb Planning steps\u2026', 'planning');
+              updateProgress(progressEl,
+                ev.message ? '\ud83d\udccb ' + ev.message : '\ud83d\udccb Planning steps\u2026',
+                'planning');
               break;
 
             case 'task_planned':
               updateProgress(progressEl,
-                `\ud83d\udccb Plan ready \u2014 ${ev.steps ? ev.steps.length : '?'} steps`, 'planned');
+                '\ud83d\udccb Plan ready \u2014 ' + (ev.steps ? ev.steps.length : '?') + ' steps', 'planned');
               renderStepList(progressEl, ev.steps || []);
+              if (ev.steps && ev.steps.length) {
+                const planText = ev.steps.map(function(s) { return s.step_id + '. ' + s.description; }).join('\n');
+                appendPhaseLog(progressEl, '\ud83d\udccb', 'Execution Plan', planText);
+              }
               break;
 
             case 'task_executing':
-              updateProgress(progressEl, `\u2699\ufe0f Executing steps\u2026`, 'executing');
+              updateProgress(progressEl,
+                ev.message ? '\u2699\ufe0f ' + ev.message : '\u2699\ufe0f Executing steps\u2026',
+                'executing');
+              break;
+
+            case 'task_verifying':
+              updateProgress(progressEl, '\ud83d\udd0d Verifying results\u2026', 'verifying');
+              break;
+
+            case 'task_verified':
+              updateProgress(progressEl,
+                ev.passed ? '\u2705 Verification passed' : '\u26a0\ufe0f ' + (ev.message || 'Verification failed'),
+                ev.passed ? 'completed' : 'executing');
+              appendPhaseLog(progressEl,
+                ev.passed ? '\u2705' : '\u26a0\ufe0f',
+                'Verification',
+                ev.message || (ev.passed ? 'Output meets requirements.' : 'Requirements not fully met.'));
               break;
 
             case 'step_started': {
               const sid = ev.step ? ev.step.step_id : ev.step_id;
               const sdesc = ev.step ? ev.step.description : (ev.description || '');
-              updateProgress(progressEl, `\u2699\ufe0f Step ${sid}: ${sdesc}`, 'executing');
+              updateProgress(progressEl, '\u2699\ufe0f Step ' + sid + ': ' + sdesc, 'executing');
               highlightStep(progressEl, sid, 'running');
               break;
             }
 
             case 'step_completed': {
               const sid = ev.step ? ev.step.step_id : ev.step_id;
+              const sdesc = ev.step ? ev.step.description : '';
+              const sresult = ev.step ? ev.step.result : (ev.result || '');
               highlightStep(progressEl, sid, 'done');
+              if (sresult) appendPhaseLog(progressEl, '\u2705', 'Step ' + sid + ': ' + sdesc, sresult);
               break;
             }
 
             case 'step_failed': {
               const sid = ev.step ? ev.step.step_id : ev.step_id;
+              const serr = ev.step ? ev.step.error : (ev.error || 'unknown error');
               highlightStep(progressEl, sid, 'failed');
+              appendPhaseLog(progressEl, '\u274c', 'Step ' + sid + ' failed', serr);
               break;
             }
 
             case 'task_completed':
               updateProgress(progressEl, '\u2705 Task completed', 'completed');
-              appendTaskMessage('assistant', ev.result || '(no result)');
               taskEventSource = null;
               activeTaskId = null;
               // Mark done in the map and clean up localStorage
@@ -1513,17 +1553,44 @@ document.addEventListener('click', e => {
       'padding: 12px 16px',
     ].join(';');
 
-    wrapper.innerHTML = `
-      <div style="color:#aaa;margin-bottom:6px;font-weight:600">
-        ⚡ Task Mode
-        <span style="font-size:11px;font-weight:400;color:#666;margin-left:8px">${description.slice(0, 60)}${description.length > 60 ? '…' : ''}</span>
-      </div>
-      <div class="task-status" style="color:#cdd6f4">⏳ Submitting…</div>
-      <div class="task-steps" style="margin-top:8px"></div>`;
+    wrapper.innerHTML =
+      '<div style="color:#aaa;margin-bottom:6px;font-weight:600">' +
+        '\u26a1 Task Mode ' +
+        '<span style="font-size:11px;font-weight:400;color:#666;margin-left:8px">' +
+          description.slice(0, 60) + (description.length > 60 ? '\u2026' : '') +
+        '</span>' +
+      '</div>' +
+      '<div class="task-status" style="color:#cdd6f4">\u23f3 Submitting\u2026</div>' +
+      '<div class="task-phase-log" style="margin-top:8px;max-height:300px;overflow-y:auto;' +
+        'background:#0d0d1f;border-radius:6px;padding:0;font-size:12px;display:none"></div>' +
+      '<div class="task-steps" style="margin-top:8px"></div>';
 
     container.appendChild(wrapper);
     container.scrollTop = container.scrollHeight;
     return wrapper;
+  }
+
+  function appendPhaseLog(wrapper, icon, label, content) {
+    if (!wrapper) return;
+    const logEl = wrapper.querySelector('.task-phase-log');
+    if (!logEl) return;
+    logEl.style.display = 'block';
+    const entry = document.createElement('div');
+    entry.style.cssText = 'border-bottom:1px solid #1e1e3a;padding:6px 10px;';
+    const header = document.createElement('div');
+    header.style.cssText = 'color:#888;font-size:11px;margin-bottom:3px;';
+    header.textContent = icon + ' ' + label;
+    entry.appendChild(header);
+    if (content) {
+      const body = document.createElement('div');
+      body.style.cssText = 'color:#cdd6f4;white-space:pre-wrap;word-break:break-word;';
+      body.textContent = content.slice(0, 800) + (content.length > 800 ? '\u2026' : '');
+      entry.appendChild(body);
+    }
+    logEl.appendChild(entry);
+    logEl.scrollTop = logEl.scrollHeight;
+    const cont = getMessagesContainer();
+    if (cont) cont.scrollTop = cont.scrollHeight;
   }
 
   function updateProgress(wrapper, text, state) {
@@ -1533,7 +1600,9 @@ document.addEventListener('click', e => {
     el.textContent = text;
     const colors = {
       planning: '#89b4fa', planned: '#89b4fa',
+      researching: '#cba6f7',
       executing: '#fab387', completed: '#a6e3a1',
+      verifying: '#f9e2af',
       failed: '#f38ba8', default: '#cdd6f4',
     };
     el.style.color = colors[state] || colors.default;

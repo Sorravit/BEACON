@@ -40,7 +40,7 @@ LOG_FILE = "logs/ai_assistant.log"
 # AI Model Configuration
 DEFAULT_MODEL = "gpt-3.5-turbo"
 DEFAULT_TEMPERATURE = 0.7
-DEFAULT_MAX_TOKENS = 2000
+DEFAULT_MAX_TOKENS = 4096
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 
 # Tool Execution Limits
@@ -591,18 +591,34 @@ class ToolManager:
         # Normalize parameter names to handle AI model variations
         normalized_args = self._normalize_tool_args(name, args)
 
-        # Validate required parameters before calling handler
+        # Validate required parameters and strip unexpected ones before calling handler
         import inspect
         handler = self.tool_handlers[name]
         sig = inspect.signature(handler)
+
+        # Check for missing required parameters
         missing = [
             p for p, v in sig.parameters.items()
             if p != "self"
+            and v.kind not in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)
             and v.default is inspect.Parameter.empty
             and p not in normalized_args
         ]
         if missing:
             return f"Error: tool '{name}' missing required parameter(s): {', '.join(missing)}"
+
+        # Strip unexpected keyword args the model may hallucinate (e.g. 'timeout' on tools
+        # that don't accept it) to prevent TypeError: unexpected keyword argument.
+        accepted = {
+            p for p, v in sig.parameters.items()
+            if p != "self" and v.kind not in (inspect.Parameter.VAR_POSITIONAL,)
+        }
+        has_var_keyword = any(
+            v.kind == inspect.Parameter.VAR_KEYWORD
+            for v in sig.parameters.values()
+        )
+        if not has_var_keyword:
+            normalized_args = {k: v for k, v in normalized_args.items() if k in accepted}
 
         return await self.tool_handlers[name](**normalized_args)
     
@@ -627,6 +643,24 @@ class ToolManager:
                 'path': 'directory',
                 'dir': 'directory',
                 'folder': 'directory'
+            },
+            'execute_command': {
+                'cmd': 'command',
+                'shell_command': 'command',
+                'shell': 'command',
+                'code': 'command',
+                'script': 'command',
+                'bash': 'command',
+                'input': 'command',
+            },
+            'execute_long_command': {
+                'cmd': 'command',
+                'shell_command': 'command',
+                'shell': 'command',
+                'code': 'command',
+                'script': 'command',
+                'bash': 'command',
+                'input': 'command',
             },
         }
         
@@ -865,10 +899,11 @@ class AIAgent:
             for server_name, server_config in servers.items():
                 command = server_config.get("command")
                 args = server_config.get("args", [])
-                
+                env = server_config.get("env", None)
+
                 if command and self.mcp_manager:
                     logger.info(f"Loading MCP server: {server_name}")
-                    success = await self.mcp_manager.add_server(server_name, command, args)
+                    success = await self.mcp_manager.add_server(server_name, command, args, env=env)
                     if success:
                         logger.info(f"✅ MCP server {server_name} loaded")
                     else:
@@ -980,7 +1015,7 @@ If nothing meaningful to extract, respond with: []
 
 JSON:"""
 
-            result = await asyncio.get_event_loop().run_in_executor(
+            result = await asyncio.get_running_loop().run_in_executor(
                 None,
                 lambda: self.client.chat.completions.create(
                     model=self.config.model,
@@ -1081,10 +1116,22 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
         
         tool_calls = []
         
-        # Find all <tool_use> blocks
-        pattern = r'<tool_use>(.*?)</tool_use>'
+        # ── Format 1: <tool_use>...<tool_name>NAME</tool_name>...</tool_use> ──
+        # Also tolerates mismatched closing tags: </tool_invoke>, </tool_call>
+        pattern = r'<tool_use>(.*?)</(?:tool_use|tool_invoke|tool_call|use)>'
         matches = re.findall(pattern, response_text, re.DOTALL)
-        
+
+        # ── Format 2: <function_calls><invoke name="NAME">...</invoke></function_calls> ──
+        # Claude sometimes uses this anthropic-native format for MCP tools.
+        invoke_pattern = r'<invoke\s+name=["\']([^"\']+)["\']>(.*?)</invoke>'
+        for inv_name, inv_body in re.findall(invoke_pattern, response_text, re.DOTALL):
+            # Convert <parameter name="key">value</parameter> → JSON dict
+            params = {}
+            for p_name, p_val in re.findall(r'<parameter\s+name=["\']([^"\']+)["\']>(.*?)</parameter>', inv_body, re.DOTALL):
+                params[p_name] = p_val.strip()
+            tool_calls.append({"tool_name": inv_name.strip(), "parameters": params})
+            logger.warning(f"Parsed function_calls/invoke format for tool: {inv_name.strip()}")
+
         for match in matches:
             try:
                 # Parse tool name
@@ -1101,8 +1148,29 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                         try:
                             parameters = json.loads(params_text)
                         except json.JSONDecodeError:
-                            logger.error(f"Failed to parse parameters JSON: {params_text}")
-                            parameters = {}
+                            # Try 1: repair truncated JSON (max_tokens cut off closing brace)
+                            open_count = params_text.count('{')
+                            close_count = params_text.count('}')
+                            if open_count > close_count:
+                                repaired = params_text.rstrip() + '}' * (open_count - close_count)
+                                try:
+                                    parameters = json.loads(repaired)
+                                    logger.warning(f"Repaired truncated parameters JSON")
+                                    # Successfully repaired — skip XML fallback
+                                except json.JSONDecodeError:
+                                    parameters = None
+                            else:
+                                parameters = None
+
+                            # Try 2: model used XML-style params <key>value</key> instead of JSON
+                            if parameters is None:
+                                xml_params = re.findall(r'<(\w+)>(.*?)</\1>', params_text, re.DOTALL)
+                                if xml_params:
+                                    parameters = {k: v.strip() for k, v in xml_params}
+                                    logger.warning(f"Parsed XML-style parameters: {list(parameters.keys())}")
+                                else:
+                                    logger.error(f"Failed to parse parameters: {params_text[:200]}")
+                                    parameters = {}
                     else:
                         parameters = {}
                 else:
@@ -1144,13 +1212,22 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
         else:
             conv = self.conversation  # CLI mode: mutate self.conversation as before
         
+        # Build tools prompt once and store it for use in the first iteration only.
+        # We do NOT permanently inject it into conv[0] because:
+        #   1. conv[0] is a shared reference to agent.conversation[0] — mutating it
+        #      would corrupt the shared system message across sessions.
+        #   2. Including the full 80k-char tools prompt in EVERY iteration (including
+        #      the tool-results feedback round-trip) bloats the payload and causes
+        #      IBM ICA (and other APIs with tight context limits) to return 400.
+        # Instead, we pass a _first-iteration-only_ system message with the tools
+        # description, and strip it back to the base system content for subsequent
+        # iterations.
+        _base_system_content = conv[0]["content"] if conv and conv[0]["role"] == "system" else ""
+        _tools_prompt = self._build_tools_prompt() if self.tools_available else ""
+
         try:
-            # Add tools description to system message if not already present (once only)
-            if self.tools_available and len(conv) > 0:
-                if conv[0]["role"] == "system":
-                    tools_prompt = self._build_tools_prompt()
-                    if tools_prompt not in conv[0]["content"]:
-                        conv[0]["content"] += tools_prompt
+            # (tools prompt is applied per-iteration below, not permanently here)
+            pass
 
             # --- Vector memory: detect and store personal facts from user input ---
             if self.memory_available and self.vector_memory:
@@ -1175,6 +1252,16 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
             # For long-running tasks (courses, etc.), use a very high limit
             # Configured via MAX_TOOL_ITERATIONS constant at top of file
             for iteration in range(MAX_TOOL_ITERATIONS):
+                # On the first iteration: inject tools prompt into system message so
+                # the model knows the tool format.  On subsequent iterations (tool
+                # results feedback): use the base system content only to keep the
+                # payload small and avoid 400 errors from context-size limits.
+                if conv and conv[0]["role"] == "system":
+                    if iteration == 0 and _tools_prompt:
+                        conv[0] = {"role": "system", "content": _base_system_content + _tools_prompt}
+                    else:
+                        conv[0] = {"role": "system", "content": _base_system_content}
+
                 params = {
                     "model": self.config.model,
                     "messages": conv,

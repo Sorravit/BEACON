@@ -531,7 +531,7 @@ class VectorMemory:
         # is released cleanly instead of being reported as a leak.
         try:
             from joblib.externals.loky import get_reusable_executor
-            get_reusable_executor().shutdown(wait=False)
+            get_reusable_executor().shutdown(wait=True)
         except Exception:
             pass
 

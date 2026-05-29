@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 MCP (Model Context Protocol) Client Implementation
@@ -7,8 +6,9 @@ Handles communication with MCP servers via stdio using async I/O with timeouts.
 import asyncio
 import json
 import logging
+import os
 from typing import Any, Dict, List, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
@@ -27,10 +27,11 @@ class MCPTool:
 class MCPClient:
     """Async stdio MCP client — never blocks the event loop."""
 
-    def __init__(self, server_name: str, command: str, args: List[str]):
+    def __init__(self, server_name: str, command: str, args: List[str], env: Optional[Dict[str, str]] = None):
         self.server_name = server_name
         self.command = command
         self.args = args
+        self.env = env  # extra env vars to pass to the subprocess
         self.process: Optional[asyncio.subprocess.Process] = None
         self.tools: List[MCPTool] = []
         self.request_id = 0
@@ -42,11 +43,19 @@ class MCPClient:
     async def start(self) -> bool:
         try:
             logger.info(f"Starting MCP server: {self.server_name}")
+
+            # Merge current environment with any server-specific env vars
+            subprocess_env = None
+            if self.env:
+                subprocess_env = {**os.environ, **self.env}
+
             self.process = await asyncio.create_subprocess_exec(
                 self.command, *self.args,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=subprocess_env,
+                limit=10*1024*1024,
             )
             self._stderr_task = asyncio.ensure_future(self._drain_stderr())
 
@@ -233,11 +242,11 @@ class MCPManager:
     def __init__(self):
         self.clients: Dict[str, MCPClient] = {}
 
-    async def add_server(self, server_name: str, command: str, args: List[str]) -> bool:
+    async def add_server(self, server_name: str, command: str, args: List[str], env: Optional[Dict[str, str]] = None) -> bool:
         if server_name in self.clients:
             logger.warning(f"MCP server {server_name} already exists")
             return True
-        client = MCPClient(server_name, command, args)
+        client = MCPClient(server_name, command, args, env=env)
         if await client.start():
             self.clients[server_name] = client
             return True
@@ -277,11 +286,11 @@ class MCPManager:
             logger.error(f"Cannot restart '{server_name}': not found. Available: {list(self.clients.keys())}")
             return False
         client = self.clients[server_name]
-        command, args = client.command, client.args
+        command, args, env = client.command, client.args, client.env
         logger.info(f"Restarting MCP server: {server_name}")
         await client.stop()
         del self.clients[server_name]
-        new_client = MCPClient(server_name, command, args)
+        new_client = MCPClient(server_name, command, args, env=env)
         if await new_client.start():
             self.clients[server_name] = new_client
             logger.info(f"MCP server {server_name} restarted with {len(new_client.tools)} tools")

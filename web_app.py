@@ -46,7 +46,7 @@ _signal.signal(_signal.SIGHUP, _signal.SIG_IGN)
 def _cleanup_loky():
     try:
         from joblib.externals.loky import get_reusable_executor
-        get_reusable_executor().shutdown(wait=False)
+        get_reusable_executor().shutdown(wait=True)
     except Exception:
         pass
 
@@ -1029,34 +1029,48 @@ class AgentTaskRequest(BaseModel):
 def _make_agent_executor(task_id, session_id=None):
     state = _agent_tasks[task_id]
 
+    def _safe_text(text):
+        """Remove UTF-8 surrogates so session JSON serialises cleanly."""
+        if not text:
+            return ""
+        try:
+            return str(text).encode("utf-8", errors="replace").decode("utf-8")
+        except Exception:
+            return ""
+
     def _cb(event, data):
         state["event_buf"].append({"type": event, **data})
-        if event == "task_completed":
+        if event in ("task_completed", "task_failed", "task_cancelled"):
             state["done"] = True
-            # Save task description (user turn) + result (assistant turn) into
-            # the session's message history so regular chat can continue the
-            # conversation with full awareness of what Task Mode did.
-            if session_id and session_id in _sessions:
-                s = _sessions[session_id]
-                now = datetime.now().isoformat()
-                task_desc = data.get("description") or state.get("description", "")
-                result = data.get("result", "")
-                if task_desc:
-                    s["messages"].append({
-                        "role": "user",
-                        "content": f"[Task Mode] {task_desc}",
-                        "ts": now,
-                    })
-                if result:
-                    s["messages"].append({
-                        "role": "assistant",
-                        "content": f"[Task Mode completed]\n\n{result}",
-                        "ts": now,
-                    })
+
+        # Only save the final task result to permanent chat history.
+        # Intermediate phase details (research, plan, steps, verification)
+        # are shown live in the progress card's scrollable log — not saved as
+        # separate chat messages to avoid cluttering the conversation.
+        if not (session_id and session_id in _sessions):
+            return
+        s = _sessions[session_id]
+        now = datetime.now().isoformat()
+
+        if event == "task_completed":
+            result = _safe_text(data.get("result", ""))
+            if result:
+                s["messages"].append({
+                    "role": "assistant",
+                    "content": "🏁 **Task Complete**\n\n" + result,
+                    "ts": now,
+                })
                 s["updated_at"] = now
                 _save_session(session_id)
         elif event in ("task_failed", "task_cancelled"):
-            state["done"] = True
+            error = _safe_text(data.get("error", "unknown error"))
+            s["messages"].append({
+                "role": "assistant",
+                "content": "❌ **Task Failed**\n\n" + error,
+                "ts": now,
+            })
+            s["updated_at"] = now
+            _save_session(session_id)
 
     # Build session conversation context so Task Mode planning/execution is
     # aware of everything discussed in regular chat before activation.
@@ -1073,6 +1087,29 @@ async def agent_submit_task(req: AgentTaskRequest):
     session_id = req.session_id or None
     _agent_tasks[task_id] = {"event_buf": [], "done": False, "asyncio_task": None,
                               "description": req.description}
+
+    # Save task command as a user message IMMEDIATELY on submission so it always
+    # appears in chat history regardless of whether the task succeeds or fails.
+    if session_id and session_id in _sessions:
+        s = _sessions[session_id]
+        now = datetime.now().isoformat()
+        # Avoid duplicate if already present (e.g. page reload)
+        already_saved = any(
+            m.get("role") == "user" and m.get("content") == f"[Task Mode] {req.description}"
+            for m in s["messages"][-3:] if s["messages"]
+        )
+        if not already_saved:
+            s["messages"].append({
+                "role": "user",
+                "content": f"[Task Mode] {req.description}",
+                "ts": now,
+            })
+            if not s.get("manually_named") and len([m for m in s["messages"] if m["role"] == "user"]) == 1:
+                s["title"] = _auto_title(req.description)
+            s["updated_at"] = now
+            _save_session(session_id)
+            logger.info(f"Saved task command to session {session_id}: {req.description[:60]}")
+
     executor = _make_agent_executor(task_id, session_id=session_id)
     async def _run():
         try:
