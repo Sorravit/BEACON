@@ -24,6 +24,7 @@ Usage:
 import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -66,17 +67,25 @@ class VectorMemory:
             import weaviate
             from sentence_transformers import SentenceTransformer
 
-            # Load local embedding model (downloads ~90MB on first run only)
-            # After first run: set TRANSFORMERS_OFFLINE=1 to skip HuggingFace checks
-            logger.info(f"Loading local embedding model: {self.embedding_model}")
-            self._encoder = SentenceTransformer(
-                self.embedding_model,
-                local_files_only=os.getenv("TRANSFORMERS_OFFLINE", "0") == "1"
-            )
+            # Load local embedding model once (downloads ~90MB on first run only)
+            if self._encoder is None:
+                logger.info(f"Loading local embedding model: {self.embedding_model}")
+                self._encoder = SentenceTransformer(
+                    self.embedding_model,
+                    local_files_only=os.getenv("TRANSFORMERS_OFFLINE", "0") == "1"
+                )
 
             # Weaviate client (anonymous access, no vectorizer module)
-            weaviate_port = int(_os.getenv("WEAVIATE_PORT", "8090"))
-            self.client = weaviate.connect_to_local(host="localhost", port=weaviate_port)
+            if self.client:
+                try:
+                    self.client.close()
+                except Exception:
+                    pass
+
+            parsed = urlparse(self.weaviate_url)
+            host = parsed.hostname or "localhost"
+            port = parsed.port or int(_os.getenv("WEAVIATE_PORT", "8090"))
+            self.client = weaviate.connect_to_local(host=host, port=port)
 
             await self._ensure_collections()
             self._ready = True
@@ -85,10 +94,21 @@ class VectorMemory:
 
         except ImportError as e:
             logger.error(f"Missing dependency: {e}. Run: pip install weaviate-client sentence-transformers")
+            self._ready = False
             return False
         except Exception as e:
             logger.warning(f"VectorMemory not available: {e}")
+            self._ready = False
+            self.client = None
             return False
+
+    async def ensure_ready(self) -> bool:
+        """Ensure memory backend is ready; try to reconnect lazily when needed."""
+        if self._ready and self.client:
+            return True
+
+        logger.info("VectorMemory is not ready, attempting reconnect")
+        return await self.initialize()
 
     async def _ensure_collections(self):
         """Create (or recreate) collections with no vectorizer (we supply vectors directly)."""
@@ -270,7 +290,7 @@ class VectorMemory:
 
     async def get_all_personal_facts(self) -> List[Dict[str, Any]]:
         """Return all stored personal facts."""
-        if not self._ready:
+        if not await self.ensure_ready():
             return []
         try:
             collection = self.client.collections.get("PersonalFacts")
@@ -280,8 +300,22 @@ class VectorMemory:
             )
             return [obj.properties for obj in response.objects]
         except Exception as e:
-            logger.error(f"Failed to fetch personal facts: {e}")
-            return []
+            logger.warning(f"Failed to fetch personal facts, reconnecting once: {e}")
+            self._ready = False
+            self.client = None
+            if not await self.ensure_ready():
+                return []
+
+            try:
+                collection = self.client.collections.get("PersonalFacts")
+                response = collection.query.fetch_objects(
+                    limit=200,
+                    return_properties=["topic", "fact", "stored_at"]
+                )
+                return [obj.properties for obj in response.objects]
+            except Exception as retry_err:
+                logger.error(f"Failed to fetch personal facts after reconnect: {retry_err}")
+                return []
 
     async def delete_personal_facts(self, keyword: str) -> int:
         """
