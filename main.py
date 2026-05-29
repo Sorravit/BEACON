@@ -545,6 +545,8 @@ class ToolManager:
         if not await self.vector_memory.ensure_ready():
             return "Memory system is currently unavailable."
         stored = await self.vector_memory.store_personal_fact(topic, fact)
+        if stored is None:
+            return "Failed to store fact because the memory database is unreachable. Please try again shortly."
         if stored:
             return f"Remembered: [{topic}] {fact}"
         return f"Failed to store fact."
@@ -555,6 +557,8 @@ class ToolManager:
         if not await self.vector_memory.ensure_ready():
             return "Memory system is currently unavailable."
         facts = await self.vector_memory.get_all_personal_facts()
+        if facts is None:
+            return "Failed to list personal facts because the memory database is unreachable. Please try again shortly."
         if not facts:
             return "No personal facts stored in memory."
         lines = [f"[{f.get('topic')}] {f.get('fact')} (saved: {f.get('stored_at', '')[:10]})" for f in facts]
@@ -566,6 +570,8 @@ class ToolManager:
         if not await self.vector_memory.ensure_ready():
             return "Memory system is currently unavailable."
         count = await self.vector_memory.delete_personal_facts(keyword)
+        if count is None:
+            return "Failed to delete personal facts because the memory database is unreachable. Please try again shortly."
         if count == 0:
             return f"No personal facts found matching '{keyword}'."
         return f"Deleted {count} personal fact(s) matching '{keyword}'."
@@ -576,6 +582,8 @@ class ToolManager:
         if not await self.vector_memory.ensure_ready():
             return "Memory system is currently unavailable."
         count = await self.vector_memory.delete_research(keyword)
+        if count is None:
+            return "Failed to delete research memory because the memory database is unreachable. Please try again shortly."
         if count == 0:
             return f"No research entries found matching '{keyword}'."
         return f"Deleted {count} research entry/entries matching '{keyword}'."
@@ -586,6 +594,8 @@ class ToolManager:
         if not await self.vector_memory.ensure_ready():
             return "Memory system is currently unavailable."
         count = await self.vector_memory.clear_all_research()
+        if count is None:
+            return "Failed to clear research memory because the memory database is unreachable. Please try again shortly."
         return f"Cleared all {count} research memory entries."
 
     async def execute_tool(self, name: str, args: Dict):
@@ -985,12 +995,12 @@ class AIAgent:
             return
         try:
             # Get existing auto-facts topics to avoid duplication
-            existing = await self.vector_memory.get_all_auto_facts()
+            existing = await self.vector_memory.get_all_auto_facts() or []
             existing_topics = [f.get('topic', '').lower() for f in existing]
             existing_summary = ', '.join(existing_topics[:50]) if existing_topics else 'none yet'
 
             # Get existing personal facts topics too
-            personal = await self.vector_memory.get_all_personal_facts()
+            personal = await self.vector_memory.get_all_personal_facts() or []
             personal_topics = [f.get('topic', '').lower() for f in personal]
             personal_summary = ', '.join(personal_topics[:50]) if personal_topics else 'none'
 

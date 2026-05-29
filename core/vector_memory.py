@@ -22,8 +22,9 @@ Usage:
 """
 
 import logging
+import socket
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, TypeVar
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,7 @@ import os as _os
 WEAVIATE_URL = f"http://localhost:{_os.getenv('WEAVIATE_PORT', '8090')}"
 # Local embedding model — no API key needed, works with any LLM backend
 LOCAL_EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+T = TypeVar("T")
 
 
 class VectorMemory:
@@ -109,6 +111,67 @@ class VectorMemory:
 
         logger.info("VectorMemory is not ready, attempting reconnect")
         return await self.initialize()
+
+    def _mark_unavailable(self):
+        """Mark current DB connection as unavailable so next call reconnects cleanly."""
+        if self.client:
+            try:
+                self.client.close()
+            except Exception:
+                pass
+        self.client = None
+        self._ready = False
+
+    def _is_grpc_reachable(self, timeout_seconds: float = 0.4) -> bool:
+        """Fast TCP check for Weaviate gRPC port to avoid long internal backoff retries."""
+        parsed = urlparse(self.weaviate_url)
+        host = parsed.hostname or "localhost"
+        grpc_port = int(_os.getenv("WEAVIATE_GRPC_PORT", "50051"))
+        try:
+            with socket.create_connection((host, grpc_port), timeout=timeout_seconds):
+                return True
+        except OSError:
+            return False
+
+    async def _run_with_reconnect(
+        self,
+        operation_name: str,
+        operation: Callable[[], T],
+        *,
+        on_failure: Optional[T],
+        retries: int = 3,
+    ) -> Optional[T]:
+        """Run a DB operation with reconnect retries; return on_failure if unavailable."""
+        if not await self.ensure_ready():
+            return on_failure
+
+        if not self._is_grpc_reachable():
+            logger.info(f"{operation_name} skipped: Weaviate gRPC is unreachable")
+            self._mark_unavailable()
+            return on_failure
+
+        attempts = max(retries, 1)
+        for attempt in range(1, attempts + 1):
+            try:
+                return operation()
+            except Exception as exc:
+                if attempt >= attempts:
+                    logger.error(f"{operation_name} failed after {attempts} attempt(s): {exc}")
+                    self._mark_unavailable()
+                    return on_failure
+
+                logger.warning(
+                    f"{operation_name} failed (attempt {attempt}/{attempts}), reconnecting: {exc}"
+                )
+                self._mark_unavailable()
+                if not await self.ensure_ready():
+                    return on_failure
+                if not self._is_grpc_reachable():
+                    logger.info(f"{operation_name} retry aborted: Weaviate gRPC is unreachable")
+                    self._mark_unavailable()
+                    return on_failure
+
+        return on_failure
 
     async def _ensure_collections(self):
         """Create (or recreate) collections with no vectorizer (we supply vectors directly)."""
@@ -196,11 +259,9 @@ class VectorMemory:
     # Research memory
     # -------------------------------------------------------------------------
 
-    async def store_research(self, tool_name: str, query: str, result: str) -> bool:
+    async def store_research(self, tool_name: str, query: str, result: str) -> Optional[bool]:
         """Store a tool result in ResearchMemory."""
-        if not self._ready:
-            return False
-        try:
+        def _op() -> bool:
             truncated = result[:4000] if len(result) > 4000 else result
             text_to_embed = f"{tool_name}: {query}\n{truncated}"
             vector = self._embed(text_to_embed, label="Storing research")
@@ -219,15 +280,16 @@ class VectorMemory:
             )
             logger.debug(f"Stored research: [{tool_name}] {query[:60]}")
             return True
-        except Exception as e:
-            logger.error(f"Failed to store research: {e}")
-            return False
 
-    async def search_research(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+        return await self._run_with_reconnect(
+            "store_research",
+            _op,
+            on_failure=None,
+        )
+
+    async def search_research(self, query: str, limit: int = 5) -> Optional[List[Dict[str, Any]]]:
         """Semantic search over ResearchMemory using near_vector."""
-        if not self._ready:
-            return []
-        try:
+        def _op() -> List[Dict[str, Any]]:
             vector = self._embed(query)
             if vector is None:
                 return []
@@ -238,19 +300,20 @@ class VectorMemory:
                 return_properties=["tool_name", "query", "result", "stored_at"]
             )
             return [obj.properties for obj in response.objects]
-        except Exception as e:
-            logger.error(f"Research search failed: {e}")
-            return []
+
+        return await self._run_with_reconnect(
+            "search_research",
+            _op,
+            on_failure=None,
+        )
 
     # -------------------------------------------------------------------------
     # Personal facts memory
     # -------------------------------------------------------------------------
 
-    async def store_personal_fact(self, topic: str, fact: str) -> bool:
+    async def store_personal_fact(self, topic: str, fact: str) -> Optional[bool]:
         """Store a personal fact in PersonalFacts."""
-        if not self._ready:
-            return False
-        try:
+        def _op() -> bool:
             vector = self._embed(f"{topic}: {fact}")
             if vector is None:
                 return False
@@ -265,15 +328,16 @@ class VectorMemory:
             )
             logger.info(f"Stored personal fact [{topic}]: {fact[:80]}")
             return True
-        except Exception as e:
-            logger.error(f"Failed to store personal fact: {e}")
-            return False
 
-    async def search_personal_facts(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+        return await self._run_with_reconnect(
+            "store_personal_fact",
+            _op,
+            on_failure=None,
+        )
+
+    async def search_personal_facts(self, query: str, limit: int = 10) -> Optional[List[Dict[str, Any]]]:
         """Semantic search over PersonalFacts."""
-        if not self._ready:
-            return []
-        try:
+        def _op() -> List[Dict[str, Any]]:
             vector = self._embed(query)
             if vector is None:
                 return []
@@ -284,48 +348,35 @@ class VectorMemory:
                 return_properties=["topic", "fact", "stored_at"]
             )
             return [obj.properties for obj in response.objects]
-        except Exception as e:
-            logger.error(f"Personal facts search failed: {e}")
-            return []
 
-    async def get_all_personal_facts(self) -> List[Dict[str, Any]]:
-        """Return all stored personal facts."""
-        if not await self.ensure_ready():
-            return []
-        try:
+        return await self._run_with_reconnect(
+            "search_personal_facts",
+            _op,
+            on_failure=None,
+        )
+
+    async def get_all_personal_facts(self) -> Optional[List[Dict[str, Any]]]:
+        """Return all stored personal facts, or None when backend access fails."""
+        def _op() -> List[Dict[str, Any]]:
             collection = self.client.collections.get("PersonalFacts")
             response = collection.query.fetch_objects(
                 limit=200,
                 return_properties=["topic", "fact", "stored_at"]
             )
             return [obj.properties for obj in response.objects]
-        except Exception as e:
-            logger.warning(f"Failed to fetch personal facts, reconnecting once: {e}")
-            self._ready = False
-            self.client = None
-            if not await self.ensure_ready():
-                return []
 
-            try:
-                collection = self.client.collections.get("PersonalFacts")
-                response = collection.query.fetch_objects(
-                    limit=200,
-                    return_properties=["topic", "fact", "stored_at"]
-                )
-                return [obj.properties for obj in response.objects]
-            except Exception as retry_err:
-                logger.error(f"Failed to fetch personal facts after reconnect: {retry_err}")
-                return []
+        return await self._run_with_reconnect(
+            "get_all_personal_facts",
+            _op,
+            on_failure=None,
+        )
 
-    async def delete_personal_facts(self, keyword: str) -> int:
+    async def delete_personal_facts(self, keyword: str) -> Optional[int]:
         """
         Delete personal facts whose topic or fact text contains the keyword.
         Returns the number of entries deleted.
         """
-        if not self._ready:
-            return 0
-        try:
-            import weaviate.classes.query as wq
+        def _op() -> int:
             collection = self.client.collections.get("PersonalFacts")
             # Fetch all, filter client-side by keyword
             response = collection.query.fetch_objects(
@@ -342,18 +393,19 @@ class VectorMemory:
                 collection.data.delete_by_id(uuid)
             logger.info(f"Deleted {len(to_delete)} personal fact(s) matching '{keyword}'")
             return len(to_delete)
-        except Exception as e:
-            logger.error(f"Failed to delete personal facts: {e}")
-            return 0
 
-    async def delete_research(self, keyword: str) -> int:
+        return await self._run_with_reconnect(
+            "delete_personal_facts",
+            _op,
+            on_failure=None,
+        )
+
+    async def delete_research(self, keyword: str) -> Optional[int]:
         """
         Delete research entries whose query or result contains the keyword.
         Returns the number of entries deleted.
         """
-        if not self._ready:
-            return 0
-        try:
+        def _op() -> int:
             collection = self.client.collections.get("ResearchMemory")
             response = collection.query.fetch_objects(
                 limit=500,
@@ -369,15 +421,16 @@ class VectorMemory:
                 collection.data.delete_by_id(uuid)
             logger.info(f"Deleted {len(to_delete)} research entry/entries matching '{keyword}'")
             return len(to_delete)
-        except Exception as e:
-            logger.error(f"Failed to delete research: {e}")
-            return 0
 
-    async def clear_all_research(self) -> int:
+        return await self._run_with_reconnect(
+            "delete_research",
+            _op,
+            on_failure=None,
+        )
+
+    async def clear_all_research(self) -> Optional[int]:
         """Delete all research memory entries. Returns count deleted."""
-        if not self._ready:
-            return 0
-        try:
+        def _op() -> int:
             collection = self.client.collections.get("ResearchMemory")
             response = collection.query.fetch_objects(limit=5000)
             count = len(response.objects)
@@ -385,20 +438,21 @@ class VectorMemory:
                 collection.data.delete_by_id(obj.uuid)
             logger.info(f"Cleared all {count} research memory entries")
             return count
-        except Exception as e:
-            logger.error(f"Failed to clear research memory: {e}")
-            return 0
+
+        return await self._run_with_reconnect(
+            "clear_all_research",
+            _op,
+            on_failure=None,
+        )
 
 
     # -------------------------------------------------------------------------
     # Auto-learned memory (extracted by hook after each conversation turn)
     # -------------------------------------------------------------------------
 
-    async def store_auto_fact(self, topic: str, fact: str, confidence: str = "medium") -> bool:
+    async def store_auto_fact(self, topic: str, fact: str, confidence: str = "medium") -> Optional[bool]:
         """Store an auto-extracted fact. Updates existing entry if topic matches."""
-        if not self._ready:
-            return False
-        try:
+        def _op() -> bool:
             # Check if topic already exists — update instead of duplicate
             collection = self.client.collections.get("AutoLearned")
             existing = collection.query.fetch_objects(
@@ -436,30 +490,32 @@ class VectorMemory:
             )
             logger.info(f"Stored auto-fact [{topic}]: {fact[:80]}")
             return True
-        except Exception as e:
-            logger.error(f"Failed to store auto-fact: {e}")
-            return False
 
-    async def get_all_auto_facts(self) -> List[Dict[str, Any]]:
+        return await self._run_with_reconnect(
+            "store_auto_fact",
+            _op,
+            on_failure=None,
+        )
+
+    async def get_all_auto_facts(self) -> Optional[List[Dict[str, Any]]]:
         """Return all auto-learned facts."""
-        if not self._ready:
-            return []
-        try:
+        def _op() -> List[Dict[str, Any]]:
             collection = self.client.collections.get("AutoLearned")
             response = collection.query.fetch_objects(
                 limit=200,
                 return_properties=["topic", "fact", "confidence", "stored_at", "updated_at"]
             )
             return [obj.properties for obj in response.objects]
-        except Exception as e:
-            logger.error(f"Failed to fetch auto-facts: {e}")
-            return []
 
-    async def search_auto_facts(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+        return await self._run_with_reconnect(
+            "get_all_auto_facts",
+            _op,
+            on_failure=None,
+        )
+
+    async def search_auto_facts(self, query: str, limit: int = 10) -> Optional[List[Dict[str, Any]]]:
         """Semantic search over AutoLearned collection."""
-        if not self._ready:
-            return []
-        try:
+        def _op() -> List[Dict[str, Any]]:
             vector = self._embed(query)
             if vector is None:
                 return []
@@ -470,15 +526,16 @@ class VectorMemory:
                 return_properties=["topic", "fact", "confidence", "stored_at"]
             )
             return [obj.properties for obj in response.objects]
-        except Exception as e:
-            logger.error(f"Auto-facts search failed: {e}")
-            return []
 
-    async def delete_auto_facts(self, keyword: str) -> int:
+        return await self._run_with_reconnect(
+            "search_auto_facts",
+            _op,
+            on_failure=None,
+        )
+
+    async def delete_auto_facts(self, keyword: str) -> Optional[int]:
         """Delete auto-learned facts matching keyword."""
-        if not self._ready:
-            return 0
-        try:
+        def _op() -> int:
             collection = self.client.collections.get("AutoLearned")
             response = collection.query.fetch_objects(
                 limit=500,
@@ -493,15 +550,16 @@ class VectorMemory:
             for uuid in to_delete:
                 collection.data.delete_by_id(uuid)
             return len(to_delete)
-        except Exception as e:
-            logger.error(f"Failed to delete auto-facts: {e}")
-            return 0
 
-    async def clear_auto_facts(self) -> int:
+        return await self._run_with_reconnect(
+            "delete_auto_facts",
+            _op,
+            on_failure=None,
+        )
+
+    async def clear_auto_facts(self) -> Optional[int]:
         """Clear all auto-learned facts."""
-        if not self._ready:
-            return 0
-        try:
+        def _op() -> int:
             collection = self.client.collections.get("AutoLearned")
             response = collection.query.fetch_objects(limit=5000)
             count = len(response.objects)
@@ -509,9 +567,12 @@ class VectorMemory:
                 collection.data.delete_by_id(obj.uuid)
             logger.info(f"Cleared {count} auto-learned facts")
             return count
-        except Exception as e:
-            logger.error(f"Failed to clear auto-facts: {e}")
-            return 0
+
+        return await self._run_with_reconnect(
+            "clear_auto_facts",
+            _op,
+            on_failure=None,
+        )
 
     # -------------------------------------------------------------------------
     # Context builder
@@ -526,17 +587,17 @@ class VectorMemory:
         """
         sections = []
 
-        facts = await self.search_personal_facts(user_query, limit=10)
+        facts = await self.search_personal_facts(user_query, limit=10) or []
         if facts:
             lines = [f"  - [{f['topic']}] {f['fact']}" for f in facts]
             sections.append("📋 What I know about you:\n" + "\n".join(lines))
 
-        auto_facts = await self.search_auto_facts(user_query, limit=8)
+        auto_facts = await self.search_auto_facts(user_query, limit=8) or []
         if auto_facts:
             lines = [f"  - [{f['topic']}] {f['fact']}" for f in auto_facts]
             sections.append("🧠 What I've learned about you:\n" + "\n".join(lines))
 
-        research = await self.search_research(user_query, limit=3)
+        research = await self.search_research(user_query, limit=3) or []
         if research:
             lines = []
             for r in research:
