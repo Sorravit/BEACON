@@ -316,3 +316,4 @@ class MCPManager:
         for client in self.clients.values():
             await client.stop()
         self.clients.clear()
+

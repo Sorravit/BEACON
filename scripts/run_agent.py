@@ -11,7 +11,7 @@ from pathlib import Path
 # Add parent directory to path so we can import from root
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from agent_api import run_agent_task
+from api.agent_api import run_agent_task
 
 
 async def main():

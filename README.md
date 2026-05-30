@@ -46,6 +46,9 @@ python main.py
 # 4b. Run (Web UI mode)
 python web_app.py
 # Then open http://localhost:8000
+
+# 5. Run tests
+python -m pytest -q
 ```
 
 ---
@@ -184,17 +187,28 @@ python scripts/background_task.py --status
 ```
 main.py              — BEACON main entry point (CLI + AIAgent + ToolManager)
 web_app.py           — FastAPI web server + SSE streaming + session management
-agent_api.py         — Programmatic API wrapper
-agent_executor.py    — Autonomous task execution engine
+api/
+  agent_api.py       — Programmatic API wrapper
+  agent_executor.py  — Autonomous task execution engine
 core/
   vector_memory.py   — Weaviate-backed semantic memory
   mcp_client.py      — MCP protocol client
   agent_memory.py    — Simple key-value memory
+utils/
+  encoding.py        — Shared UTF-8 safe encoding helper
 docker-compose.yml   — Weaviate vector DB
 scripts/
   background_task.py — Background task runner (delegate_background_task backend)
   run_agent.py       — Standalone agent runner
   run_interactive_task.py — Interactive task runner
+tools/
+  manager.py         — Tool registry/composition entrypoint
+  base/              — Time/search/command/background task tools
+  browser/           — Browser automation tools
+  file/              — File read/write/list tools
+  web/               — HTTP tools
+  mcp/               — MCP server management tools
+  memory/            — Vector-memory management tools
 static/
   index.html         — Web UI shell
   app.js             — Frontend logic
@@ -204,6 +218,7 @@ logs/                — Agent + background task logs
 examples/
   example_agent_usage.py  — Programmatic usage examples
 docs/                — Documentation
+tests/               — Regression tests for core utilities
 ```
 
 ---

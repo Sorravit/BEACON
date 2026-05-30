@@ -21,22 +21,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 
+from utils.encoding import safe_encode_string
+
 logger = logging.getLogger(__name__)
-
-
-def safe_encode_string(text: str, errors: str = "replace") -> str:
-    """Safely encode string to handle UTF-8 surrogate characters."""
-    if not text:
-        return text
-    try:
-        return text.encode("utf-8", errors=errors).decode("utf-8")
-    except Exception as e:
-        logger.warning(f"Failed to encode string safely: {e}")
-        try:
-            return str(text).encode("utf-8", errors="ignore").decode("utf-8")
-        except Exception:
-            return "[Invalid UTF-8 content]"
-
 
 class TaskStatus(Enum):
     PENDING = "pending"
@@ -515,3 +502,6 @@ class AgentExecutor:
              "created_at": t.created_at.isoformat()}
             for t in self.tasks.values()
         ]
+
+
+

@@ -4,7 +4,7 @@ Example Agent Usage - Demonstrates how to use the agent programmatically
 """
 
 import asyncio
-from agent_api import AgentBuilder, run_agent_task, run_agent_workflow
+from api.agent_api import AgentBuilder, run_agent_task, run_agent_workflow
 
 
 async def example_simple_task():

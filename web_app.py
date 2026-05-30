@@ -1019,7 +1019,7 @@ async def _tail_log(name: str, log_file: str, request: Request) -> AsyncGenerato
 
 
 # AgentExecutor task routes
-from agent_executor import AgentExecutor, Task, TaskStatus
+from api.agent_executor import AgentExecutor, Task, TaskStatus
 _agent_tasks = {}
 
 class AgentTaskRequest(BaseModel):
