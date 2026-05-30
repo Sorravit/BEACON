@@ -301,11 +301,11 @@ class AIAgent:
             return False
     
     async def _load_mcp_servers(self):
-        """Load MCP servers from mcp_config.json"""
+        """Load MCP servers from config file"""
         try:
-            config_file = Path("mcp_config.json")
+            config_file = Path(MCP_CONFIG_FILE)
             if not config_file.exists():
-                logger.info("No mcp_config.json found, skipping MCP servers")
+                logger.info(f"No {MCP_CONFIG_FILE} found, skipping MCP servers")
                 return
             
             with open(config_file) as f:
@@ -943,24 +943,58 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
         if self.vector_memory:
             self.vector_memory.close()
 
-    async def run(self, mode: str = "chat"):
+    async def run(self, mode: str = "chat", task: Optional[str] = None):
         """
         Run the agent in specified mode.
         
         Args:
-            mode: "chat" for interactive chat, "agent" for programmatic agent mode
+            mode: "chat" for interactive chat, "agent" for programmatic/task mode
+            task: Optional task to run immediately in agent mode
         """
         if mode == "agent":
-            # Agent mode - programmatic interface
+            # Agent mode - programmatic/task interface
             from api.agent_api import AgentAPI
             api = AgentAPI(self)
+            
+            if task:
+                from datetime import datetime
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+                print(f"\n{timestamp} - 🚀 Running task: {task}")
+                print("="*60)
+                result = await api.run_task(task)
+                
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+                print("\n" + "="*60)
+                print(f"{timestamp} - 🏁 TASK COMPLETED")
+                print("="*60)
+                print(f"Status: {result.get('status', 'unknown')}")
+                print(f"Success: {result.get('success', False)}")
+                
+                if result.get('result'):
+                    print("\nRESULT:")
+                    print("-" * 20)
+                    print(result['result'])
+                    print("-" * 20)
+                elif result.get('error'):
+                    print(f"\nERROR: {result['error']}")
+                
+                if result.get('duration_seconds'):
+                    print(f"\nDuration: {result['duration_seconds']:.2f}s")
+                print("="*60 + "\n")
+                
+                await self.shutdown()
+                return result
+
             print("="*60)
             print("🤖 AGENT MODE - Programmatic Interface")
             print("="*60)
             print("Agent is ready for programmatic task execution.")
             print("Use the AgentAPI to run tasks programmatically.")
             print("See example_agent_usage.py for examples.")
-            print("-"*60)
+            print("-" * 60)
+            print("\nTo run a task directly from CLI:")
+            print(f"  python {sys.argv[0]} --mode agent \"your task here\"")
+            print("-" * 60)
             return api
         
         # Chat mode - interactive conversation
@@ -990,12 +1024,14 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
 
         while True:
             try:
+                from datetime import datetime
+                prompt_label = f"\n👤 You [{datetime.now().strftime('%H:%M:%S')}]: "
                 if session:
                     user_input = await asyncio.get_event_loop().run_in_executor(
-                        None, lambda: session.prompt("\n👤 You: ")
+                        None, lambda: session.prompt(prompt_label)
                     )
                 else:
-                    user_input = input("\n👤 You: ")
+                    user_input = input(prompt_label)
                 user_input = user_input.strip()
                 if not user_input:
                     continue
@@ -1035,7 +1071,8 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                 print("\n🔄 Agent working...")
                 response = await self.get_response(user_input)
                 if response:
-                    print(f"\n✅ {response}")
+                    timestamp = datetime.now().strftime("%H:%M:%S")
+                    print(f"\n✅ [{timestamp}] {response}")
                 else:
                     print("❌ Failed to get response")
                     
@@ -1050,6 +1087,14 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
 
 
 async def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Autonomous AI Agent")
+    parser.add_argument("--mode", choices=["chat", "agent"], default="chat", help="Execution mode")
+    parser.add_argument("task", nargs="*", help="Task to run (only for agent mode)")
+    
+    args = parser.parse_args()
+    task_str = " ".join(args.task) if args.task else None
+
     try:
         config = Config()
         if not config.validate():
@@ -1061,7 +1106,7 @@ async def main():
             print("❌ Failed to initialize")
             return 1
         
-        await agent.run()
+        await agent.run(mode=args.mode, task=task_str)
         return 0
     except Exception as e:
         logger.error(f"Fatal: {e}")

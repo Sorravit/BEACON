@@ -14,6 +14,11 @@ class FileToolsMixin:
     async def _write_file(self, file_path: str, content: str):
         try:
             path = Path(file_path)
+            # If no directory is specified, default to 'output/'
+            if not path.parent or str(path.parent) == ".":
+                path = Path("output") / path.name
+                file_path = str(path)
+            
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(file_path, "w", encoding="utf-8") as handle:
                 handle.write(content)

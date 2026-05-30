@@ -71,3 +71,6 @@ output/
 # Temporary and session data
 temp/
 sessions/
+
+# MCP configuration
+mcp_config.json

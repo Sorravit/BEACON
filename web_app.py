@@ -657,7 +657,7 @@ async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent, model:
     resolved_model = agent.config.resolve_model(model, role="chat")
     _model_info = agent.config.models.get(resolved_model)
     model_label = _model_info.label if _model_info else resolved_model
-    _emit({"type": "model", "content": resolved_model, "label": model_label})
+    _emit({"type": "model", "content": resolved_model, "label": model_label, "ts": datetime.now().isoformat()})
 
     try:
         from main import ToolManager
@@ -1096,14 +1096,16 @@ def _make_task_callback(task_id, session_id=None):
     state = _agent_tasks[task_id]
 
     def _cb(event, data):
-        state["event_buf"].append({"type": event, **data})
+        now = datetime.now().isoformat()
+        # Ensure every event has a timestamp for real-time UI rendering
+        event_data = {"type": event, "ts": now, **data}
+        state["event_buf"].append(event_data)
         if event in ("task_completed", "task_failed", "task_cancelled"):
             state["done"] = True
 
         if not (session_id and session_id in _sessions):
             return
         s = _sessions[session_id]
-        now = datetime.now().isoformat()
 
         if event == "task_completed":
             result = _safe_task_text(data.get("result", ""))

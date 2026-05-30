@@ -816,6 +816,10 @@ async function sendMessage(){
           if(ev.name==='delegate_background_task')setTimeout(()=>{openTasksPanel();refreshTasksList();},800);
         }else if(ev.type==='model'){
           answerModelLabel=ev.label||ev.content||'';addModelBadge(ab,answerModelLabel);
+          if(ev.ts){
+            const tsEl=document.createElement('div');tsEl.className='msg-ts';tsEl.textContent=fmtTs(ev.ts);
+            ab.parentNode.appendChild(tsEl);
+          }
         }else if(ev.type==='result'){
           (ev.content||'').split('\n').forEach(l=>{if(l.trim())atl('   '+l,'tool-result');});
           setStatus('thinking','Processing\u2026');
@@ -1460,8 +1464,8 @@ document.addEventListener('click', e => {
     if (!description) return;
 
     const sessionId = getSessionId();
-    appendTaskMessage('user', description);
-    const progressEl = appendTaskProgress(description);
+    appendTaskMessage('user', description, new Date().toISOString());
+    const progressEl = appendTaskProgress(description, new Date().toISOString());
 
     try {
       const resp = await fetch('/agent/task', {
@@ -1495,8 +1499,8 @@ document.addEventListener('click', e => {
     if (!description) return;
 
     const sessionId = getSessionId();
-    appendTaskMessage('user', '\ud83e\udde0 ' + description);
-    const progressEl = appendTaskProgress(description);
+    appendTaskMessage('user', '\ud83e\udde0 ' + description, new Date().toISOString());
+    const progressEl = appendTaskProgress(description, new Date().toISOString());
 
     try {
       const resp = await fetch('/agent/orchestrate', {
@@ -1660,6 +1664,9 @@ document.addEventListener('click', e => {
 
             case 'task_completed':
               updateProgress(progressEl, '\u2705 Task completed', 'completed');
+              if (ev.result) {
+                appendTaskMessage('assistant', ev.result, ev.ts || new Date().toISOString());
+              }
               taskEventSource = null;
               activeTaskId = null;
               // Mark done in the map and clean up localStorage
@@ -1711,7 +1718,7 @@ document.addEventListener('click', e => {
     );
   }
 
-  function appendTaskMessage(role, content) {
+  function appendTaskMessage(role, content, ts) {
     const container = getMessagesContainer();
     if (!container) return;
 
@@ -1728,12 +1735,25 @@ document.addEventListener('click', e => {
       'word-break: break-word',
     ].join(';');
     el.textContent = content;
-    container.appendChild(el);
+
+    const wrap = document.createElement('div');
+    wrap.style.cssText = 'display:flex;flex-direction:column;';
+    wrap.appendChild(el);
+
+    if (ts) {
+      const tsEl = document.createElement('div');
+      tsEl.className = 'msg-ts';
+      tsEl.style.cssText = 'font-size:10px;color:#666;margin:2px 4px 8px;' + (role==='user'?'text-align:right':'');
+      tsEl.textContent = fmtTs(ts);
+      wrap.appendChild(tsEl);
+    }
+
+    container.appendChild(wrap);
     container.scrollTop = container.scrollHeight;
     return el;
   }
 
-  function appendTaskProgress(description) {
+  function appendTaskProgress(description, ts) {
     const container = getMessagesContainer();
     if (!container) return document.createElement('div');
 
@@ -1749,12 +1769,17 @@ document.addEventListener('click', e => {
       'padding: 12px 16px',
     ].join(';');
 
+    const displayTs = ts ? fmtTs(ts) : fmtTs(new Date().toISOString());
+
     wrapper.innerHTML =
-      '<div style="color:#aaa;margin-bottom:6px;font-weight:600">' +
-        '\u26a1 Task Mode ' +
-        '<span style="font-size:11px;font-weight:400;color:#666;margin-left:8px">' +
-          description.slice(0, 60) + (description.length > 60 ? '\u2026' : '') +
-        '</span>' +
+      '<div style="color:#aaa;margin-bottom:6px;font-weight:600;display:flex;justify-content:space-between;align-items:center">' +
+        '<div>' +
+          '\u26a1 Task Mode ' +
+          '<span style="font-size:11px;font-weight:400;color:#666;margin-left:8px">' +
+            description.slice(0, 60) + (description.length > 60 ? '\u2026' : '') +
+          '</span>' +
+        '</div>' +
+        '<div style="font-size:10px;color:#555;font-weight:400">' + displayTs + '</div>' +
       '</div>' +
       '<div class="task-status" style="color:#cdd6f4">\u23f3 Submitting\u2026</div>' +
       '<div class="task-phase-log" style="margin-top:8px;max-height:300px;overflow-y:auto;' +

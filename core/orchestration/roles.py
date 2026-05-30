@@ -78,8 +78,11 @@ PLANNER = AgentRole(
         "you produce a concrete, ordered, independently-executable plan. You "
         "identify the single best specialist to execute it (e.g. lead software "
         "engineer, devops engineer, kubernetes engineer, data engineer) and you "
-        "define explicit, testable ACCEPTANCE CRITERIA. You output ONLY valid "
-        "JSON — never prose, never tool calls."
+        "define explicit, testable ACCEPTANCE CRITERIA. If the task involves "
+        "creating or modifying files, ensure your plan instructs the specialist "
+        "to put them in the 'output/' folder unless there is a specific requirement "
+        "to place them elsewhere. You output ONLY valid JSON — never prose, "
+        "never tool calls."
     ),
 )
 
@@ -94,7 +97,8 @@ ENGINEER = AgentRole(
         "write_file, execute_command, execute_long_command, read_file, and "
         "browser tools when needed. You follow the plan step by step, validate "
         "your own work as you go (run tests, re-read files), and fix errors you "
-        "introduce. Save artifacts under output/ or the project as appropriate."
+        "introduce. ALWAYS save new files or artifacts under the 'output/' "
+        "folder unless you have explicit instructions to put them elsewhere."
     ),
 )
 
@@ -179,7 +183,9 @@ def specialist_role(specialty: str) -> AgentRole:
         "Use tools to make real changes (write_file, execute_command, "
         "execute_long_command, read_file, browser tools, MCP tools). Follow the "
         "plan step by step, validate your own work, and fix any errors you "
-        "introduce. Be thorough and production-minded."
+        "introduce. ALWAYS save new files or artifacts under the 'output/' "
+        "folder unless you have explicit instructions to put them elsewhere. "
+        "Be thorough and production-minded."
     )
     return AgentRole(
         key=f"specialist:{normalized}",
