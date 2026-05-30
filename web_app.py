@@ -321,6 +321,7 @@ def _rotate_bg_logs():
 class ChatRequest(BaseModel):
     message: str
     session_id: str
+    model: Optional[str] = None
 
 
 class RenameRequest(BaseModel):
@@ -513,7 +514,7 @@ async def chat_stream(req: ChatRequest):
     bg["event_buf"] = []
     bg["done_event"] = asyncio.Event()
     bg["activity"] = ""
-    bg["task"] = asyncio.create_task(_run_agent_bg(req.message, sid, agent))
+    bg["task"] = asyncio.create_task(_run_agent_bg(req.message, sid, agent, model=req.model))
 
     return StreamingResponse(
         _reconnect_stream(sid),
@@ -576,6 +577,36 @@ async def health():
     return {"status": "ok", "sessions": len(_sessions)}
 
 
+# ── Model registry endpoints ──────────────────────────────────────────────────
+@app.get("/models")
+async def list_models():
+    """Return the curated list of selectable models + role defaults.
+
+    Drives the chat model picker and the per-agent selectors in Task Mode.
+    """
+    if _config is None:
+        raise HTTPException(status_code=503, detail="Config not initialised")
+    registry = _config.models
+    return {
+        "models": registry.to_public_list(),
+        "default": registry.default_model,
+        "current": _config.model,
+        "roles": registry.role_defaults(),
+    }
+
+
+@app.post("/models/reload")
+async def reload_models():
+    """Hot-reload models.yaml without restarting the server."""
+    if _config is None:
+        raise HTTPException(status_code=503, detail="Config not initialised")
+    from core.models import ModelRegistry
+
+    _config.models = ModelRegistry.load(env_default=_config.model)
+    logger.info("Model registry reloaded: %d models", len(_config.models.ids()))
+    return {"status": "reloaded", "count": len(_config.models.ids())}
+
+
 # ── Background agent task ─────────────────────────────────────────────────────
 def _build_conversation(agent: AIAgent, session_id: str) -> list:
     """Build a fresh conversation list for this session (stateless per-request)."""
@@ -595,7 +626,7 @@ def _build_conversation(agent: AIAgent, session_id: str) -> list:
     return conv
 
 
-async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent):
+async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent, model: Optional[str] = None):
     """
     Run the agent completely decoupled from any HTTP connection.
     Each call gets its own ToolManager and conversation list.
@@ -621,12 +652,20 @@ async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent):
 
     conversation = _build_conversation(agent, session_id)
 
+    # Resolve the model that will actually answer so the UI can show it and we
+    # can persist it with the message.
+    resolved_model = agent.config.resolve_model(model, role="chat")
+    _model_info = agent.config.models.get(resolved_model)
+    model_label = _model_info.label if _model_info else resolved_model
+    _emit({"type": "model", "content": resolved_model, "label": model_label})
+
     try:
         from main import ToolManager
         per_request_tools = ToolManager(
             vector_memory=agent.vector_memory,
             mcp_manager=agent.mcp_manager,
             shared_browser=await agent._get_shared_browser(),  # lazy init — one Chromium process shared
+            skill_manager=agent.skill_manager,
         )
         await per_request_tools.initialize()
         per_request_tools.session_id = session_id
@@ -653,7 +692,7 @@ async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent):
         try:
             def _token_cb(token: str):
                 _emit({"type": "token", "content": token})
-            response = await agent.get_response(user_input, conversation=conversation, tools=per_request_tools, token_callback=_token_cb)
+            response = await agent.get_response(user_input, conversation=conversation, tools=per_request_tools, token_callback=_token_cb, model=model)
         except Exception as api_err:
             err_msg = str(api_err)
             # Emit user-friendly error to the SSE stream
@@ -671,7 +710,8 @@ async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent):
 
         if s is not None:
             now = datetime.now().isoformat()
-            s["messages"].append({"role": "assistant", "content": content, "ts": now})
+            s["messages"].append({"role": "assistant", "content": content, "ts": now,
+                                   "model": resolved_model, "model_label": model_label})
             s["updated_at"] = now
             _save_session(session_id)
 
@@ -1020,40 +1060,53 @@ async def _tail_log(name: str, log_file: str, request: Request) -> AsyncGenerato
 
 # AgentExecutor task routes
 from api.agent_executor import AgentExecutor, Task, TaskStatus
+from core.orchestration import Orchestrator
 _agent_tasks = {}
 
 class AgentTaskRequest(BaseModel):
     description: str
     session_id: str = None
 
-def _make_agent_executor(task_id, session_id=None):
-    state = _agent_tasks[task_id]
 
-    def _safe_text(text):
-        """Remove UTF-8 surrogates so session JSON serialises cleanly."""
-        if not text:
-            return ""
-        try:
-            return str(text).encode("utf-8", errors="replace").decode("utf-8")
-        except Exception:
-            return ""
+class OrchestrateRequest(BaseModel):
+    description: str
+    session_id: Optional[str] = None
+    max_rounds: int = 2
+    # Optional per-role model overrides, e.g. {"researcher": "global/o3-mini"}.
+    # The special key "all" overrides every role.
+    model_overrides: Optional[Dict[str, str]] = None
+
+
+def _safe_task_text(text):
+    """Remove UTF-8 surrogates so session JSON serialises cleanly."""
+    if not text:
+        return ""
+    try:
+        return str(text).encode("utf-8", errors="replace").decode("utf-8")
+    except Exception:
+        return ""
+
+
+def _make_task_callback(task_id, session_id=None):
+    """Build the SSE/event callback shared by AgentExecutor and the Orchestrator.
+
+    Buffers every phase event for streaming and persists only the final result
+    (or failure) to the session's chat history.
+    """
+    state = _agent_tasks[task_id]
 
     def _cb(event, data):
         state["event_buf"].append({"type": event, **data})
         if event in ("task_completed", "task_failed", "task_cancelled"):
             state["done"] = True
 
-        # Only save the final task result to permanent chat history.
-        # Intermediate phase details (research, plan, steps, verification)
-        # are shown live in the progress card's scrollable log — not saved as
-        # separate chat messages to avoid cluttering the conversation.
         if not (session_id and session_id in _sessions):
             return
         s = _sessions[session_id]
         now = datetime.now().isoformat()
 
         if event == "task_completed":
-            result = _safe_text(data.get("result", ""))
+            result = _safe_task_text(data.get("result", ""))
             if result:
                 s["messages"].append({
                     "role": "assistant",
@@ -1063,7 +1116,7 @@ def _make_agent_executor(task_id, session_id=None):
                 s["updated_at"] = now
                 _save_session(session_id)
         elif event in ("task_failed", "task_cancelled"):
-            error = _safe_text(data.get("error", "unknown error"))
+            error = _safe_task_text(data.get("error", "unknown error"))
             s["messages"].append({
                 "role": "assistant",
                 "content": "❌ **Task Failed**\n\n" + error,
@@ -1072,16 +1125,28 @@ def _make_agent_executor(task_id, session_id=None):
             s["updated_at"] = now
             _save_session(session_id)
 
+    return _cb
+
+
+def _make_agent_executor(task_id, session_id=None):
+    cb = _make_task_callback(task_id, session_id)
     # Build session conversation context so Task Mode planning/execution is
     # aware of everything discussed in regular chat before activation.
     session_conv = None
     if session_id:
         session_conv = _build_conversation(_shared_agent, session_id)
 
-    return AgentExecutor(_shared_agent, step_callback=_cb, session_conversation=session_conv)
+    return AgentExecutor(_shared_agent, step_callback=cb, session_conversation=session_conv)
 
 @app.post("/agent/task")
 async def agent_submit_task(req: AgentTaskRequest):
+    """DEPRECATED single-agent Task Mode (research→plan→act→verify with one model).
+
+    Superseded by POST /agent/orchestrate, which runs the same pipeline as a
+    multi-agent team with per-agent model selection, dynamic specialist spawning
+    and spec-aware verification. Kept for backward compatibility / task recovery;
+    the web UI no longer calls this endpoint.
+    """
     if _shared_agent is None: raise HTTPException(status_code=503, detail="Agent not initialised")
     task_id = "agt_" + uuid.uuid4().hex[:12]
     session_id = req.session_id or None
@@ -1191,6 +1256,82 @@ async def agent_cancel_task(task_id: str):
         at.cancel(); _agent_tasks[task_id]["done"] = True
         return {"status": "cancelled", "task_id": task_id}
     return {"status": "already_done", "task_id": task_id}
+
+
+# ── Multi-agent orchestration ─────────────────────────────────────────────────
+def _save_task_command(session_id: str, description: str, prefix: str):
+    """Persist the submitted task as a user message so it always shows in chat."""
+    if not (session_id and session_id in _sessions):
+        return
+    s = _sessions[session_id]
+    now = datetime.now().isoformat()
+    content = f"{prefix} {description}"
+    already = any(
+        m.get("role") == "user" and m.get("content") == content
+        for m in s["messages"][-3:] if s["messages"]
+    )
+    if not already:
+        s["messages"].append({"role": "user", "content": content, "ts": now})
+        if not s.get("manually_named") and len([m for m in s["messages"] if m["role"] == "user"]) == 1:
+            s["title"] = _auto_title(description)
+        s["updated_at"] = now
+        _save_session(session_id)
+
+
+@app.post("/agent/orchestrate")
+async def agent_orchestrate(req: OrchestrateRequest):
+    """Run a goal through the multi-agent orchestrator (research → plan →
+    specialist → verify, looping on failure). Streams the same event types as
+    Task Mode via /agent/task/{id}/stream."""
+    if _shared_agent is None:
+        raise HTTPException(status_code=503, detail="Agent not initialised")
+    task_id = "orch_" + uuid.uuid4().hex[:12]
+    session_id = req.session_id or None
+    _agent_tasks[task_id] = {"event_buf": [], "done": False, "asyncio_task": None,
+                              "description": req.description}
+    _save_task_command(session_id, req.description, "[Orchestrate]")
+
+    cb = _make_task_callback(task_id, session_id)
+    session_conv = _build_conversation(_shared_agent, session_id) if session_id else None
+
+    async def _run():
+        tools = None
+        try:
+            from main import ToolManager
+            tools = ToolManager(
+                vector_memory=_shared_agent.vector_memory,
+                mcp_manager=_shared_agent.mcp_manager,
+                shared_browser=await _shared_agent._get_shared_browser(),
+                skill_manager=_shared_agent.skill_manager,
+            )
+            await tools.initialize()
+            orchestrator = Orchestrator(
+                _shared_agent,
+                tools=tools,
+                max_rounds=max(1, min(req.max_rounds, 5)),
+                model_overrides=req.model_overrides,
+                emit=cb,
+                session_conversation=session_conv,
+            )
+            await orchestrator.run(req.description, task_id=task_id)
+        except Exception as exc:
+            _agent_tasks[task_id]["event_buf"].append(
+                {"type": "task_failed", "task_id": task_id, "error": str(exc)})
+            _agent_tasks[task_id]["done"] = True
+        finally:
+            if tools:
+                try:
+                    await tools.cleanup()
+                except Exception:
+                    pass
+            buf = _agent_tasks[task_id]["event_buf"]
+            if not buf or buf[-1].get("type") != "stream_done":
+                buf.append({"type": "stream_done", "task_id": task_id})
+            _agent_tasks[task_id]["done"] = True
+
+    _agent_tasks[task_id]["asyncio_task"] = asyncio.create_task(_run())
+    return {"task_id": task_id, "status": "started"}
+
 
 if __name__ == "__main__":
     uvicorn.run(

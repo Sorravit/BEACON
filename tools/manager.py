@@ -12,6 +12,7 @@ from tools.browser.browser_tools import BrowserToolsMixin
 from tools.file.file_tools import FileToolsMixin
 from tools.mcp.mcp_tools import MCPToolsMixin
 from tools.memory.memory_tools import MemoryToolsMixin
+from tools.skill.skill_tools import SkillToolsMixin
 from tools.web.http_tools import HttpToolsMixin
 
 logger = logging.getLogger(__name__)
@@ -26,10 +27,11 @@ class ToolManager(
     TaskToolsMixin,
     MCPToolsMixin,
     MemoryToolsMixin,
+    SkillToolsMixin,
 ):
     """Manages all agent tools, split by domain modules."""
 
-    def __init__(self, vector_memory=None, mcp_manager=None, shared_browser=None):
+    def __init__(self, vector_memory=None, mcp_manager=None, shared_browser=None, skill_manager=None):
         self.tools: List[Dict[str, Any]] = []
         self.tool_handlers: Dict[str, Callable] = {}
         self._shared_browser = shared_browser
@@ -39,6 +41,7 @@ class ToolManager(
         self.playwright = None
         self.vector_memory = vector_memory
         self.mcp_manager = mcp_manager
+        self.skill_manager = skill_manager
         self.session_id = None
 
     async def initialize(self):
@@ -78,6 +81,8 @@ class ToolManager(
             ("memory_delete_fact", "Deletes personal facts from memory that match a keyword. Use this when the user asks to forget or remove something about themselves.", {"keyword": "string"}, self._memory_delete_fact),
             ("memory_delete_research", "Deletes research memory entries that match a keyword. Use this when the user asks to forget research about a topic.", {"keyword": "string"}, self._memory_delete_research),
             ("memory_clear_research", "Clears ALL research memory entries. Use only when user explicitly asks to clear all research memory.", {}, self._memory_clear_research),
+            ("list_skills", "Lists all installed Agent Skills (specialised playbooks) with their names and descriptions. Use when deciding whether a skill applies to the user's request.", {}, self._list_skills),
+            ("load_skill", "Loads the full instruction body of an installed skill by name. Call this BEFORE acting on a task that matches a skill, then follow the returned instructions.", {"name": "string"}, self._load_skill),
         ]
 
         for name, desc, params, handler in tools_config:

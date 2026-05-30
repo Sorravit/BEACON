@@ -11,12 +11,10 @@ import json
 import logging
 import logging.handlers
 import os
-import subprocess
 import sys
 import warnings
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 # Suppress noisy deprecation warnings from third-party libraries
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="authlib")
@@ -24,6 +22,8 @@ warnings.filterwarnings("ignore", message=".*authlib.jose.*")
 
 from openai import OpenAI
 from core.mcp_client import MCPManager
+from core.models import ModelRegistry
+from core.skills import SkillManager
 from core.vector_memory import VectorMemory
 from tools.manager import ToolManager
 
@@ -116,16 +116,36 @@ class Config:
         self.temperature = float(os.getenv("AI_TEMPERATURE", str(DEFAULT_TEMPERATURE)))
         self.max_tokens = int(os.getenv("AI_MAX_TOKENS", str(DEFAULT_MAX_TOKENS)))
         self.enable_tools = os.getenv("ENABLE_TOOLS", "true").lower() == "true"
-    
+
+        # Curated registry of selectable models + per-role defaults (models.yaml).
+        # Loaded once here so chat and orchestration share a single source of truth.
+        self.models = ModelRegistry.load(env_default=self.model)
+        # Honour the registry default unless AI_MODEL was explicitly set.
+        if "AI_MODEL" not in os.environ:
+            self.model = self.models.default_model
+
+    def resolve_model(self, requested: Optional[str] = None, role: Optional[str] = None) -> str:
+        """Resolve a requested/role model id to a valid registered model.
+
+        Resolution order: an explicit valid ``requested`` id → the role default
+        from models.yaml → the global default. The global ``self.model`` is only
+        used as the request when no role is supplied, so role-scoped sub-agents
+        correctly pick up their per-role defaults instead of the chat model.
+        """
+        if requested is None and role is None:
+            requested = self.model
+        return self.models.resolve(requested, role=role)
+
     def validate(self) -> bool:
         """Validate that required configuration is present."""
         return bool(self.api_key)
-    
+
     def display(self):
         """Display current configuration."""
         print(f"Model: {self.model}")
         print(f"Endpoint: {self.base_url}")
         print(f"Tools: {self.enable_tools}")
+        print(f"Models available: {len(self.models.ids())}")
 
 
 class AIAgent:
@@ -141,6 +161,7 @@ class AIAgent:
         self.tools_available = False
         self.vector_memory: Optional[VectorMemory] = None
         self.memory_available = False
+        self.skill_manager: Optional[SkillManager] = None
         self._shared_browser = None  # shared Playwright browser process
         self._playwright = None
 
@@ -170,6 +191,12 @@ class AIAgent:
             
             # Load MCP servers from config
             await self._load_mcp_servers()
+
+            # Discover Agent Skills (SKILL.md playbooks) — progressive disclosure
+            self.skill_manager = SkillManager.load()
+            if self.skill_manager.has_skills():
+                logger.info("✅ %d skill(s) available: %s",
+                            len(self.skill_manager), ", ".join(self.skill_manager.names()))
             
             # Initialize vector memory (Weaviate) — optional, graceful if unavailable
             weaviate_port = int(os.getenv("WEAVIATE_PORT", "8090"))
@@ -185,7 +212,7 @@ class AIAgent:
                 logger.info("ℹ️  Vector memory unavailable — running without persistent memory")
 
             if self.config.enable_tools:
-                self.tools = ToolManager(vector_memory=self.vector_memory, mcp_manager=self.mcp_manager)
+                self.tools = ToolManager(vector_memory=self.vector_memory, mcp_manager=self.mcp_manager, skill_manager=self.skill_manager)
                 self.tools_available = await self.tools.initialize()
 
                 # mcp_manager already loaded above — update reference in ToolManager
@@ -260,6 +287,11 @@ class AIAgent:
                             "BE PROACTIVE. ACT FIRST. EXPLAIN AFTER."
                         )
                     }
+                    # Progressive disclosure: append the skills catalog (names +
+                    # descriptions only) so the model knows what playbooks exist
+                    # and can load the full body on demand via load_skill.
+                    if self.skill_manager and self.skill_manager.has_skills():
+                        system_message["content"] += self.skill_manager.system_prompt_block()
                     self.conversation.append(system_message)
                     
             logger.info("Agent initialized successfully")
@@ -570,7 +602,7 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
         
         return tool_calls
     
-    async def get_response(self, user_input: str, conversation: Optional[List[Dict]] = None, tools: Optional["ToolManager"] = None, token_callback=None) -> Optional[str]:
+    async def get_response(self, user_input: str, conversation: Optional[List[Dict]] = None, tools: Optional["ToolManager"] = None, token_callback=None, model: Optional[str] = None) -> Optional[str]:
         """
         Get AI response with prompt-based tool execution loop (Cline/Roo style).
         
@@ -580,12 +612,18 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                           If None, falls back to self.conversation (CLI/backward-compat mode).
             tools: Optional per-request ToolManager. If provided, used instead of self.tools so
                    concurrent requests never share or mutate the agent's tool reference.
+            model: Optional model id override for this call. Resolved against the
+                   curated registry; invalid ids fall back to the chat default.
             
         Returns:
             Optional[str]: AI response or None if error occurred
         """
         if not self.client:
             return None
+
+        # Resolve the model for this call from the curated registry (never trust
+        # a raw client value — an unknown id degrades to the chat default).
+        effective_model = self.config.resolve_model(model, role="chat")
 
         # Resolve which ToolManager to use for this call — never mutate self.tools
         effective_tools = tools if tools is not None else self.tools
@@ -647,7 +685,7 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                         conv[0] = {"role": "system", "content": _base_system_content}
 
                 params = {
-                    "model": self.config.model,
+                    "model": effective_model,
                     "messages": conv,
                     "temperature": self.config.temperature,
                     "max_tokens": self.config.max_tokens

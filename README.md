@@ -53,7 +53,118 @@ python -m pytest -q
 
 ---
 
+## 🧠 Model Selection
+
+BEACON can use any of the models declared in **`models.yaml`** — a single,
+curated, offline source of truth (no network discovery). Each model has an id,
+label and optional description/tags, and every agent *role* has a default model.
+
+- **Per-chat model** — pick a model from the header dropdown in the web UI. The
+  choice is remembered per browser.
+- **Per-agent models** — in Orchestrate mode each spawned agent (researcher,
+  planner, engineer, devops, verifier) uses its role default automatically, and
+  you can override any of them manually (right-click the 🧠 toggle → *Agent
+  Models*).
+- **Endpoints** — `GET /models` returns the catalog + role defaults;
+  `POST /models/reload` hot-reloads `models.yaml`.
+
+```yaml
+# models.yaml (excerpt)
+default: global/anthropic.claude-sonnet-4-6
+roles:
+  researcher: global/gpt-5.1-chat
+  verifier:   global/anthropic.claude-sonnet-4-5-20250929-v1:0
+models:
+  - id: global/anthropic.claude-sonnet-4-6
+    label: Claude Sonnet 4.6
+    tags: [default, reasoning, coding]
+```
+
+---
+
+## 🎓 Agent Skills (`SKILL.md`)
+
+BEACON supports **Anthropic-style Agent Skills**: drop a folder under `skills/`
+with a `SKILL.md` (YAML frontmatter + instructions) and BEACON loads it with
+**progressive disclosure** — only the name + description sit in the system
+prompt; the full playbook is pulled in on demand via the `load_skill` tool.
+
+```
+skills/
+  web-research/
+    SKILL.md          # ---\nname/description/version\n---\n# instructions
+    scripts/...       # optional bundled resources
+```
+
+See [`skills/README.md`](skills/README.md) for the full format.
+
+---
+
+## 🤖 Agent Mode — Multi-Agent Orchestration
+
+Enable the 🧠 **Agent Mode** toggle to run a goal through a coordinated team of
+specialist sub-agents, looping until the work passes verification:
+
+```
+RESEARCH → PLAN → ACT (engineer / devops / k8s / …) → VERIFY
+   ▲                                                     │
+   └──────────────── feedback on failure ────────────────┘
+```
+
+- **Fixed core roles + dynamic spawning** — researcher, planner and verifier are
+  always present; the planner picks the right ACT specialist (lead software
+  engineer, devops, kubernetes, data engineer, …) for each task.
+- **Spec-aware verification** — when the goal references a Jira issue, research
+  and verification fetch the issue, its acceptance criteria, linked tickets and
+  related Confluence pages via MCP and validate against them.
+- **Per-agent models** — each role resolves its model from `models.yaml`, with
+  optional manual overrides (right-click the 🧠 toggle → *Agent Models*).
+- **Endpoint** — `POST /agent/orchestrate` with `{description, session_id,
+  max_rounds, model_overrides}`; progress streams via `/agent/task/{id}/stream`.
+
+### What each agent passes to the next (context hand-off)
+
+The data flow between agents is explicit and visible (logged as `HANDOFF` lines
+and shown in the progress card as 🔄 entries):
+
+| From → To | What is passed |
+|---|---|
+| Research → Planner | Research findings (facts, constraints, spec) + prior chat context |
+| Planner → ACT specialist | Chosen specialist, acceptance criteria, ordered steps |
+| ACT → Verifier | The work product + acceptance criteria (and the spec/Jira refs) |
+| Verifier → Research (next round) | Failure feedback, so the team re-approaches with the reason it failed |
+
+Within ACT, each step also receives the **running context** (goal + research +
+all prior step results) so the specialist stays coherent across steps.
+
+Watch the live log to see who is doing what:
+
+```
+[orch_…] ROUND 1/2
+[orch_…] SPAWN    Research Agent          model=global/gpt-5.1-chat tools=True
+[orch_…] RESEARCH done | 1820 chars | The repo uses FastAPI…
+[orch_…] HANDOFF  Research Agent → Project Planner | research findings (1820 chars)
+[orch_…] SPAWN    Project Planner         model=global/anthropic.claude-sonnet-4-6 tools=False
+[orch_…] PLAN done | specialist=devops | 4 step(s) | 3 criteria
+[orch_…] HANDOFF  Project Planner → devops (ACT) | execution plan (…)
+[orch_…] ACT step 1/4 | Devops | Create the Dockerfile…
+…
+[orch_…] VERIFY done | passed=true | All criteria met…
+```
+
+> **Agent Mode vs the old Task Mode.** Agent Mode replaces the previous
+> single-agent Task Mode. Task Mode ran the *same* research→plan→act→verify loop
+> but as **one** agent using **one** model. Agent Mode runs it as a **team** —
+> each phase is a separate role-scoped agent with its **own selectable model**,
+> the planner spawns the right specialist dynamically, and verification can
+> validate against Jira/Confluence. The legacy `POST /agent/task` endpoint
+> remains for backward compatibility but is no longer used by the UI.
+
+
+---
+
 ## 🌐 Web Interface
+
 
 BEACON includes a full web UI served by FastAPI on port 8000.
 
@@ -185,15 +296,23 @@ python scripts/background_task.py --status
 ## 📁 Project Structure
 
 ```
-main.py              — BEACON main entry point (CLI + AIAgent + ToolManager)
+main.py              — BEACON main entry point (CLI + AIAgent + Config + model registry)
 web_app.py           — FastAPI web server + SSE streaming + session management
+models.yaml          — Curated model registry (selectable models + role defaults)
 api/
   agent_api.py       — Programmatic API wrapper
-  agent_executor.py  — Autonomous task execution engine
+  agent_executor.py  — Single-agent Research→Plan→Act→Verify engine
 core/
+  models.py          — ModelRegistry (loads models.yaml)
+  skills.py          — SkillManager (Agent Skills / SKILL.md, progressive disclosure)
+  orchestration/     — Multi-agent orchestration
+    roles.py         — Role definitions + dynamic specialist builder
+    sub_agent.py     — Role-scoped sub-agent (per-role model)
+    orchestrator.py  — Research→Plan→Act→Verify team loop
   vector_memory.py   — Weaviate-backed semantic memory
   mcp_client.py      — MCP protocol client
   agent_memory.py    — Simple key-value memory
+skills/              — Agent Skills (each subfolder has a SKILL.md)
 utils/
   encoding.py        — Shared UTF-8 safe encoding helper
 docker-compose.yml   — Weaviate vector DB
@@ -209,6 +328,7 @@ tools/
   web/               — HTTP tools
   mcp/               — MCP server management tools
   memory/            — Vector-memory management tools
+  skill/             — Agent Skills tools (list_skills, load_skill)
 static/
   index.html         — Web UI shell
   app.js             — Frontend logic
@@ -244,8 +364,11 @@ tests/               — Regression tests for core utilities
 - [x] Pinned chats & drag-to-reorder
 - [x] File drag-and-drop upload
 - [x] SSE-based real-time task notifications
-- [ ] Multi-agent orchestration
-- [ ] Specialized sub-agents (researcher, coder, tester)
+- [x] Multi-model selection (per-chat + per-agent)
+- [x] Agent Skills (`SKILL.md`, progressive disclosure)
+- [x] Multi-agent orchestration (research → plan → act → verify loop)
+- [x] Specialized sub-agents (researcher, planner, engineer, devops, verifier)
+- [x] Spec-aware verification (Jira / Confluence)
 - [ ] Agent-to-agent communication
 - [ ] Whatever Big wants to do
 

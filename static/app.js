@@ -22,6 +22,9 @@ let taskLogStreams   = {};
 let _dragInit        = false;
 let _currentReader   = null;   // active SSE reader so we can cancel client-side too
 let _currentSessionEmpty = true; // true when current session has no messages yet
+// Selected chat model (persisted). null → let the backend use its default.
+let currentModel     = localStorage.getItem('beacon_model') || null;
+let availableModels  = [];     // [{id,label,description,...}] from GET /models
 // Per-conversation active agent task tracking: sessionId → { taskId, progressEl, done }
 const activeTaskByConversation = new Map();
 
@@ -309,6 +312,31 @@ function createMessage(role, ts) {
   return bubble;
 }
 
+// Attach (or update) a small "which model answered" badge under an AI bubble.
+function addModelBadge(bubble, label) {
+  if (!bubble || !label) return;
+  const wrap = bubble.parentNode;
+  if (!wrap) return;
+  let badge = wrap.querySelector('.model-badge');
+  if (!badge) {
+    badge = document.createElement('div');
+    badge.className = 'model-badge';
+    if (bubble.nextSibling) wrap.insertBefore(badge, bubble.nextSibling);
+    else wrap.appendChild(badge);
+  }
+  badge.textContent = '\u2728 ' + label;
+}
+
+// Insert a centered divider noting the user switched the active model.
+function appendModelSwitchNote(label) {
+  if (!messagesEl || !label) return;
+  const note = document.createElement('div');
+  note.className = 'model-switch-note';
+  note.textContent = '\u2699 Model switched to ' + label;
+  messagesEl.appendChild(note);
+  scrollToBottom();
+}
+
 // ── Sidebar collapse ──────────────────────────────────────────────────────────
 function openSidebar() {
   sidebar.classList.remove('collapsed');
@@ -538,6 +566,7 @@ async function switchSession(id) {
           const isNotif = msg.notification === true;
           const b = createMessage('ai', msg.ts);
           b.innerHTML = renderMarkdown(msg.content || '');
+          if (msg.model_label) addModelBadge(b, msg.model_label);
           if (isNotif) {
             const levelIcon = {alert: '🚨', warning: '⚠️', success: '✅', info: '📋'};
             const icon = levelIcon[msg.level] || '⚙';
@@ -597,7 +626,7 @@ async function reconnectToSession(id) {
   tHd.addEventListener('click',()=>{tBo.classList.toggle('open');tTg.textContent=tBo.classList.contains('open')?' \u25b2':' \u25bc';});
   tBl.appendChild(tHd);tBl.appendChild(tBo);ab.appendChild(tBl);
   const tn=document.createElement('div');ab.appendChild(tn);
-  let acc='',steps=0;
+  let acc='',steps=0,answerModelLabel='';
   function atl(txt,cls){const l=document.createElement('div');l.className='thinking-line '+(cls||'');l.textContent=txt;tBo.appendChild(l);tBo.scrollTop=tBo.scrollHeight;scrollToBottom();}
   try {
     const resp=await fetch('/chat/reconnect/'+id);
@@ -613,9 +642,10 @@ async function reconnectToSession(id) {
         if(!line.trim()||line.trim().startsWith(':'))continue;
         let ev;try{ev=JSON.parse(line.trim());}catch{continue;}
         if(ev.type==='tool'){steps++;if(id===currentSessionId)setStatus('thinking','Running '+ev.name+'\u2026');tLb.textContent='\u2699 Step '+steps+': '+ev.name;atl('\uD83D\uDD27 '+ev.name+(ev.args?'('+ev.args+')':'()'),'tool-call');}
+        else if(ev.type==='model'){answerModelLabel=ev.label||ev.content||'';addModelBadge(ab,answerModelLabel);}
         else if(ev.type==='result'){(ev.content||'').split('\n').forEach(l=>{if(l.trim())atl('   '+l,'tool-result');});if(id===currentSessionId)setStatus('thinking','Processing\u2026');}
         else if(ev.type==='token'){acc+=ev.content||'';tn.innerHTML=renderMarkdown(acc);scrollToBottom();if(id===currentSessionId)setStatus('thinking','Responding\u2026');}
-        else if(ev.type==='done'){tBo.classList.remove('open');tIc.innerHTML=steps>0?'<span style="color:var(--green);font-size:13px">\u2713</span>':'<span style="color:var(--muted);font-size:13px">\u2014</span>';tLb.textContent=steps>0?('\u2699 '+steps+' step'+(steps>1?'s':'')+' completed'):'\u2699 No tools used';tn.innerHTML=renderMarkdown(acc);scrollToBottom();refreshTasksBadge();await loadSessions();if(id===currentSessionId){const ud=await(await fetch('/sessions/'+id)).json();chatTitleEl.textContent=ud.title||'New Chat';}}
+        else if(ev.type==='done'){tBo.classList.remove('open');tIc.innerHTML=steps>0?'<span style="color:var(--green);font-size:13px">\u2713</span>':'<span style="color:var(--muted);font-size:13px">\u2014</span>';tLb.textContent=steps>0?('\u2699 '+steps+' step'+(steps>1?'s':'')+' completed'):'\u2699 No tools used';tn.innerHTML=renderMarkdown(acc);if(answerModelLabel)addModelBadge(ab,answerModelLabel);scrollToBottom();refreshTasksBadge();await loadSessions();if(id===currentSessionId){const ud=await(await fetch('/sessions/'+id)).json();chatTitleEl.textContent=ud.title||'New Chat';}}
         else if(ev.type==='stopped'){tBo.classList.remove('open');tIc.innerHTML='<span style="color:var(--yellow);font-size:13px">\u23F9</span>';tLb.textContent='\u2699 Stopped';if(acc)tn.innerHTML=renderMarkdown(acc);scrollToBottom();}
         else if(ev.type==='error'){atl('\u26a0 '+(ev.content||'Unknown error'),'error');tBo.classList.add('open');if(id===currentSessionId)setStatus('error','Error');}
       }
@@ -674,6 +704,31 @@ async function clearChat(){
   const es=document.createElement('div');es.className='empty-state';es.id='empty-state-active';
   es.innerHTML='<div class="empty-icon">🤖</div><div class="empty-title">Big\'s Personal AI Assistant</div><div class="empty-subtitle">Ask me anything.</div>';
   messagesEl.appendChild(es);showToast('Conversation cleared');
+}
+
+// ── Model picker ──────────────────────────────────────────────────────────────
+// Populate the header model dropdown from GET /models and persist the choice.
+async function loadModels(){
+  const picker = document.getElementById('model-picker');
+  if(!picker) return;
+  try{
+    const res = await fetch('/models');
+    if(!res.ok) return;
+    const data = await res.json();
+    availableModels = data.models || [];
+    const selected = (currentModel && availableModels.some(m=>m.id===currentModel))
+      ? currentModel : (data.current || data.default);
+    currentModel = selected;
+    picker.innerHTML = availableModels.map(m =>
+      `<option value="${m.id}"${m.id===selected?' selected':''}>${m.label}</option>`
+    ).join('');
+    picker.onchange = () => {
+      currentModel = picker.value;
+      try{ localStorage.setItem('beacon_model', currentModel); }catch(e){}
+      const m = availableModels.find(x=>x.id===currentModel);
+      if(m){ showToast('Model: ' + m.label); appendModelSwitchNote(m.label); }
+    };
+  }catch(e){ console.warn('Could not load models', e); }
 }
 
 async function sendMessage(){
@@ -736,7 +791,7 @@ async function sendMessage(){
   tHd.addEventListener('click',()=>{tBo.classList.toggle('open');tTg.textContent=tBo.classList.contains('open')?' \u25b2':' \u25bc';});
   tBl.appendChild(tHd);tBl.appendChild(tBo);ab.appendChild(tBl);
   const tn=document.createElement('div');ab.appendChild(tn);
-  let acc='',steps=0;
+  let acc='',steps=0,answerModelLabel='';
 
   function atl(txt,cls){
     const l=document.createElement('div');l.className='thinking-line '+(cls||'');l.textContent=txt;
@@ -744,7 +799,7 @@ async function sendMessage(){
   }
 
   try{
-    const resp=await fetch('/chat/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:fullText||text,session_id:currentSessionId})});
+    const resp=await fetch('/chat/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:fullText||text,session_id:currentSessionId,model:currentModel})});
     if(!resp.ok)throw new Error('HTTP '+resp.status);
     const reader=resp.body.getReader();_currentReader=reader;const dec=new TextDecoder();let buf='';
     while(true){
@@ -759,6 +814,8 @@ async function sendMessage(){
           tLb.textContent='\u2699 Step '+steps+': '+ev.name;
           atl('\uD83D\uDD27 '+ev.name+(ev.args?'('+ev.args+')':'()'),'tool-call');
           if(ev.name==='delegate_background_task')setTimeout(()=>{openTasksPanel();refreshTasksList();},800);
+        }else if(ev.type==='model'){
+          answerModelLabel=ev.label||ev.content||'';addModelBadge(ab,answerModelLabel);
         }else if(ev.type==='result'){
           (ev.content||'').split('\n').forEach(l=>{if(l.trim())atl('   '+l,'tool-result');});
           setStatus('thinking','Processing\u2026');
@@ -769,6 +826,7 @@ async function sendMessage(){
           tIc.innerHTML=steps>0?'<span style="color:var(--green);font-size:13px">\u2713</span>':'<span style="color:var(--muted);font-size:13px">\u2014</span>';
           tLb.textContent=steps>0?('\u2699 '+steps+' step'+(steps>1?'s':'')+' completed'):'\u2699 No tools used';
           tn.innerHTML=renderMarkdown(acc);scrollToBottom();refreshTasksBadge();
+          if(answerModelLabel)addModelBadge(ab,answerModelLabel);
           await loadSessions();
           const ud=await(await fetch('/sessions/'+currentSessionId)).json();
           chatTitleEl.textContent=ud.title||'New Chat';
@@ -1144,6 +1202,7 @@ window.addEventListener('load',async()=>{
     setStatus('ready','Ready');
     textarea.focus();
     initEventStream();
+    await loadModels();
     await loadSessions();
     // Check for ?session= URL param
     const urlParams = new URLSearchParams(window.location.search);
@@ -1183,9 +1242,17 @@ document.addEventListener('click', e => {
   'use strict';
 
   // ── State ────────────────────────────────────────────────
-  let taskModeActive = false;
+  // Single structured "Agent Mode" routes messages through the multi-agent
+  // orchestrator instead of /chat/stream.
+  let orchestrateModeActive = false;
   let activeTaskId = null;
   let taskEventSource = null;
+
+  // Per-role model overrides for orchestration (role → model id, or "" = Auto).
+  // Persisted so the user's choices survive reloads.
+  const ORCH_ROLES = ['researcher', 'planner', 'engineer', 'devops', 'verifier'];
+  let orchModelOverrides = {};
+  try { orchModelOverrides = JSON.parse(localStorage.getItem('beacon_orch_models') || '{}'); } catch (e) {}
 
   // ── Inject toggle button into the input area ─────────────
   function injectTaskToggle() {
@@ -1207,13 +1274,15 @@ document.addEventListener('click', e => {
       return;
     }
 
-    if (document.getElementById('task-mode-toggle')) return; // already injected
+    if (document.getElementById('agent-mode-toggle')) return; // already injected
 
+    // Single structured "Agent Mode" — runs the multi-agent orchestrator
+    // (research → plan → engineer/specialist → verify, looping on failure).
     const toggle = document.createElement('button');
-    toggle.id = 'task-mode-toggle';
+    toggle.id = 'agent-mode-toggle';
     toggle.type = 'button';
-    toggle.title = 'Task Mode — structured plan → execute → verify';
-    toggle.innerHTML = '⚡';
+    toggle.title = 'Agent Mode — multi-agent team (research → plan → engineer → verify). Right-click to pick a model per agent.';
+    toggle.innerHTML = '\ud83e\udde0';
     toggle.style.cssText = [
       'width: 44px',
       'height: 44px',
@@ -1232,30 +1301,97 @@ document.addEventListener('click', e => {
     ].join(';');
 
     toggle.addEventListener('mouseenter', () => {
-      if (!taskModeActive) toggle.style.background = 'rgba(108,99,255,0.15)';
+      if (!orchestrateModeActive) toggle.style.background = 'rgba(167,139,250,0.18)';
     });
     toggle.addEventListener('mouseleave', () => {
-      if (!taskModeActive) toggle.style.background = 'transparent';
+      if (!orchestrateModeActive) toggle.style.background = 'transparent';
     });
     toggle.addEventListener('click', () => {
-      taskModeActive = !taskModeActive;
-      toggle.style.background = taskModeActive ? '#6c63ff' : 'transparent';
-      toggle.style.borderColor = taskModeActive ? '#6c63ff' : '#44446a';
-      toggle.style.color = taskModeActive ? '#fff' : '#888';
-      toggle.title = taskModeActive
-        ? 'Task Mode ON — structured plan → execute → verify (click to disable)'
-        : 'Task Mode — structured plan → execute → verify (click to enable)';
+      orchestrateModeActive = !orchestrateModeActive;
+      toggle.style.background = orchestrateModeActive ? '#a78bfa' : 'transparent';
+      toggle.style.borderColor = orchestrateModeActive ? '#a78bfa' : '#44446a';
+      toggle.style.color = orchestrateModeActive ? '#fff' : '#888';
+      toggle.title = orchestrateModeActive
+        ? 'Agent Mode ON — multi-agent team (click to disable). Right-click to pick models per agent.'
+        : 'Agent Mode — multi-agent team (research → plan → engineer → verify). Right-click to pick a model per agent.';
     });
+    // Right-click opens the per-agent model picker.
+    toggle.addEventListener('contextmenu', (e) => { e.preventDefault(); openAgentModelModal(); });
 
     sendBtn.parentNode.insertBefore(toggle, sendBtn);
+
     console.log('[TaskMode] Toggle injected');
+  }
+
+  // ── Per-agent model selection modal ───────────────────────
+  function openAgentModelModal() {
+    document.getElementById('agent-model-modal')?.remove();
+    document.getElementById('agent-model-overlay')?.remove();
+
+    const models = (typeof availableModels !== 'undefined' && availableModels) ? availableModels : [];
+    const overlay = document.createElement('div');
+    overlay.id = 'agent-model-overlay';
+    overlay.style.cssText = 'position:fixed;inset:0;background:#0008;z-index:998';
+    overlay.onclick = closeAgentModelModal;
+
+    const modal = document.createElement('div');
+    modal.id = 'agent-model-modal';
+    modal.style.cssText = [
+      'position:fixed', 'top:50%', 'left:50%', 'transform:translate(-50%,-50%)',
+      'background:#1a1d27', 'border:1px solid #2e3144', 'border-radius:14px',
+      'padding:20px 22px', 'z-index:999', 'width:380px', 'max-width:92vw',
+      'box-shadow:0 12px 40px #000a', 'color:#e2e8f0', 'font-size:14px',
+    ].join(';');
+
+    const optionsHtml = (sel) =>
+      '<option value="">Auto (role default)</option>' +
+      models.map(m => `<option value="${m.id}"${m.id === sel ? ' selected' : ''}>${m.label}</option>`).join('');
+
+    modal.innerHTML =
+      '<div style="font-weight:600;font-size:15px;margin-bottom:4px">\ud83e\udde0 Agent Models</div>' +
+      '<div style="color:#94a3b8;font-size:12px;margin-bottom:14px">Pick a model per agent for Orchestrate mode. "Auto" uses the role default from models.yaml.</div>' +
+      ORCH_ROLES.map(role =>
+        `<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;gap:10px">` +
+        `<label style="text-transform:capitalize;flex:0 0 90px">${role}</label>` +
+        `<select data-role="${role}" class="model-select" style="flex:1">${optionsHtml(orchModelOverrides[role] || '')}</select>` +
+        `</div>`
+      ).join('') +
+      '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">' +
+      '<button id="agent-model-reset" class="modal-btn cancel" style="padding:7px 14px;border-radius:8px;border:1px solid #2e3144;background:#252836;color:#e2e8f0;cursor:pointer">Reset</button>' +
+      '<button id="agent-model-save" class="modal-btn confirm" style="padding:7px 14px;border-radius:8px;border:none;background:#6c63ff;color:#fff;cursor:pointer">Save</button>' +
+      '</div>';
+
+    document.body.appendChild(overlay);
+    document.body.appendChild(modal);
+
+    modal.querySelector('#agent-model-save').onclick = () => {
+      const next = {};
+      modal.querySelectorAll('select[data-role]').forEach(sel => {
+        if (sel.value) next[sel.dataset.role] = sel.value;
+      });
+      orchModelOverrides = next;
+      try { localStorage.setItem('beacon_orch_models', JSON.stringify(next)); } catch (e) {}
+      if (typeof showToast === 'function') showToast('Agent models saved');
+      closeAgentModelModal();
+    };
+    modal.querySelector('#agent-model-reset').onclick = () => {
+      orchModelOverrides = {};
+      try { localStorage.removeItem('beacon_orch_models'); } catch (e) {}
+      closeAgentModelModal();
+      if (typeof showToast === 'function') showToast('Agent models reset to Auto');
+    };
+  }
+
+  function closeAgentModelModal() {
+    document.getElementById('agent-model-modal')?.remove();
+    document.getElementById('agent-model-overlay')?.remove();
   }
 
   // ── Intercept form submit / send button click ─────────────
   function interceptSend() {
     // Hook into the document-level keydown (Enter key) and click
     document.addEventListener('keydown', (e) => {
-      if (!taskModeActive) return;
+      if (!orchestrateModeActive) return;
       if (e.key !== 'Enter' || e.shiftKey) return;
       const ta =
         document.querySelector('textarea') ||
@@ -1263,7 +1399,7 @@ document.addEventListener('click', e => {
       if (document.activeElement === ta) {
         e.preventDefault();
         e.stopImmediatePropagation();
-        submitAsTask(ta.value.trim());
+        submitActive(ta.value.trim());
         ta.value = '';
         ta.style.height = '';
       }
@@ -1271,15 +1407,15 @@ document.addEventListener('click', e => {
 
     // Also hook the send button
     document.addEventListener('click', (e) => {
-      if (!taskModeActive) return;
+      if (!orchestrateModeActive) return;
       const sendBtn =
         document.getElementById('send-btn') ||
         document.getElementById('sendBtn') ||
         document.querySelector('[data-action="send"]') ||
         document.querySelector('button[type="submit"]') ||
         document.querySelector('.send-btn') ||
-        document.querySelector('.chat-input-row button:not(#task-mode-toggle)') ||
-        document.querySelector('#input-area button:not(#task-mode-toggle)');
+        document.querySelector('.chat-input-row button:not(#agent-mode-toggle)') ||
+        document.querySelector('#input-area button:not(#agent-mode-toggle)');
       if (e.target === sendBtn || (sendBtn && sendBtn.contains(e.target))) {
         e.preventDefault();
         e.stopImmediatePropagation();
@@ -1289,13 +1425,19 @@ document.addEventListener('click', e => {
         if (ta) {
           const msg = ta.value.trim();
           if (msg) {
-            submitAsTask(msg);
+            submitActive(msg);
             ta.value = '';
             ta.style.height = '';
           }
         }
       }
     }, true);
+  }
+
+  // Agent Mode routes everything through the orchestrator.
+  function submitActive(value) {
+    if (!value) return;
+    submitAsOrchestration(value);
   }
 
   // ── Get current session id ────────────────────────────────
@@ -1348,6 +1490,45 @@ document.addEventListener('click', e => {
     }
   }
 
+  // ── Submit message as a multi-agent orchestration ─────────
+  async function submitAsOrchestration(description) {
+    if (!description) return;
+
+    const sessionId = getSessionId();
+    appendTaskMessage('user', '\ud83e\udde0 ' + description);
+    const progressEl = appendTaskProgress(description);
+
+    try {
+      const resp = await fetch('/agent/orchestrate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          description,
+          session_id: sessionId,
+          max_rounds: 2,
+          model_overrides: orchModelOverrides,
+        }),
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const { task_id } = await resp.json();
+      activeTaskId = task_id;
+
+      if (sessionId) {
+        activeTaskByConversation.set(sessionId, { taskId: task_id, progressEl, done: false });
+        try {
+          localStorage.setItem(
+            'activeTask_' + sessionId,
+            JSON.stringify({ taskId: task_id, sessionId: sessionId })
+          );
+        } catch (e) {}
+      }
+
+      streamTaskEvents(task_id, progressEl);
+    } catch (err) {
+      progressEl.innerHTML = '<span style="color:#f38ba8">\u26a0\ufe0f Orchestration submit failed: ' + err.message + '</span>';
+    }
+  }
+
   // ── Stream SSE events from /agent/task/{id}/stream ────────
   // Uses fetch()+ReadableStream (same pattern as /chat/stream) instead of
   // native EventSource. The backend yields lines like:
@@ -1394,6 +1575,21 @@ document.addEventListener('click', e => {
           switch (ev.type) {
             case 'task_started':
               updateProgress(progressEl, '\u23f3 Starting task\u2026', 'planning');
+              break;
+
+            case 'agent_spawned':
+              appendPhaseLog(progressEl, '\ud83e\udd16',
+                'Spawned ' + (ev.title || ev.role),
+                'Model: ' + (ev.model || 'default'));
+              updateProgress(progressEl,
+                '\ud83e\udd16 ' + (ev.title || ev.role) + ' (' + (ev.model || 'default') + ')',
+                'executing');
+              break;
+
+            case 'agent_context':
+              appendPhaseLog(progressEl, '\ud83d\udd04',
+                (ev.from || '?') + ' \u2192 ' + (ev.to || '?') + ' (' + (ev.label || 'context') + ', ' + (ev.chars || 0) + ' chars)',
+                ev.preview || '');
               break;
 
             case 'task_researching':

@@ -20,6 +20,11 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 .header-right{display:flex;gap:8px;align-items:center}
 .btn-icon{background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--muted);cursor:pointer;padding:7px 12px;font-size:13px;transition:all .15s;display:flex;align-items:center;gap:5px}
 .btn-icon:hover{background:var(--border);color:var(--text)}
+.model-select{background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);cursor:pointer;padding:7px 10px;font-size:13px;max-width:200px;transition:all .15s;font-family:var(--font)}
+.model-select:hover{border-color:var(--accent)}
+.model-select:focus{outline:none;border-color:var(--accent)}
+.model-badge{font-size:11px;color:var(--muted);margin-top:3px;opacity:.85;display:inline-flex;align-items:center;gap:4px}
+.model-switch-note{text-align:center;color:var(--muted);font-size:12px;margin:10px auto;opacity:.85;padding:4px 12px;border:1px dashed var(--border);border-radius:999px;width:fit-content;max-width:90%}
 /* Stop button – highlighted in red when visible */
 .stop-btn{background:#3a1a1a!important;border-color:#6b2a2a!important;color:var(--red)!important;font-weight:600;animation:stopPulse 1.5s ease-in-out infinite}
 .stop-btn:hover{background:#5a2a2a!important;color:#fca5a5!important}
