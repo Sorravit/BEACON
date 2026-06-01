@@ -958,14 +958,29 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
             
             if task:
                 from datetime import datetime
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+                start_time = datetime.now()
+                timestamp = start_time.strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
                 print(f"\n{timestamp} - 🚀 Running task: {task}")
                 print("="*60)
                 result = await api.run_task(task)
                 
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+                end_time = datetime.now()
+                timestamp = end_time.strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+                
+                # Calculate total elapsed time in human-readable format
+                duration_secs = result.get('duration_seconds') or (end_time - start_time).total_seconds()
+                hours, remainder = divmod(int(duration_secs), 3600)
+                minutes, seconds = divmod(remainder, 60)
+                if hours > 0:
+                    duration_str = f"{hours}h {minutes}m {seconds}s"
+                elif minutes > 0:
+                    duration_str = f"{minutes}m {seconds}s"
+                else:
+                    duration_str = f"{duration_secs:.2f}s"
+                
                 print("\n" + "="*60)
                 print(f"{timestamp} - 🏁 TASK COMPLETED")
+                print(f"⏱️  Total time: {duration_str}")
                 print("="*60)
                 print(f"Status: {result.get('status', 'unknown')}")
                 print(f"Success: {result.get('success', False)}")
@@ -978,8 +993,6 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                 elif result.get('error'):
                     print(f"\nERROR: {result['error']}")
                 
-                if result.get('duration_seconds'):
-                    print(f"\nDuration: {result['duration_seconds']:.2f}s")
                 print("="*60 + "\n")
                 
                 await self.shutdown()

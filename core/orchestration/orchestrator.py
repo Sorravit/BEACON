@@ -45,7 +45,9 @@ from utils.encoding import safe_encode_string
 logger = logging.getLogger(__name__)
 
 _JIRA_KEY_RE = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b")
-_MAX_CONTEXT_CHARS = 4000
+# Default limit for inter-agent context. Increased from 4000 to preserve more
+# information between agents while still preventing token overflow.
+_MAX_CONTEXT_CHARS = 8000
 
 
 @dataclass
@@ -197,6 +199,7 @@ class Orchestrator:
         task_id = task_id or "orch_" + datetime.now().strftime("%Y%m%d_%H%M%S")
         self._task_id = task_id
         result = OrchestrationResult(task_id=task_id, goal=goal)
+        start_time = datetime.now()
 
         jira_keys = sorted(set(_JIRA_KEY_RE.findall(goal)))
         spec_note = ""
@@ -276,13 +279,15 @@ class Orchestrator:
             result.status = "completed"
             summary = self._compile_summary(result)
             result.final_output = summary
-            logger.info("[%s] ORCHESTRATION DONE | verified=%s | rounds=%d",
-                        task_id, result.verified, result.rounds)
+            duration_seconds = (datetime.now() - start_time).total_seconds()
+            logger.info("[%s] ORCHESTRATION DONE | verified=%s | rounds=%d | duration=%.2fs",
+                        task_id, result.verified, result.rounds, duration_seconds)
             self._emit("task_completed", {
                 "task_id": task_id,
                 "description": goal,
                 "result": summary,
                 "verified": result.verified,
+                "duration_seconds": duration_seconds,
             })
             return result
 
@@ -349,7 +354,7 @@ class Orchestrator:
             "Create an execution plan for the goal. Choose the single best "
             "specialist to execute it and define explicit, testable acceptance "
             "criteria.\n\n"
-            f"Goal: {goal}\n\nResearch findings:\n{self._truncate(research, 2500)}{fb}\n\n"
+            f"Goal: {goal}\n\nResearch findings:\n{self._truncate(research, 5000)}{fb}\n\n"
             "Specialist must be one of: lead-software-engineer, devops, kubernetes, "
             "data-engineer, sre, security — or another short role name if none fit.\n\n"
             'Respond ONLY with JSON:\n'
@@ -403,7 +408,7 @@ class Orchestrator:
             "message": f"{role.title} executing {len(steps)} step(s)…",
         })
 
-        accumulated = f"Goal: {goal}\n\nResearch findings:\n{self._truncate(research, 1500)}"
+        accumulated = f"Goal: {goal}\n\nResearch findings:\n{self._truncate(research, 3000)}"
         outputs: List[str] = []
         for idx, step in enumerate(steps, start=1):
             logger.info("[%s] ACT step %d/%d | %s | %s", task_id, idx, len(steps),
@@ -492,6 +497,7 @@ class Orchestrator:
             "Acceptance criteria:",
         ]
         lines += [f"  - {c}" for c in result.acceptance_criteria]
-        lines += ["", "Result:", self._truncate(result.final_output, 6000)]
+        # Show full result to user - no truncation for final output
+        lines += ["", "Result:", result.final_output or ""]
         return "\n".join(lines)
 

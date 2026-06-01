@@ -816,10 +816,7 @@ async function sendMessage(){
           if(ev.name==='delegate_background_task')setTimeout(()=>{openTasksPanel();refreshTasksList();},800);
         }else if(ev.type==='model'){
           answerModelLabel=ev.label||ev.content||'';addModelBadge(ab,answerModelLabel);
-          if(ev.ts){
-            const tsEl=document.createElement('div');tsEl.className='msg-ts';tsEl.textContent=fmtTs(ev.ts);
-            ab.parentNode.appendChild(tsEl);
-          }
+          // Timestamp already added by createMessage() - don't add duplicate
         }else if(ev.type==='result'){
           (ev.content||'').split('\n').forEach(l=>{if(l.trim())atl('   '+l,'tool-result');});
           setStatus('thinking','Processing\u2026');
@@ -1662,10 +1659,28 @@ document.addEventListener('click', e => {
               break;
             }
 
-            case 'task_completed':
-              updateProgress(progressEl, '\u2705 Task completed', 'completed');
+            case 'task_completed': {
+              // Format duration if available
+              let durationStr = '';
+              if (ev.duration_seconds != null) {
+                const secs = ev.duration_seconds;
+                const hours = Math.floor(secs / 3600);
+                const mins = Math.floor((secs % 3600) / 60);
+                const s = Math.floor(secs % 60);
+                if (hours > 0) durationStr = hours + 'h ' + mins + 'm ' + s + 's';
+                else if (mins > 0) durationStr = mins + 'm ' + s + 's';
+                else durationStr = secs.toFixed(1) + 's';
+              }
+              const statusMsg = durationStr
+                ? '\u2705 Task completed in ' + durationStr
+                : '\u2705 Task completed';
+              updateProgress(progressEl, statusMsg, 'completed');
               if (ev.result) {
-                appendTaskMessage('assistant', ev.result, ev.ts || new Date().toISOString());
+                // Include duration in the result message if available
+                const resultWithTime = durationStr
+                  ? ev.result + '\n\n⏱️ **Total time:** ' + durationStr
+                  : ev.result;
+                appendTaskMessage('assistant', resultWithTime, ev.ts || new Date().toISOString());
               }
               taskEventSource = null;
               activeTaskId = null;
@@ -1677,6 +1692,7 @@ document.addEventListener('click', e => {
                 }
               });
               return;
+            }
 
             case 'task_failed':
               updateProgress(progressEl, `\u274c Task failed: ${ev.error || 'unknown error'}`, 'failed');
