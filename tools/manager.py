@@ -1,8 +1,15 @@
-"""Central tool manager composed from category-specific tool modules."""
+"""Central tool manager composed from category-specific tool modules.
+
+Telemetry: every call to execute_tool() is automatically wrapped in an
+OpenTelemetry child span (``tool/<name>``) with a ``tool.duration_ms``
+attribute so traces show per-tool latency.
+"""
 
 import inspect
 import json
 import logging
+import time
+import uuid
 from typing import Any, Callable, Dict, List
 
 from tools.base.command_tools import CommandToolsMixin
@@ -42,7 +49,10 @@ class ToolManager(
         self.vector_memory = vector_memory
         self.mcp_manager = mcp_manager
         self.skill_manager = skill_manager
-        self.session_id = None
+        # Assign a unique session ID immediately so every tool span is always
+        # associated with a session.  Callers (e.g. web_app._run_agent_bg) may
+        # override this with the HTTP-session UUID; that is intentional and safe.
+        self.session_id: str = str(uuid.uuid4())
 
     async def initialize(self):
         try:
@@ -103,38 +113,87 @@ class ToolManager(
             self.tool_handlers[name] = handler
 
     async def execute_tool(self, name: str, args: Dict):
-        if name not in self.tool_handlers:
-            if self.mcp_manager:
-                result = await self.mcp_manager.call_tool(name, args)
-                if result is None:
-                    return json.dumps({"error": f"Unknown tool: {name}"})
+        """Execute a named tool and return its result.
+
+        Telemetry: every call is wrapped in an OTel child span with:
+          - ``tool.name``        : tool identifier
+          - ``tool.duration_ms`` : wall-clock execution time in milliseconds
+          - ``error.type``       : set on exception
+          - ``session.id``       : always set — session_id is never None
+        """
+        # ── OTel span ──────────────────────────────────────────────────────
+        try:
+            from opentelemetry import trace
+            from opentelemetry.trace import Status, StatusCode
+
+            tracer = trace.get_tracer("beacon.tools")
+            # session_id is always a valid UUID string (set in __init__)
+            span_attrs: Dict[str, Any] = {
+                "tool.name": name,
+                "session.id": self.session_id,
+            }
+        except Exception:
+            tracer = None  # OTel not initialised — run without tracing
+
+        t0 = time.perf_counter()
+
+        async def _run():
+            if name not in self.tool_handlers:
+                if self.mcp_manager:
+                    result = await self.mcp_manager.call_tool(name, args)
+                    if result is None:
+                        return json.dumps({"error": f"Unknown tool: {name}"})
+                    return result
+                return f"Unknown tool: {name}"
+
+            normalized_args = self._normalize_tool_args(name, args)
+
+            handler = self.tool_handlers[name]
+            sig = inspect.signature(handler)
+
+            missing = [
+                p
+                for p, v in sig.parameters.items()
+                if p != "self"
+                and v.kind not in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)
+                and v.default is inspect.Parameter.empty
+                and p not in normalized_args
+            ]
+            if missing:
+                return f"Error: tool '{name}' missing required parameter(s): {', '.join(missing)}"
+
+            accepted = {
+                p for p, v in sig.parameters.items() if p != "self" and v.kind not in (inspect.Parameter.VAR_POSITIONAL,)
+            }
+            has_var_keyword = any(v.kind == inspect.Parameter.VAR_KEYWORD for v in sig.parameters.values())
+            if not has_var_keyword:
+                normalized_args = {k: v for k, v in normalized_args.items() if k in accepted}
+
+            return await self.tool_handlers[name](**normalized_args)
+
+        if tracer is None:
+            return await _run()
+
+        with tracer.start_as_current_span(
+            f"tool/{name}",
+            attributes=span_attrs,
+            kind=trace.SpanKind.INTERNAL,
+        ) as span:
+            try:
+                result = await _run()
+                duration_ms = round((time.perf_counter() - t0) * 1000, 2)
+                span.set_attribute("tool.duration_ms", duration_ms)
+                span.set_status(Status(StatusCode.OK))
+                logger.debug("[telemetry] tool=%s duration=%.1fms", name, duration_ms)
                 return result
-            return f"Unknown tool: {name}"
-
-        normalized_args = self._normalize_tool_args(name, args)
-
-        handler = self.tool_handlers[name]
-        sig = inspect.signature(handler)
-
-        missing = [
-            p
-            for p, v in sig.parameters.items()
-            if p != "self"
-            and v.kind not in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)
-            and v.default is inspect.Parameter.empty
-            and p not in normalized_args
-        ]
-        if missing:
-            return f"Error: tool '{name}' missing required parameter(s): {', '.join(missing)}"
-
-        accepted = {
-            p for p, v in sig.parameters.items() if p != "self" and v.kind not in (inspect.Parameter.VAR_POSITIONAL,)
-        }
-        has_var_keyword = any(v.kind == inspect.Parameter.VAR_KEYWORD for v in sig.parameters.values())
-        if not has_var_keyword:
-            normalized_args = {k: v for k, v in normalized_args.items() if k in accepted}
-
-        return await self.tool_handlers[name](**normalized_args)
+            except Exception as exc:
+                duration_ms = round((time.perf_counter() - t0) * 1000, 2)
+                span.set_attribute("tool.duration_ms", duration_ms)
+                span.set_attribute("error.type", type(exc).__name__)
+                span.set_attribute("error.message", str(exc)[:400])
+                span.record_exception(exc)
+                span.set_status(Status(StatusCode.ERROR, description=str(exc)))
+                raise
 
     def _normalize_tool_args(self, tool_name: str, args: Dict) -> Dict:
         param_mappings = {
@@ -192,4 +251,3 @@ class ToolManager(
                     self.playwright = None
             except Exception:
                 pass
-

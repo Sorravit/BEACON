@@ -626,7 +626,20 @@ class VectorMemory:
         # is released cleanly instead of being reported as a leak.
         try:
             from joblib.externals.loky import get_reusable_executor
-            get_reusable_executor().shutdown(wait=True)
+            executor = get_reusable_executor()
+            try:
+                # Supported on newer loky; forces worker teardown and semaphore cleanup.
+                executor.shutdown(wait=True, kill_workers=True)
+            except TypeError:
+                executor.shutdown(wait=True)
+        except Exception:
+            pass
+
+        try:
+            from joblib.externals.loky.backend import resource_tracker as _loky_rt
+            tracker = getattr(_loky_rt, "_resource_tracker", None)
+            if tracker is not None:
+                tracker._stop()
         except Exception:
             pass
 

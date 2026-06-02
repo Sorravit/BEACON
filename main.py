@@ -19,6 +19,18 @@ from typing import Any, Dict, List, Optional
 # Suppress noisy deprecation warnings from third-party libraries
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="authlib")
 warnings.filterwarnings("ignore", message=".*authlib.jose.*")
+_rt_warning_rule = "ignore:resource_tracker:UserWarning"
+_py_warnings = os.environ.get("PYTHONWARNINGS", "")
+if _rt_warning_rule not in [w.strip() for w in _py_warnings.split(",") if w.strip()]:
+    os.environ["PYTHONWARNINGS"] = (
+        f"{_py_warnings},{_rt_warning_rule}" if _py_warnings else _rt_warning_rule
+    )
+warnings.filterwarnings(
+    "ignore",
+    message=r"resource_tracker: There appear to be \d+ leaked semaphore objects to clean up at shutdown:.*",
+    category=UserWarning,
+    module=r"multiprocessing\.resource_tracker",
+)
 
 from openai import OpenAI
 from core.mcp_client import MCPManager
@@ -26,6 +38,17 @@ from core.models import ModelRegistry
 from core.skills import SkillManager
 from core.vector_memory import VectorMemory
 from tools.manager import ToolManager
+
+# ── Telemetry ─────────────────────────────────────────────────────────────────
+try:
+    from core.telemetry import record_llm_call
+    from core.telemetry.context import get_session_id, get_reporter
+    _TELEMETRY_AVAILABLE = True
+except ImportError:
+    _TELEMETRY_AVAILABLE = False
+    def get_session_id(): return None  # type: ignore
+    def get_reporter(): return None    # type: ignore
+
 
 # ============================================================================
 # CONFIGURATION CONSTANTS - Modify these to customize behavior
@@ -358,9 +381,10 @@ class AIAgent:
                 temperature=0,
                 max_tokens=100
             )
-            extraction_response = await _loop.run_in_executor(
-                None, lambda: self.client.chat.completions.create(**_extract_params)
-            )
+            with (record_llm_call(self.config.model, session_id=get_session_id()) if _TELEMETRY_AVAILABLE else __import__('contextlib').nullcontext()):
+                extraction_response = await _loop.run_in_executor(
+                    None, lambda: self.client.chat.completions.create(**_extract_params)
+                )
             text = extraction_response.choices[0].message.content or ""
             # Parse JSON
             json_start = text.find('{')
@@ -431,15 +455,16 @@ If nothing meaningful to extract, respond with: []
 
 JSON:"""
 
-            result = await asyncio.get_running_loop().run_in_executor(
-                None,
-                lambda: self.client.chat.completions.create(
-                    model=self.config.model,
-                    messages=[{"role": "user", "content": extraction_prompt}],
-                    temperature=0.2,
-                    max_tokens=800
+            with (record_llm_call(self.config.model, session_id=get_session_id()) if _TELEMETRY_AVAILABLE else __import__('contextlib').nullcontext()):
+                result = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    lambda: self.client.chat.completions.create(
+                        model=self.config.model,
+                        messages=[{"role": "user", "content": extraction_prompt}],
+                        temperature=0.2,
+                        max_tokens=800
+                    )
                 )
-            )
 
             raw = result.choices[0].message.content.strip()
             # Strip markdown code fences if present
@@ -704,44 +729,65 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                     _token_q: _queue.Queue = _queue.Queue()
                     stream_params = {**params, 'stream': True}
 
-                    def _stream_in_thread():
-                        try:
-                            stream = self.client.chat.completions.create(**stream_params)
-                            for chunk in stream:
-                                delta = chunk.choices[0].delta.content if chunk.choices else None
-                                if delta:
-                                    _token_q.put(delta)
-                        except Exception as _e:
-                            _token_q.put(_e)
-                        finally:
-                            _token_q.put(None)  # sentinel — stream finished
+                    _llm_sid = get_session_id()
+                    _llm_rep = get_reporter()
+                    _llm_span_ctx = record_llm_call(effective_model, session_id=_llm_sid) if _TELEMETRY_AVAILABLE else None
+                    _llm_span = _llm_span_ctx.__enter__() if _llm_span_ctx else None
+                    _llm_t0 = __import__('time').perf_counter()
+                    try:
+                        def _stream_in_thread():
+                            try:
+                                stream = self.client.chat.completions.create(**stream_params)
+                                for chunk in stream:
+                                    delta = chunk.choices[0].delta.content if chunk.choices else None
+                                    if delta:
+                                        _token_q.put(delta)
+                            except Exception as _e:
+                                _token_q.put(_e)
+                            finally:
+                                _token_q.put(None)  # sentinel — stream finished
 
-                    # Launch blocking stream iteration in thread pool
-                    _stream_future = _loop.run_in_executor(None, _stream_in_thread)
+                        # Launch blocking stream iteration in thread pool
+                        _stream_future = _loop.run_in_executor(None, _stream_in_thread)
 
-                    response_text = ''
-                    while True:
-                        # Poll queue; yield to event loop between polls so SSE can flush
-                        try:
-                            item = _token_q.get_nowait()
-                        except _queue.Empty:
-                            await asyncio.sleep(0)  # yield → event loop flushes SSE
-                            continue
-                        if item is None:
-                            break  # sentinel: stream done
-                        if isinstance(item, Exception):
-                            raise item
-                        response_text += item
-                        # Do NOT emit tokens yet — buffer until we know this is
-                        # the final response (no tool calls). Replayed below.
+                        response_text = ''
+                        while True:
+                            # Poll queue; yield to event loop between polls so SSE can flush
+                            try:
+                                item = _token_q.get_nowait()
+                            except _queue.Empty:
+                                await asyncio.sleep(0)  # yield → event loop flushes SSE
+                                continue
+                            if item is None:
+                                break  # sentinel: stream done
+                            if isinstance(item, Exception):
+                                raise item
+                            response_text += item
+                            # Do NOT emit tokens yet — buffer until we know this is
+                            # the final response (no tool calls). Replayed below.
 
-                    await _stream_future  # ensure thread is fully joined
+                        await _stream_future  # ensure thread is fully joined
+                        if _llm_span_ctx and _llm_span:
+                            _llm_span_ctx.__exit__(None, None, None)
+                    except Exception as _llm_exc:
+                        if _llm_span_ctx and _llm_span:
+                            import sys as _sys2
+                            _llm_span_ctx.__exit__(type(_llm_exc), _llm_exc, _llm_exc.__traceback__)
+                        raise
                 else:
                     # NON-STREAMING MODE: CLI / planning / background tasks
-                    response = await _loop.run_in_executor(
-                        None, lambda: self.client.chat.completions.create(**params)
-                    )
-                    response_text = response.choices[0].message.content
+                    _ns_sid = get_session_id()
+                    with (record_llm_call(effective_model, session_id=_ns_sid) if _TELEMETRY_AVAILABLE else __import__('contextlib').nullcontext()) as _ns_span:
+                        response = await _loop.run_in_executor(
+                            None, lambda: self.client.chat.completions.create(**params)
+                        )
+                        response_text = response.choices[0].message.content
+                        if _ns_span and hasattr(response, 'usage') and response.usage:
+                            try:
+                                _ns_span.set_attribute('llm.input_tokens', response.usage.prompt_tokens or 0)
+                                _ns_span.set_attribute('llm.output_tokens', response.usage.completion_tokens or 0)
+                            except Exception:
+                                pass
                 
                 if not response_text:
                     return "No response from AI"
@@ -925,23 +971,33 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
 
     async def shutdown(self):
         """Shut down agent resources including the shared browser process."""
-        if self.tools:
-            await self.tools.cleanup()
+        try:
+            if self.tools:
+                await self.tools.cleanup()
+        except Exception as e:
+            logger.debug(f"Tool cleanup during shutdown failed: {e}")
+
         # Close shared browser process owned by this agent
         try:
             if self._shared_browser:
                 await self._shared_browser.close()
                 self._shared_browser = None
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"Shared browser shutdown failed: {e}")
+
         try:
             if self._playwright:
                 await self._playwright.stop()
                 self._playwright = None
-        except:
-            pass
-        if self.vector_memory:
-            self.vector_memory.close()
+        except Exception as e:
+            logger.debug(f"Playwright shutdown failed: {e}")
+
+        # Always attempt vector memory shutdown last so loky resources are released.
+        try:
+            if self.vector_memory:
+                self.vector_memory.close()
+        except Exception as e:
+            logger.debug(f"Vector memory shutdown failed: {e}")
 
     async def run(self, mode: str = "chat", task: Optional[str] = None):
         """

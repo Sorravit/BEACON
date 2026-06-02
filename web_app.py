@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import sys
+import warnings
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -31,6 +32,22 @@ import atexit
 import signal as _signal
 import sys as _sys
 _sys.stdout.reconfigure(line_buffering=True)
+
+_rt_warning_rule = "ignore:resource_tracker:UserWarning"
+_py_warnings = os.environ.get("PYTHONWARNINGS", "")
+if _rt_warning_rule not in [w.strip() for w in _py_warnings.split(",") if w.strip()]:
+    os.environ["PYTHONWARNINGS"] = (
+        f"{_py_warnings},{_rt_warning_rule}" if _py_warnings else _rt_warning_rule
+    )
+
+# Python 3.14 + native deps can emit a spurious resource_tracker semaphore
+# warning on clean SIGTERM shutdown even after explicit executor teardown.
+warnings.filterwarnings(
+    "ignore",
+    message=r"resource_tracker: There appear to be \d+ leaked semaphore objects to clean up at shutdown:.*",
+    category=UserWarning,
+    module=r"multiprocessing\.resource_tracker",
+)
 
 # ── Fix #1: Ignore SIGHUP so the server survives terminal disconnects ─────────
 # When Fish shell / SSH closes the controlling terminal it sends SIGHUP to the
@@ -46,7 +63,21 @@ _signal.signal(_signal.SIGHUP, _signal.SIG_IGN)
 def _cleanup_loky():
     try:
         from joblib.externals.loky import get_reusable_executor
-        get_reusable_executor().shutdown(wait=True)
+        executor = get_reusable_executor()
+        try:
+            # Newer loky versions accept kill_workers and release resources eagerly.
+            executor.shutdown(wait=True, kill_workers=True)
+        except TypeError:
+            executor.shutdown(wait=True)
+    except Exception:
+        pass
+
+    # Stop loky's own resource tracker process once all workers are down.
+    try:
+        from joblib.externals.loky.backend import resource_tracker as _loky_rt
+        tracker = getattr(_loky_rt, "_resource_tracker", None)
+        if tracker is not None:
+            tracker._stop()
     except Exception:
         pass
 
@@ -59,6 +90,17 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from main import AIAgent, Config
+
+try:
+    from core.telemetry import init_tracer as _init_tracer, shutdown as _shutdown_tracer
+    from core.telemetry import session_span_context, record_llm_call
+    from core.telemetry import SessionReporter
+    from core.telemetry.context import set_session_context, clear_session_context
+    _TELEMETRY_AVAILABLE = True
+except ImportError:
+    def _init_tracer(): pass
+    def _shutdown_tracer(): pass
+    _TELEMETRY_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -88,9 +130,16 @@ async def lifespan(app: FastAPI):
         _rotate_log_if_needed(lf)
     _rotate_bg_logs()
 
+    # FIX: Init OTel tracer so spans are exported
+    _init_tracer()
+    logger.info("OTel tracer initialised")
+
     yield  # App runs here
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
+    # Pre-clean loky in case later shutdown steps are interrupted.
+    _cleanup_loky()
+
     if _shared_agent and hasattr(_shared_agent, "shutdown"):
         await _shared_agent.shutdown()
     elif _shared_agent:
@@ -98,6 +147,12 @@ async def lifespan(app: FastAPI):
             await _shared_agent.tools.cleanup()
         if _shared_agent.vector_memory:
             _shared_agent.vector_memory.close()
+
+    # FIX: Flush all pending OTel spans before process exits
+    _shutdown_tracer()
+
+    # Ensure loky pool is torn down before interpreter atexit handlers run.
+    _cleanup_loky()
 
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
@@ -277,9 +332,12 @@ async def _generate_smart_title(session_id: str, user_msg: str, assistant_msg: s
             temperature=0.3,
             max_tokens=_config.max_tokens,
         )
-        response = await loop.run_in_executor(
-            None, lambda: agent.client.chat.completions.create(**params)
-        )
+        import contextlib as _cl_st
+        _st_ctx = record_llm_call(_config.model, session_id=session_id) if _TELEMETRY_AVAILABLE else _cl_st.nullcontext()
+        with _st_ctx:
+            response = await loop.run_in_executor(
+                None, lambda: agent.client.chat.completions.create(**params)
+            )
         raw = (response.choices[0].message.content or "").strip()
         title = raw.splitlines()[0].strip().strip("'\"")
         if title and len(title) > 2:
@@ -634,6 +692,22 @@ async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent, model:
     bg = _bg_state(session_id)
     s = _sessions.get(session_id)
 
+    # ── Telemetry: session root span + reporter + ContextVars ─────────────────
+    import time as _tmod
+    _t0_sess = _tmod.perf_counter()
+    _reporter = SessionReporter(session_id=session_id) if _TELEMETRY_AVAILABLE else None
+    _ctx_tokens = None
+    if _TELEMETRY_AVAILABLE and _reporter:
+        _ctx_tokens = set_session_context(session_id, _reporter)
+    _sess_span_cm = session_span_context(session_id) if _TELEMETRY_AVAILABLE else None
+    _sess_otel_span = None
+    if _sess_span_cm:
+        try:
+            _sess_otel_span = _sess_span_cm.__enter__()
+            _sess_otel_span.set_attribute("session.user_message_chars", len(user_input))
+        except Exception:
+            _sess_span_cm = None
+
     def _emit(ev: dict):
         bg["event_buf"].append(ev)
 
@@ -678,14 +752,24 @@ async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent, model:
             ) if args else ""
             bg["activity"] = f"{name}({args_preview})"
             _emit({"type": "tool", "name": name, "args": args_preview})
-            result = await original_execute(name, args)
+            # OTel child span per tool call via SessionReporter
+            if _reporter:
+                _tc = _reporter.track_tool(name)
+                _tc.__enter__()
+                try:
+                    result = await original_execute(name, args)
+                    _tc.__exit__(None, None, None)
+                except Exception as _te:
+                    _tc.__exit__(type(_te), _te, _te.__traceback__)
+                    raise
+            else:
+                result = await original_execute(name, args)
             preview = str(result)
             if len(preview) > 400:
-                preview = preview[:400] + "\u2026"
+                preview = preview[:400] + "…"
             bg["activity"] = f"Processing result from {name}..."
             _emit({"type": "result", "name": name, "content": preview})
             return result
-
         per_request_tools.execute_tool = instrumented_execute
 
         bg["activity"] = "Thinking..."
@@ -727,12 +811,46 @@ async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent, model:
 
     except asyncio.CancelledError:
         _emit({"type": "stopped", "content": "Stopped by user"})
+        if _sess_span_cm and _sess_otel_span:
+            try:
+                from opentelemetry.trace import Status, StatusCode
+                _sess_otel_span.set_status(Status(StatusCode.ERROR, "Cancelled by user"))
+                _sess_span_cm.__exit__(None, None, None)
+                _sess_span_cm = None
+            except Exception:
+                pass
         raise
     except Exception as e:
         logger.error(f"Agent BG error: {e}")
         import traceback; traceback.print_exc()
         _emit({"type": "error", "content": str(e)})
+        if _sess_span_cm and _sess_otel_span:
+            try:
+                _sess_span_cm.__exit__(type(e), e, e.__traceback__)
+                _sess_span_cm = None
+            except Exception:
+                pass
     finally:
+        # ── Close OTel root session span ──────────────────────────────────────
+        if _sess_span_cm:
+            try:
+                _sess_span_cm.__exit__(None, None, None)
+            except Exception:
+                pass
+        # ── Reset ContextVars ─────────────────────────────────────────────────
+        if _TELEMETRY_AVAILABLE and _ctx_tokens:
+            try:
+                clear_session_context(*_ctx_tokens)
+            except Exception:
+                pass
+        # ── Persist SessionReporter JSON to disk ──────────────────────────────
+        if _reporter:
+            try:
+                _reporter.mark_ended()
+                _reporter.log_summary()
+                _reporter.save()
+            except Exception as _re:
+                logger.debug(f"SessionReporter save error: {_re}")
         bg["activity"] = ""
         bg["done_event"].set()
 
@@ -1298,6 +1416,20 @@ async def agent_orchestrate(req: OrchestrateRequest):
 
     async def _run():
         tools = None
+        # ── Telemetry ─────────────────────────────────────────────────────────
+        _orch_reporter = SessionReporter(session_id=session_id) if (_TELEMETRY_AVAILABLE and session_id) else None
+        _orch_ctx_tokens = None
+        _orch_span_cm = None
+        _orch_span = None
+        if _TELEMETRY_AVAILABLE and session_id:
+            if _orch_reporter:
+                _orch_ctx_tokens = set_session_context(session_id, _orch_reporter)
+            _orch_span_cm = session_span_context(session_id)
+            try:
+                _orch_span = _orch_span_cm.__enter__()
+                _orch_span.set_attribute("session.mode", "orchestrate")
+            except Exception:
+                _orch_span_cm = None
         try:
             from main import ToolManager
             tools = ToolManager(
@@ -1307,6 +1439,8 @@ async def agent_orchestrate(req: OrchestrateRequest):
                 skill_manager=_shared_agent.skill_manager,
             )
             await tools.initialize()
+            if session_id:
+                tools.session_id = session_id
             orchestrator = Orchestrator(
                 _shared_agent,
                 tools=tools,
@@ -1324,6 +1458,24 @@ async def agent_orchestrate(req: OrchestrateRequest):
             if tools:
                 try:
                     await tools.cleanup()
+                except Exception:
+                    pass
+            # ── Telemetry teardown ────────────────────────────────────────────
+            if _orch_span_cm:
+                try:
+                    _orch_span_cm.__exit__(None, None, None)
+                except Exception:
+                    pass
+            if _TELEMETRY_AVAILABLE and _orch_ctx_tokens:
+                try:
+                    clear_session_context(*_orch_ctx_tokens)
+                except Exception:
+                    pass
+            if _orch_reporter:
+                try:
+                    _orch_reporter.mark_ended()
+                    _orch_reporter.log_summary()
+                    _orch_reporter.save()
                 except Exception:
                     pass
             buf = _agent_tasks[task_id]["event_buf"]

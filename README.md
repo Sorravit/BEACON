@@ -383,4 +383,24 @@ tests/               — Regression tests for core utilities
 
 ---
 
+
+---
+
+## Telemetry
+
+BEACON ships built-in OpenTelemetry tracing. Every tool call is auto-wrapped in an OTel span with tool.duration_ms.
+
+**Quick start:**
+
+    docker compose -f docker-compose.yml -f docker-compose.telemetry.yml up -d
+    echo OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 >> .env
+    python web_app.py
+    open http://localhost:16686
+
+**Key env vars:** OTEL_EXPORTER_OTLP_ENDPOINT (default: http://localhost:4317), BEACON_OTEL_CONSOLE (default: false), SESSION_REPORT_DIR (default: /tmp/beacon_sessions).
+
+**Disable:** leave OTEL_EXPORTER_OTLP_ENDPOINT unset and BEACON_OTEL_CONSOLE=false. Zero overhead.
+
+Per-session JSON reports: output/sample_trace.json (reference). Full guide: output/telemetry_additions.md
+
 <p align="center">Built by Big · Powered by BEACON 🔦</p>
