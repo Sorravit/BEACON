@@ -24,6 +24,26 @@ from tools.web.http_tools import HttpToolsMixin
 
 logger = logging.getLogger(__name__)
 
+# Character caps for telemetry previews of tool parameters / results.
+_MAX_PARAM_CHARS = 1024
+_MAX_RESULT_CHARS = 512
+
+
+def _params_preview(args: Dict) -> str:
+    """JSON-render tool arguments for a span attribute, truncated for safety."""
+    try:
+        text = json.dumps(args or {}, ensure_ascii=False, default=str)
+    except Exception:
+        text = repr(args)
+    return text if len(text) <= _MAX_PARAM_CHARS else text[:_MAX_PARAM_CHARS] + "...[truncated]"
+
+
+def _result_preview(result: Any) -> str:
+    """Stringify a tool result for a span attribute, truncated for safety."""
+    text = str(result)
+    return text if len(text) <= _MAX_RESULT_CHARS else text[:_MAX_RESULT_CHARS] + "...[truncated]"
+
+
 
 class ToolManager(
     SystemToolsMixin,
@@ -115,22 +135,26 @@ class ToolManager(
     async def execute_tool(self, name: str, args: Dict):
         """Execute a named tool and return its result.
 
-        Telemetry: every call is wrapped in an OTel child span with:
-          - ``tool.name``        : tool identifier
-          - ``tool.duration_ms`` : wall-clock execution time in milliseconds
-          - ``error.type``       : set on exception
-          - ``session.id``       : always set — session_id is never None
+        Telemetry: every call is wrapped in one OTel child span ``tool/<name>``
+        carrying:
+          - ``tool.name``         : tool identifier
+          - ``session.id``        : owning session (never None — set in __init__)
+          - ``tool.parameters``   : JSON preview of the call arguments
+          - ``tool.duration_ms``  : wall-clock execution time in milliseconds
+          - ``tool.result_preview``: truncated preview of the return value
+          - ``error.type`` / ``error.message`` : set on exception
         """
-        # ── OTel span ──────────────────────────────────────────────────────
+        # ── OTel span setup ────────────────────────────────────────────────
         try:
             from opentelemetry import trace
             from opentelemetry.trace import Status, StatusCode
 
             tracer = trace.get_tracer("beacon.tools")
-            # session_id is always a valid UUID string (set in __init__)
+            # session_id is always a valid UUID string (set in __init__).
             span_attrs: Dict[str, Any] = {
                 "tool.name": name,
                 "session.id": self.session_id,
+                "tool.parameters": _params_preview(args),
             }
         except Exception:
             tracer = None  # OTel not initialised — run without tracing
@@ -183,6 +207,7 @@ class ToolManager(
                 result = await _run()
                 duration_ms = round((time.perf_counter() - t0) * 1000, 2)
                 span.set_attribute("tool.duration_ms", duration_ms)
+                span.set_attribute("tool.result_preview", _result_preview(result))
                 span.set_status(Status(StatusCode.OK))
                 logger.debug("[telemetry] tool=%s duration=%.1fms", name, duration_ms)
                 return result

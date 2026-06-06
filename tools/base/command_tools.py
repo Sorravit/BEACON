@@ -10,6 +10,30 @@ logger = logging.getLogger(__name__)
 
 class CommandToolsMixin:
 
+    @staticmethod
+    def _looks_like_self_kill(command: str) -> bool:
+        """Block obvious commands that can kill this server process itself.
+
+        This protects against agent plans like:
+        `lsof -ti :8000 | xargs kill -9`
+        which will terminate the currently running web_app process.
+        """
+        cmd = (command or "").lower()
+        if not cmd:
+            return False
+
+        # Exact failure mode seen in production: kill whatever listens on :8000.
+        if ":8000" in cmd and "kill" in cmd:
+            return True
+
+        # Block common direct process-kill patterns targeting this app runtime.
+        kill_tokens = ("kill -9", "killall", "pkill")
+        app_tokens = ("web_app.py", "uvicorn", "python web_app.py")
+        if any(k in cmd for k in kill_tokens) and any(a in cmd for a in app_tokens):
+            return True
+
+        return False
+
     async def _execute_command(self, command: str):
         # Enrich the active OTel span with the actual command
         span = trace.get_current_span()
@@ -17,6 +41,21 @@ class CommandToolsMixin:
             span.set_attribute("tool.command", command[:2000])
         except Exception:
             pass
+
+        if os.getenv("ALLOW_SELF_KILL_COMMANDS", "0") != "1" and self._looks_like_self_kill(command):
+            msg = (
+                "Blocked potentially self-terminating command. "
+                "This command appears to kill the running app process "
+                "(for example by killing PID(s) on port 8000)."
+            )
+            try:
+                span.set_attribute("tool.blocked", True)
+                span.set_attribute("tool.block_reason", "self_kill_guard")
+            except Exception:
+                pass
+            logger.warning("Command blocked by self-kill guard: %s", command)
+            return f"Error: {msg}"
+
         try:
             result = subprocess.run(
                 command, shell=True, capture_output=True, text=True, timeout=30
@@ -50,6 +89,20 @@ class CommandToolsMixin:
             span.set_attribute("tool.command", command[:2000])
         except Exception:
             pass
+
+        if os.getenv("ALLOW_SELF_KILL_COMMANDS", "0") != "1" and self._looks_like_self_kill(command):
+            msg = (
+                "Blocked potentially self-terminating long command. "
+                "This command appears to kill the running app process."
+            )
+            try:
+                span.set_attribute("tool.blocked", True)
+                span.set_attribute("tool.block_reason", "self_kill_guard")
+            except Exception:
+                pass
+            logger.warning("Long command blocked by self-kill guard: %s", command)
+            return f"Error: {msg}"
+
         try:
             timeout_val = int(os.getenv("LONG_COMMAND_TIMEOUT", "7200"))
             effective_timeout = timeout_val if timeout_val > 0 else None

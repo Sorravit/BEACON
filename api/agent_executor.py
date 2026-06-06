@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 Agent Executor - Research -> Plan -> Act -> Verify loop.
@@ -6,6 +5,8 @@ Agent Executor - Research -> Plan -> Act -> Verify loop.
 Every task goes through four phases:
   1. RESEARCH  - understand requirements, gather context via tools/search
   2. PLAN      - break the task into numbered, tool-mapped steps
+               ↳ If the plan contains a genuine clarifying question, emit
+                 task_question and PAUSE until the user replies.
   3. ACT       - execute each step using tools (error-detection + auto-fix)
   4. VERIFY    - check output meets requirements; re-plan/re-act if not
 
@@ -29,6 +30,7 @@ class TaskStatus(Enum):
     PENDING = "pending"
     RESEARCHING = "researching"
     PLANNING = "planning"
+    WAITING_FOR_ANSWER = "waiting_for_answer"
     EXECUTING = "executing"
     VERIFYING = "verifying"
     COMPLETED = "completed"
@@ -73,6 +75,10 @@ class AgentExecutor:
 
     Phase 1 RESEARCH : gather context and requirements via tools/web search
     Phase 2 PLAN     : produce a numbered, tool-mapped execution plan
+                       If the plan detects a genuine ambiguity, emit task_question,
+                       pause execution, and wait for the user's answer before
+                       continuing.  The answer is injected into the task context
+                       so subsequent phases are aware of it.
     Phase 3 ACT      : execute every step with error-detection and auto-fix
     Phase 4 VERIFY   : check output satisfies requirements; loop if not
     """
@@ -86,7 +92,7 @@ class AgentExecutor:
             max_steps: Maximum plan steps per task
             max_retries: Maximum retries per individual step
             max_verify_retries: How many times to re-plan if verification fails
-            step_callback: Callable(event: str, data: dict) for SSE events
+            step_callback: Callable(event: str,  dict) for SSE events
             session_conversation: Chat history so Task Mode is aware of prior
                 design decisions / requirements discussed in regular chat.
         """
@@ -98,6 +104,12 @@ class AgentExecutor:
         self.current_task: Optional[Task] = None
         self.step_callback = step_callback
         self.session_conversation = session_conversation
+
+        # ── Interactive Q&A state ────────────────────────────────────────────
+        # Maps task_id → asyncio.Event that is set when the user submits an answer.
+        self._answer_events: Dict[str, asyncio.Event] = {}
+        # Maps task_id → the answer string provided by the user.
+        self._answers: Dict[str, str] = {}
 
     # -------------------------------------------------------------------------
     # SSE helpers
@@ -113,6 +125,60 @@ class AgentExecutor:
     def _base_conv(self) -> Optional[List[Dict]]:
         """Return a fresh copy of session conversation as AI context base."""
         return list(self.session_conversation) if self.session_conversation else None
+
+    # -------------------------------------------------------------------------
+    # Interactive Q&A helpers
+    # -------------------------------------------------------------------------
+
+    def submit_answer(self, task_id: str, answer: str) -> bool:
+        """
+        Called by the web layer when the user submits an answer to a question.
+        Stores the answer and signals the waiting coroutine to continue.
+
+        Returns True if the task was paused and is now resumed, False otherwise.
+        """
+        event = self._answer_events.get(task_id)
+        if event is None:
+            logger.warning("[Task %s] submit_answer called but no pending question", task_id)
+            return False
+        self._answers[task_id] = answer
+        event.set()
+        logger.info("[Task %s] Answer received: %s", task_id, answer[:80])
+        return True
+
+    async def _ask_question(self, task: Task, question: str,
+                             timeout: float = 300.0) -> Optional[str]:
+        """
+        Emit a task_question event, pause execution, and wait for the user's
+        answer (or timeout after `timeout` seconds).
+
+        Returns the answer string, or None on timeout.
+        """
+        task_id = task.task_id
+
+        # Create a fresh event for this question
+        ev = asyncio.Event()
+        self._answer_events[task_id] = ev
+        self._answers.pop(task_id, None)
+
+        # Pause the task status
+        task.status = TaskStatus.WAITING_FOR_ANSWER
+        self._emit("task_question", {
+            "task_id": task_id,
+            "question": question,
+        })
+        logger.info("[Task %s] Waiting for answer to: %s", task_id, question)
+
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("[Task %s] Question timed out after %.0fs", task_id, timeout)
+            self._answer_events.pop(task_id, None)
+            return None
+
+        answer = self._answers.pop(task_id, None)
+        self._answer_events.pop(task_id, None)
+        return answer
 
     # -------------------------------------------------------------------------
     # Main entry point
@@ -167,6 +233,32 @@ class AgentExecutor:
                 })
                 task.steps = []
                 await self._phase_plan(task, is_retry=is_retry)
+
+                # ── Interactive Q&A: ask any clarifying questions before ACT ─
+                # The plan phase may have stored questions in task.metadata["questions"].
+                # Ask them one at a time and inject answers back into context.
+                questions = task.metadata.pop("questions", [])
+                if questions and not is_retry:
+                    for q in questions:
+                        answer = await self._ask_question(task, q)
+                        if answer:
+                            # Resume signal: update status back to planning
+                            task.status = TaskStatus.PLANNING
+                            self._emit("task_planning", {
+                                "task_id": task_id,
+                                "message": "Got your answer — updating plan...",
+                            })
+                            # Inject Q&A into task description so ACT/VERIFY are aware
+                            qa_note = f"\n\n[Clarification] Q: {q}\nA: {answer}"
+                            task.metadata.setdefault("clarifications", "")
+                            task.metadata["clarifications"] += qa_note
+                            # Re-plan with the new information
+                            task.steps = []
+                            await self._phase_plan(task, is_retry=False,
+                                                   extra_context=qa_note)
+                        else:
+                            logger.info("[Task %s] No answer received, continuing without clarification", task_id)
+
                 self._emit("task_planned", {
                     "task_id": task_id,
                     "steps": [{"step_id": s.step_id, "description": s.description}
@@ -306,8 +398,22 @@ class AgentExecutor:
 
     # ---- Phase 2: PLAN ------------------------------------------------------
 
-    async def _phase_plan(self, task: Task, is_retry: bool = False):
-        """Produce a numbered, tool-mapped execution plan."""
+    async def _phase_plan(self, task: Task, is_retry: bool = False,
+                          extra_context: str = ""):
+        """
+        Produce a numbered, tool-mapped execution plan.
+
+        The LLM is also asked to surface any single genuine clarifying question
+        that only the user can answer.  If it has one, it goes into
+        task.metadata["questions"] and execute_task() will pause to ask it
+        before entering the ACT phase.
+
+        RULES for questions:
+          - Ask ONLY if truly ambiguous (e.g. "staging or production?")
+          - NEVER ask for permission ("should I list the files?")
+          - NEVER ask something the agent can discover itself with tools
+          - If nothing is ambiguous, return an empty questions list
+        """
         try:
             tool_names = ", ".join([t["function"]["name"] for t in self.ai_agent.tools.tools])
         except Exception:
@@ -317,14 +423,32 @@ class AgentExecutor:
         if is_retry and task.metadata.get("verify_feedback"):
             fb = "\nPrevious verification FAILED:\n" + task.metadata["verify_feedback"] + "\nFix this.\n"
 
+        clarifications = task.metadata.get("clarifications", "")
+        clarification_block = (
+            "\n\nClarifications already provided by the user:\n" + clarifications
+            if clarifications else ""
+        )
+
         prompt = (
             "You are an autonomous agent in the PLANNING phase.\n"
             "Task: " + task.description + "\n"
             "Research findings: " + (task.research_summary or "None") + "\n"
-            + fb +
-            "Available tools: " + tool_names + "\n\n"
-            "Create a concrete step-by-step plan. Each step must be independently executable.\n"
-            'Respond ONLY with JSON: {"steps": [{"description": "...", "tool": "tool_name or null", "args": {"k": "v"}}]}'
+            + fb
+            + clarification_block
+            + ("\nAdditional context: " + extra_context if extra_context else "")
+            + "\nAvailable tools: " + tool_names + "\n\n"
+            "Create a concrete step-by-step plan. Each step must be independently executable.\n\n"
+            "QUESTION RULES — read carefully:\n"
+            "- You MAY ask ONE clarifying question if something is GENUINELY ambiguous and ONLY the user knows the answer.\n"
+            "  Good examples: 'Deploy to staging or production?', 'Which branch should I target?'\n"
+            "- You MUST NOT ask for permission: 'Should I list files?' → NO. Just list them.\n"
+            "- You MUST NOT ask things you can discover with tools (file contents, status, etc.)\n"
+            "- If nothing is ambiguous, return an empty questions list.\n\n"
+            'Respond ONLY with JSON:\n'
+            '{\n'
+            '  "steps": [{"description": "...", "tool": "tool_name or null", "args": {"k": "v"}}],\n'
+            '  "questions": ["single clarifying question if truly needed, else empty array"]\n'
+            '}'
         )
         messages = [
             {"role": "system", "content": (
@@ -353,6 +477,25 @@ class AgentExecutor:
                     tool_args=s.get("args"),
                 ))
             logger.info("[Task %s] Plan: %d steps", task.task_id, len(task.steps))
+
+            # Store any clarifying questions for execute_task() to ask
+            raw_questions = plan.get("questions", [])
+            # Filter out blanks and permission-seeking questions
+            _permission_words = (
+                "should i", "do you want", "can i", "would you like",
+                "shall i", "is it ok", "may i", "do you need"
+            )
+            filtered = [
+                q.strip() for q in raw_questions
+                if q.strip() and not any(p in q.lower() for p in _permission_words)
+            ]
+            if filtered:
+                task.metadata["questions"] = filtered
+                logger.info("[Task %s] Plan has %d question(s): %s",
+                            task.task_id, len(filtered), filtered)
+            else:
+                task.metadata.pop("questions", None)
+
         except Exception as e:
             logger.error("[Task %s] Plan parse error: %s", task.task_id, e)
             task.steps.append(TaskStep(step_id=1, description=task.description))
@@ -376,12 +519,15 @@ class AgentExecutor:
                             step.result = safe_encode_string(str(result)) if result else None
                         else:
                             conv = self._base_conv()
-                            raw = await self.ai_agent.get_response(
+                            # Inject any user clarifications into the step prompt
+                            clarifications = task.metadata.get("clarifications", "")
+                            step_prompt = (
                                 "Execute this step: " + step.description + "\n"
                                 "Context: step " + str(step.step_id) + " of task: " + task.description + "\n"
-                                "Use the appropriate tool.",
-                                conversation=conv,
+                                + ("User clarifications: " + clarifications + "\n" if clarifications else "")
+                                + "Use the appropriate tool."
                             )
+                            raw = await self.ai_agent.get_response(step_prompt, conversation=conv)
                             step.result = safe_encode_string(raw) if raw else None
 
                         has_err, err_msg = self._quick_error_check(step.result)
@@ -493,6 +639,7 @@ class AgentExecutor:
             "started_at": task.started_at.isoformat() if task.started_at else None,
             "completed_at": task.completed_at.isoformat() if task.completed_at else None,
             "result": task.result, "error": task.error,
+            "waiting_for_answer": task.status == TaskStatus.WAITING_FOR_ANSWER,
         }
 
     def list_tasks(self):
@@ -502,6 +649,3 @@ class AgentExecutor:
              "created_at": t.created_at.isoformat()}
             for t in self.tasks.values()
         ]
-
-
-

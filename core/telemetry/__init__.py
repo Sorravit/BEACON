@@ -1,28 +1,27 @@
-"""BEACON Telemetry Package — OpenTelemetry SDK bootstrap + helpers.
+"""Telemetry package for the BEACON AI agent.
 
-Public surface
---------------
-    from core.telemetry import init_tracer, get_tracer, shutdown
-    from core.telemetry import record_tool_call, record_llm_call, SessionReporter
-    from core.telemetry import start_session_span, end_session_span
-    from core.telemetry import get_session_span, get_session_context
-    from core.telemetry import session_span_context
-    from core.telemetry import set_session_context, clear_session_context
-    from core.telemetry import get_session_id, get_reporter
+Public API (imported across the app and the test-suite):
 
-Environment variables (all optional)
--------------------------------------
-    OTEL_SERVICE_NAME          : string  (default: beacon-agent)
-    OTEL_SERVICE_VERSION       : string  (default: 4.2.0)
-    OTEL_EXPORTER_OTLP_ENDPOINT: http://host:port  (default: http://localhost:4317)
-    BEACON_OTEL_HTTP_ENDPOINT  : http://host:port  (second exporter, optional)
-    BEACON_OTEL_CONSOLE        : true|false  (default: false)
-    BEACON_ENV                 : string  (default: development)
-    OTEL_ENABLED               : true|false  (default: true)
+    Pipeline setup / lifecycle
+        init_tracer, setup_telemetry, install_print_bridge, get_tracer, shutdown
+
+    Session root span
+        start_session_span, end_session_span, get_session_span,
+        get_session_context, session_span_context
+
+    Per-call spans + JSON report
+        record_tool_call, record_llm_call, record_session,
+        set_tool_result, SessionReporter
+
+    Async/thread-safe session context (ContextVars)
+        set_session_context, clear_session_context, get_session_id, get_reporter
 """
 
+# -- Tracer pipeline + session root span ----------------------------------------
 from .tracer import (
     init_tracer,
+    setup_telemetry,
+    install_print_bridge,
     get_tracer,
     shutdown,
     start_session_span,
@@ -31,8 +30,19 @@ from .tracer import (
     get_session_context,
     session_span_context,
 )
-from .metrics import record_tool_call, record_llm_call, record_session
+
+# -- Per-call span helpers ------------------------------------------------------
+from .metrics import (
+    record_tool_call,
+    record_llm_call,
+    record_session,
+    set_tool_result,
+)
+
+# -- Session reporter (per-session JSON summary) --------------------------------
 from .session_reporter import SessionReporter
+
+# -- ContextVars carrying the active session id + reporter ----------------------
 from .context import (
     set_session_context,
     clear_session_context,
@@ -41,23 +51,25 @@ from .context import (
 )
 
 __all__ = [
-    # TracerProvider lifecycle
+    # tracer pipeline
     "init_tracer",
+    "setup_telemetry",
+    "install_print_bridge",
     "get_tracer",
     "shutdown",
-    # Session-root span API
+    # session root span
     "start_session_span",
     "end_session_span",
     "get_session_span",
     "get_session_context",
     "session_span_context",
-    # Metric context-managers
+    # per-call spans
     "record_tool_call",
     "record_llm_call",
     "record_session",
-    # Per-session structured reporter
+    "set_tool_result",
     "SessionReporter",
-    # ContextVar helpers (no explicit param threading)
+    # session context vars
     "set_session_context",
     "clear_session_context",
     "get_session_id",

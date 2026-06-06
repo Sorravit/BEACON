@@ -1,2 +1,2 @@
-"""Utility modules for ClineSandbox."""
+"""Utility modules for beacon."""
 

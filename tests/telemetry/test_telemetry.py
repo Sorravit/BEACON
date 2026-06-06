@@ -13,7 +13,7 @@ Tests verify ALL acceptance criteria:
   AC7 – documentation file present
 
 Run:
-    cd /Users/sorravit/sandbox/ClineSandbox
+    cd /Users/sorravit/sandbox/beacon
     python -m pytest tests/telemetry/ -v
 """
 from __future__ import annotations

@@ -13,6 +13,7 @@ import logging.handlers
 import os
 import sys
 import warnings
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -41,13 +42,15 @@ from tools.manager import ToolManager
 
 # ── Telemetry ─────────────────────────────────────────────────────────────────
 try:
-    from core.telemetry import record_llm_call
+    from core.telemetry import record_llm_call, setup_telemetry, install_print_bridge
     from core.telemetry.context import get_session_id, get_reporter
     _TELEMETRY_AVAILABLE = True
 except ImportError:
     _TELEMETRY_AVAILABLE = False
     def get_session_id(): return None  # type: ignore
     def get_reporter(): return None    # type: ignore
+    def setup_telemetry(*a, **kw): pass  # type: ignore
+    def install_print_bridge(*a, **kw): pass  # type: ignore
 
 
 # ============================================================================
@@ -187,6 +190,7 @@ class AIAgent:
         self.skill_manager: Optional[SkillManager] = None
         self._shared_browser = None  # shared Playwright browser process
         self._playwright = None
+        self._last_dispatched_skill: str = ""  # set when skill dispatch fires (Path-1)
 
     async def _get_shared_browser(self):
         """Lazily create ONE shared Chromium process for all per-request ToolManagers.
@@ -381,7 +385,7 @@ class AIAgent:
                 temperature=0,
                 max_tokens=100
             )
-            with (record_llm_call(self.config.model, session_id=get_session_id()) if _TELEMETRY_AVAILABLE else __import__('contextlib').nullcontext()):
+            with (record_llm_call(self.config.model, session_id=get_session_id()) if _TELEMETRY_AVAILABLE else nullcontext()):
                 extraction_response = await _loop.run_in_executor(
                     None, lambda: self.client.chat.completions.create(**_extract_params)
                 )
@@ -455,7 +459,7 @@ If nothing meaningful to extract, respond with: []
 
 JSON:"""
 
-            with (record_llm_call(self.config.model, session_id=get_session_id()) if _TELEMETRY_AVAILABLE else __import__('contextlib').nullcontext()):
+            with (record_llm_call(self.config.model, session_id=get_session_id()) if _TELEMETRY_AVAILABLE else nullcontext()):
                 result = await asyncio.get_running_loop().run_in_executor(
                     None,
                     lambda: self.client.chat.completions.create(
@@ -494,6 +498,67 @@ JSON:"""
 
         except Exception as e:
             logger.debug(f"Auto-memory hook failed (non-critical): {e}")
+
+    _SKILL_TRIGGERS = {
+        "business_analyst":           ["act as ba", "act as business analyst", "write user stories", "write brd"],
+        "lead_qa":                    ["act as lead qa", "qa strategy", "test strategy", "test plan"],
+        "senior_qa":                  ["act as senior qa", "write test cases", "test case design"],
+        "automated_qa_cypress":       ["cypress test", "write cypress", "cypress spec"],
+        "automated_qa_robot":         ["robot framework", "write robot", "robot test"],
+        "senior_java_engineer":       ["act as java engineer", "write spring boot", "java service"],
+        "senior_python_engineer":     ["act as python engineer", "write fastapi", "fastapi service"],
+        "senior_javascript_engineer": ["act as javascript engineer", "typescript service"],
+        "frontend_engineer":          ["act as frontend engineer", "write react component"],
+        "backend_engineer":           ["act as backend engineer", "write api spec", "openapi spec"],
+        "devops_engineer":            ["act as devops", "write gitlab ci", "kubernetes yaml", "write dockerfile"],
+        "security_engineer":          ["act as security engineer", "threat model", "security review"],
+        "solution_architect":         ["act as architect", "solution architect", "write adr"],
+        "researcher":                 ["act as researcher", "do research on", "research report on"],
+        "reviewer":                   ["act as reviewer", "review this code", "code review"],
+        "financial_analyst":          ["act as financial analyst", "npv analysis", "roi analysis"],
+        "stock_market_analyst":       ["act as stock analyst", "stock analysis", "analyse stock"],
+    }
+
+    async def _maybe_dispatch_skill(self, user_input: str):
+        lower = user_input.lower()
+        matched = None
+        for skill_id, triggers in self._SKILL_TRIGGERS.items():
+            if any(t in lower for t in triggers):
+                matched = skill_id
+                break
+        if not matched:
+            return None
+        try:
+            import importlib.util as ilu
+            base = os.path.dirname(os.path.abspath(__file__))
+            agent_path = os.path.join(base, "skills", matched, "agent.py")
+            if not os.path.exists(agent_path):
+                return None
+            spec = ilu.spec_from_file_location("skills." + matched, agent_path)
+            mod = ilu.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            cls = None
+            for name in dir(mod):
+                obj = getattr(mod, name)
+                if isinstance(obj, type) and hasattr(obj, "execute") and name not in ("BaseSkillAgent", "object"):
+                    cls = obj
+                    break
+            if not cls:
+                return None
+            inst = cls()
+            result = inst.execute({"user_request": user_input, "context": ""})
+            header = "\n\U0001f916 **[" + matched.replace("_", " ").title() + " Agent]**\n\n"
+            if isinstance(result, dict):
+                out = result.get("output") or result.get("result") or result.get("content") or str(result)
+            else:
+                out = str(result)
+            logger.info("Skill dispatched: " + matched)
+            self._last_dispatched_skill = matched  # signal for web_app skill indicator
+            return header + out
+        except Exception as e:
+            logger.warning("Skill dispatch failed: " + str(e))
+            return None
+
 
     def _build_tools_prompt(self) -> str:
         """Build system prompt with tool descriptions"""
@@ -670,11 +735,35 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
         # description, and strip it back to the base system content for subsequent
         # iterations.
         _base_system_content = conv[0]["content"] if conv and conv[0]["role"] == "system" else ""
+        # MEMORY-FIRST: prepend local path rules so BEACON checks local files before GitLab
+        _local_rules = (
+            "\nCRITICAL - MEMORY-FIRST LOCAL PATH RULES (before every tool call):\n"
+            "1. For KRS/project code READ LOCAL FILES FIRST. Never open GitLab unless asked.\n"
+            "   krs-service    : /Users/sorravit/IdeaProjects/KRS/krs-service\n"
+            "   krs-sftp-batch : /Users/sorravit/IdeaProjects/KRS/krs-sftp-batch\n"
+            "   BEACON         : /Users/sorravit/sandbox/beacon\n"
+            "2. Use execute_command or read_file with the local path above.\n"
+            "3. Only open URL/browser when explicitly asked OR local path missing.\n"
+        )
+        _base_system_content = _base_system_content + _local_rules
+
         _tools_prompt = self._build_tools_prompt() if self.tools_available else ""
 
         try:
             # (tools prompt is applied per-iteration below, not permanently here)
             pass
+
+            # SKILL DISPATCH: route to specialist agent before LLM loop
+            self._last_dispatched_skill = ""  # reset before each request
+            _skill_out = await self._maybe_dispatch_skill(user_input)
+            if _skill_out is not None:
+                if token_callback:
+                    for _ch in _skill_out:
+                        try: token_callback(_ch)
+                        except Exception: pass
+                conv.append({"role": "assistant", "content": _skill_out})
+                return _skill_out
+            # END SKILL DISPATCH
 
             # --- Vector memory: detect and store personal facts from user input ---
             if self.memory_available and self.vector_memory:
@@ -719,42 +808,51 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                 # NO tools parameter - use prompt-based approach instead
                 
                 _loop = asyncio.get_running_loop()
+
+                # One OTel span per LLM request — records the model + request
+                # parameters now; token counts are filled in once we have a
+                # response. Falls back to a no-op when telemetry is disabled.
+                llm_span_cm = (
+                    record_llm_call(
+                        effective_model,
+                        session_id=get_session_id(),
+                        temperature=self.config.temperature,
+                        max_tokens=self.config.max_tokens,
+                        message_count=len(conv),
+                        streaming=bool(token_callback),
+                    )
+                    if _TELEMETRY_AVAILABLE
+                    else nullcontext()
+                )
+
                 if token_callback:
-                    # STREAMING MODE — entire chunk iteration runs in executor thread
-                    # so the async event loop stays free to flush SSE tokens to the
-                    # browser in real time. This fixes the UI freeze / step-112 lockup
-                    # where tokens were generated but the browser never received them
-                    # because the sync for-loop was blocking the event loop.
+                    # STREAMING MODE — the blocking SDK iteration runs in a worker
+                    # thread and pushes tokens onto a queue; the event loop drains
+                    # the queue so SSE tokens flush to the browser in real time.
+                    # This avoids the UI freeze where a sync for-loop blocked the
+                    # event loop and tokens never reached the browser.
                     import queue as _queue
-                    _token_q: _queue.Queue = _queue.Queue()
-                    stream_params = {**params, 'stream': True}
+                    token_q: "_queue.Queue" = _queue.Queue()
+                    stream_params = {**params, "stream": True}
 
-                    _llm_sid = get_session_id()
-                    _llm_rep = get_reporter()
-                    _llm_span_ctx = record_llm_call(effective_model, session_id=_llm_sid) if _TELEMETRY_AVAILABLE else None
-                    _llm_span = _llm_span_ctx.__enter__() if _llm_span_ctx else None
-                    _llm_t0 = __import__('time').perf_counter()
-                    try:
-                        def _stream_in_thread():
-                            try:
-                                stream = self.client.chat.completions.create(**stream_params)
-                                for chunk in stream:
-                                    delta = chunk.choices[0].delta.content if chunk.choices else None
-                                    if delta:
-                                        _token_q.put(delta)
-                            except Exception as _e:
-                                _token_q.put(_e)
-                            finally:
-                                _token_q.put(None)  # sentinel — stream finished
+                    def _stream_in_thread():
+                        try:
+                            stream = self.client.chat.completions.create(**stream_params)
+                            for chunk in stream:
+                                delta = chunk.choices[0].delta.content if chunk.choices else None
+                                if delta:
+                                    token_q.put(delta)
+                        except Exception as exc:
+                            token_q.put(exc)
+                        finally:
+                            token_q.put(None)  # sentinel — stream finished
 
-                        # Launch blocking stream iteration in thread pool
-                        _stream_future = _loop.run_in_executor(None, _stream_in_thread)
-
-                        response_text = ''
+                    with llm_span_cm as llm_span:
+                        stream_future = _loop.run_in_executor(None, _stream_in_thread)
+                        response_text = ""
                         while True:
-                            # Poll queue; yield to event loop between polls so SSE can flush
                             try:
-                                item = _token_q.get_nowait()
+                                item = token_q.get_nowait()
                             except _queue.Empty:
                                 await asyncio.sleep(0)  # yield → event loop flushes SSE
                                 continue
@@ -762,30 +860,28 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                                 break  # sentinel: stream done
                             if isinstance(item, Exception):
                                 raise item
+                            # Buffer tokens until we know this is the final answer
+                            # (no tool calls); replayed to the UI further below.
                             response_text += item
-                            # Do NOT emit tokens yet — buffer until we know this is
-                            # the final response (no tool calls). Replayed below.
 
-                        await _stream_future  # ensure thread is fully joined
-                        if _llm_span_ctx and _llm_span:
-                            _llm_span_ctx.__exit__(None, None, None)
-                    except Exception as _llm_exc:
-                        if _llm_span_ctx and _llm_span:
-                            import sys as _sys2
-                            _llm_span_ctx.__exit__(type(_llm_exc), _llm_exc, _llm_exc.__traceback__)
-                        raise
+                        await stream_future  # ensure the worker thread is joined
+                        if llm_span is not None:
+                            llm_span.set_attribute("llm.response_chars", len(response_text))
+                            llm_span.set_attribute(
+                                "llm.output_tokens", self._estimate_tokens(response_text)
+                            )
                 else:
-                    # NON-STREAMING MODE: CLI / planning / background tasks
-                    _ns_sid = get_session_id()
-                    with (record_llm_call(effective_model, session_id=_ns_sid) if _TELEMETRY_AVAILABLE else __import__('contextlib').nullcontext()) as _ns_span:
+                    # NON-STREAMING MODE: CLI / planning / background tasks.
+                    with llm_span_cm as llm_span:
                         response = await _loop.run_in_executor(
                             None, lambda: self.client.chat.completions.create(**params)
                         )
                         response_text = response.choices[0].message.content
-                        if _ns_span and hasattr(response, 'usage') and response.usage:
+                        usage = getattr(response, "usage", None)
+                        if llm_span is not None and usage:
                             try:
-                                _ns_span.set_attribute('llm.input_tokens', response.usage.prompt_tokens or 0)
-                                _ns_span.set_attribute('llm.output_tokens', response.usage.completion_tokens or 0)
+                                llm_span.set_attribute("llm.input_tokens", usage.prompt_tokens or 0)
+                                llm_span.set_attribute("llm.output_tokens", usage.completion_tokens or 0)
                             except Exception:
                                 pass
                 
@@ -1169,7 +1265,16 @@ async def main():
         if not config.validate():
             print("❌ API key not configured\nSet OPENAI_API_KEY in .env or environment")
             return 1
-        
+
+        # ── Boot telemetry BEFORE agent starts so every log/span is captured ──
+        if _TELEMETRY_AVAILABLE:
+            try:
+                setup_telemetry(service_name="beacon")
+                install_print_bridge()
+                logger.info("🔭 Telemetry initialised (OTLP → localhost:14318)")
+            except Exception as _tel_err:
+                logger.warning("Telemetry init failed (non-fatal): %s", _tel_err)
+
         agent = AIAgent(config)
         if not await agent.initialize():
             print("❌ Failed to initialize")

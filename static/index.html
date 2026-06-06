@@ -5,6 +5,32 @@
 <meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover,interactive-widget=resizes-content"/>
 <title>Big's Personal AI Assistant</title>
 <link rel="stylesheet" href="/static/style.css"/>
+<style>
+/* ── Skill badge ─────────── */
+.skill-badge {
+  font-size: 11px;
+  font-weight: 600;
+  color: #7ec8e3;
+  margin-top: 3px;
+  padding: 1px 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  animation: skillFadeIn 0.3s ease;
+}
+.skill-badge-name {
+  background: linear-gradient(135deg,#1e3a5f,#2d1b69);
+  border: 1px solid #4a90d9;
+  color: #a8d8ea;
+  font-weight: 700;
+  padding: 1px 8px;
+  border-radius: 10px;
+}
+@keyframes skillFadeIn {
+  from{opacity:0;transform:translateY(-2px)}
+  to{opacity:1;transform:translateY(0)}
+}
+</style>
 </head>
 <body>
 <div class="layout">
@@ -40,7 +66,6 @@
         </div>
       </div>
       <div class="header-right">
-        <select class="model-select" id="model-picker" title="Model for this chat"></select>
         <button class="btn-icon stop-btn" id="stop-btn" onclick="stopAI()" title="Stop AI" style="display:none">
           <span class="btn-label">⏹ Stop</span><span class="btn-icon-only">⏹</span>
         </button>
@@ -143,4 +168,3 @@
 <script src="/static/app.js"></script>
 </body>
 </html>
-

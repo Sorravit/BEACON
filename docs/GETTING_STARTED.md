@@ -3,7 +3,7 @@
 ## Installation
 
 ```bash
-cd /Users/sorravit/sandbox/ClineSandbox
+cd /Users/sorravit/sandbox/beacon
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt

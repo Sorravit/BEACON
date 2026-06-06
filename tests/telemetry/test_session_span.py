@@ -14,7 +14,7 @@ collector is required, and they reset the tracer singleton + session
 registry between every test case.
 
 Run:
-    cd /Users/sorravit/sandbox/ClineSandbox
+    cd /Users/sorravit/sandbox/beacon
     python -m pytest tests/telemetry/test_session_span.py -v
 """
 from __future__ import annotations

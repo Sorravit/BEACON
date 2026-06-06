@@ -1,4 +1,9 @@
+# Beacon Docker Compose (step-8 network fix)
+# beacon-grafana joins krs-service_default so tempo and loki DNS
+# aliases resolve directly to KRS containers.
+
 services:
+
   weaviate:
     image: cr.weaviate.io/semitechnologies/weaviate:1.27.0
     container_name: weaviate
@@ -13,7 +18,7 @@ services:
       ENABLE_MODULES: ""
       CLUSTER_HOSTNAME: "node1"
     volumes:
-      - weaviate_data:/var/lib/weaviate
+      - weaviate_/var/lib/weaviate
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/v1/.well-known/ready"]
@@ -21,6 +26,33 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+    networks:
+      - beacon_default
+
+  grafana:
+    image: grafana/grafana:12.0.2
+    container_name: beacon-grafana
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./grafana-provisioning:/etc/grafana/provisioning
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+      - GF_NEWS_NEWS_FEED_ENABLED=false
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+    networks:
+      - beacon_default
+      - krs-service_default
+    restart: unless-stopped
+
+networks:
+  beacon_default:
+    driver: bridge
+  krs-service_default:
+    external: true
+    name: krs-service_default
 
 volumes:
-  weaviate_data:
+  weaviate_

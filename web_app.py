@@ -23,6 +23,7 @@ import subprocess
 import sys
 import warnings
 import uuid
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -91,16 +92,31 @@ from pydantic import BaseModel, Field
 
 from main import AIAgent, Config
 
+# Load .env BEFORE telemetry import so OTEL_EXPORTER_OTLP_ENDPOINT is set
+from dotenv import load_dotenv as _load_dotenv
+_load_dotenv(dotenv_path='/Users/sorravit/sandbox/beacon/.env', override=True)
+
 try:
-    from core.telemetry import init_tracer as _init_tracer, shutdown as _shutdown_tracer
+    from core.telemetry import init_tracer as _init_tracer, shutdown as _shutdown_tracer, get_tracer
     from core.telemetry import session_span_context, record_llm_call
     from core.telemetry import SessionReporter
     from core.telemetry.context import set_session_context, clear_session_context
+    from core.telemetry.tracer import install_print_bridge
     _TELEMETRY_AVAILABLE = True
 except ImportError:
     def _init_tracer(): pass
     def _shutdown_tracer(): pass
+    def get_tracer(*args, **kwargs): return None
+    def install_print_bridge(): pass
     _TELEMETRY_AVAILABLE = False
+
+# Bootstrap OTel immediately after .env is loaded
+if _TELEMETRY_AVAILABLE:
+    _init_tracer()
+    install_print_bridge()
+
+# Tool-call spans use this tracer when telemetry is enabled.
+tracer = get_tracer("beacon.web") if _TELEMETRY_AVAILABLE else None
 
 logger = logging.getLogger(__name__)
 
@@ -130,9 +146,8 @@ async def lifespan(app: FastAPI):
         _rotate_log_if_needed(lf)
     _rotate_bg_logs()
 
-    # FIX: Init OTel tracer so spans are exported
-    _init_tracer()
-    logger.info("OTel tracer initialised")
+    # OTel tracer already initialised at module load (top-level).
+    logger.info("OTel tracer active ✓  (lifespan startup complete)")
 
     yield  # App runs here
 
@@ -157,6 +172,21 @@ async def lifespan(app: FastAPI):
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 app = FastAPI(title="Big's Personal AI Assistant", version="4.5.0", lifespan=lifespan)
+
+# Instrument FastAPI for automatic HTTP span creation
+if _TELEMETRY_AVAILABLE:
+    try:
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+        # Exclude long-lived SSE / polling endpoints: their HTTP spans are
+        # open for the entire stream and add noise without useful detail. The
+        # meaningful work is captured by the per-turn `session` trace instead.
+        FastAPIInstrumentor().instrument_app(
+            app,
+            excluded_urls="events,chat/reconnect,chat/status,tasks/stream,tasks/notifications,health",
+        )
+        import logging as _l; _l.getLogger(__name__).info("FastAPIInstrumentor active")
+    except Exception as _e:
+        import logging as _l; _l.getLogger(__name__).warning("FastAPIInstrumentor failed: %s", _e)
 
 static_dir = Path("static")
 static_dir.mkdir(exist_ok=True)
@@ -747,29 +777,44 @@ async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent, model:
         original_execute = per_request_tools.execute_tool
 
         async def instrumented_execute(name, args):
+            # The canonical OTel span (tool/<name> with parameters, duration and
+            # result) is created inside ToolManager.execute_tool. Here we only
+            # add the SSE activity events and the per-session JSON bookkeeping —
+            # no extra span, so each tool call shows up exactly once in a trace.
             args_preview = ", ".join(
                 f"{k}={str(v)}" for k, v in args.items()
             ) if args else ""
             bg["activity"] = f"{name}({args_preview})"
             _emit({"type": "tool", "name": name, "args": args_preview})
-            # OTel child span per tool call via SessionReporter
-            if _reporter:
-                _tc = _reporter.track_tool(name)
-                _tc.__enter__()
-                try:
-                    result = await original_execute(name, args)
-                    _tc.__exit__(None, None, None)
-                except Exception as _te:
-                    _tc.__exit__(type(_te), _te, _te.__traceback__)
-                    raise
-            else:
+            # ── Skill indicator: tell the UI which skill is now active ──
+            if name == "load_skill":
+                _skill_name = args.get("name", "") if args else ""
+                if _skill_name:
+                    _emit({"type": "skill_active", "skill": _skill_name})
+
+            t0_tool = time.monotonic()
+            status = "ok"
+            error_text = None
+            try:
                 result = await original_execute(name, args)
-            preview = str(result)
-            if len(preview) > 400:
-                preview = preview[:400] + "…"
-            bg["activity"] = f"Processing result from {name}..."
-            _emit({"type": "result", "name": name, "content": preview})
-            return result
+                return result
+            except Exception as exc:
+                status = "error"
+                error_text = str(exc)[:300]
+                raise
+            finally:
+                duration_ms = (time.monotonic() - t0_tool) * 1000
+                if _reporter:
+                    _reporter.add_tool_call(
+                        name, duration_ms, status=status,
+                        error=error_text, parameters=args,
+                    )
+                if status == "ok":
+                    preview = str(result)
+                    if len(preview) > 400:
+                        preview = preview[:400] + "…"
+                    bg["activity"] = f"Processing result from {name}..."
+                    _emit({"type": "result", "name": name, "content": preview})
         per_request_tools.execute_tool = instrumented_execute
 
         bg["activity"] = "Thinking..."
@@ -777,6 +822,17 @@ async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent, model:
             def _token_cb(token: str):
                 _emit({"type": "token", "content": token})
             response = await agent.get_response(user_input, conversation=conversation, tools=per_request_tools, token_callback=_token_cb, model=model)
+            # ── Skill indicator Path-1: agent.py keyword dispatch ──
+            _dispatched = getattr(agent, "_last_dispatched_skill", "")
+            if _dispatched:
+                _emit({"type": "skill_active", "skill": _dispatched})
+            # ── Skill indicator: detect Path-1 agent.py dispatch (keyword match) ──
+            if response and response.lstrip().startswith("\n\U0001f916") or (response and "**[" in response[:60] and response.lstrip().startswith("\n")):
+                import re as _re_skill
+                _m = _re_skill.search(r'\*\*\[([^\]]+)\]\*\*', response[:120])
+                if _m:
+                    _dispatched = _m.group(1).lower().replace(" agent", "").replace(" ", "_")
+                    _emit({"type": "skill_active", "skill": _dispatched})
         except Exception as api_err:
             err_msg = str(api_err)
             # Emit user-friendly error to the SSE stream
@@ -822,7 +878,7 @@ async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent, model:
         raise
     except Exception as e:
         logger.error(f"Agent BG error: {e}")
-        import traceback; traceback.print_exc()
+        logger.debug("Agent BG traceback", exc_info=True)  # OTel-instrumented
         _emit({"type": "error", "content": str(e)})
         if _sess_span_cm and _sess_otel_span:
             try:
@@ -1195,6 +1251,10 @@ class OrchestrateRequest(BaseModel):
     model_overrides: Optional[Dict[str, str]] = None
 
 
+class TaskAnswerRequest(BaseModel):
+    answer: str
+
+
 def _safe_task_text(text):
     """Remove UTF-8 surrogates so session JSON serialises cleanly."""
     if not text:
@@ -1296,6 +1356,7 @@ async def agent_submit_task(req: AgentTaskRequest):
             logger.info(f"Saved task command to session {session_id}: {req.description[:60]}")
 
     executor = _make_agent_executor(task_id, session_id=session_id)
+    _agent_tasks[task_id]["executor"] = executor  # stored so /answer can call submit_answer()
     async def _run():
         try:
             await executor.execute_task(req.description, task_id=task_id)
@@ -1376,6 +1437,34 @@ async def agent_cancel_task(task_id: str):
         at.cancel(); _agent_tasks[task_id]["done"] = True
         return {"status": "cancelled", "task_id": task_id}
     return {"status": "already_done", "task_id": task_id}
+
+
+@app.post("/agent/task/{task_id}/answer")
+async def agent_task_answer(task_id: str, req: TaskAnswerRequest):
+    """
+    Submit the user's answer to a clarifying question that the agent emitted
+    via the ``task_question`` SSE event during the PLAN phase.
+
+    The executor is paused on an asyncio.Event waiting for this call.
+    On receipt, execution resumes immediately with the answer injected into
+    the task context so subsequent phases (ACT, VERIFY) are aware of it.
+    """
+    state = _agent_tasks.get(task_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    executor = state.get("executor")
+    if executor is None:
+        raise HTTPException(status_code=409, detail="No executor attached to task")
+
+    resumed = executor.submit_answer(task_id, req.answer.strip())
+    if not resumed:
+        raise HTTPException(
+            status_code=409,
+            detail="Task is not currently waiting for an answer"
+        )
+
+    return {"status": "resumed", "task_id": task_id}
 
 
 # ── Multi-agent orchestration ─────────────────────────────────────────────────

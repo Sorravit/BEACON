@@ -144,6 +144,30 @@ class SessionReporter:
     # Tool tracking
     # ------------------------------------------------------------------
 
+    def add_tool_call(
+        self,
+        tool_name: str,
+        duration_ms: float,
+        status: str = "ok",
+        error: Optional[str] = None,
+        parameters: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Append a completed tool call to the JSON report (no OTel span).
+
+        Use this when the OTel span is already produced elsewhere (e.g. by
+        ``ToolManager.execute_tool``) and you only need the session summary.
+        """
+        self._tool_seq += 1
+        self._tool_calls.append({
+            "seq": self._tool_seq,
+            "tool_name": tool_name,
+            "started_at": _now().isoformat(),
+            "duration_ms": round(duration_ms, 2),
+            "status": status,
+            "error": error,
+            "parameters": parameters,
+        })
+
     @contextmanager
     def track_tool(
         self,
@@ -202,7 +226,7 @@ class SessionReporter:
                 yield span
                 entry["duration_ms"] = round((time.perf_counter() - t0) * 1000, 2)
                 # Caller may have set token counts on the span
-                attrs = span.attributes or {}
+                attrs = getattr(span, "attributes", None) or {}
                 entry["input_tokens"] = int(attrs.get("llm.input_tokens", 0))
                 entry["output_tokens"] = int(attrs.get("llm.output_tokens", 0))
             except Exception as exc:
