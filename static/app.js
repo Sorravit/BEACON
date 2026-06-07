@@ -1,4 +1,3 @@
-
 // AI Assistant Web UI - JavaScript (multi-session)
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
@@ -20,6 +19,11 @@ let currentSessionId = null;
 let _renameTarget    = null;
 let taskLogStreams   = {};
 let _dragInit        = false;
+// ── Task question state ───────────────────────────────────────────────────────
+let _waitingForTaskAnswer = false;    // true when agent has asked a question
+let _taskQuestionId = null;            // task_id waiting for an answer
+let _taskQuestionText = null;          // the question being asked
+let _taskQuestionProgressEl = null;    // DOM element to update with answer
 let _currentReader   = null;   // active SSE reader so we can cancel client-side too
 let _currentSessionEmpty = true; // true when current session has no messages yet
 // Selected chat model (persisted). null → let the backend use its default.
@@ -31,6 +35,8 @@ const activeTaskByConversation = new Map();
 // Module-level refs to IIFE-internal functions (populated at IIFE bootstrap)
 let _streamTaskEvents = null;    // set by IIFE once ready
 let _appendTaskProgress = null;  // set by IIFE once ready
+let _updateTaskProgress = null;  // set by IIFE once ready
+let _cancelTask = null;          // set by IIFE once ready — cancels an agent task
 // Per-session streaming check
 function isStreamingSession(sid) { return _streamingSet.has(sid); }
 
@@ -646,9 +652,18 @@ async function reconnectToSession(id) {
         else if(ev.type==='model'){answerModelLabel=ev.label||ev.content||'';addModelBadge(ab,answerModelLabel);}
         else if(ev.type==='result'){(ev.content||'').split('\n').forEach(l=>{if(l.trim())atl('   '+l,'tool-result');});if(id===currentSessionId)setStatus('thinking','Processing\u2026');}
         else if(ev.type==='token'){acc+=ev.content||'';tn.innerHTML=renderMarkdown(acc);scrollToBottom();if(id===currentSessionId)setStatus('thinking','Responding\u2026');}
-        else if(ev.type==='done'){tBo.classList.remove('open');tIc.innerHTML=steps>0?'<span style="color:var(--green);font-size:13px">\u2713</span>':'<span style="color:var(--muted);font-size:13px">\u2014</span>';tLb.textContent=steps>0?('\u2699 '+steps+' step'+(steps>1?'s':'')+' completed'):'\u2699 No tools used';tn.innerHTML=renderMarkdown(acc);if(answerModelLabel)addModelBadge(ab,answerModelLabel);scrollToBottom();refreshTasksBadge();await loadSessions();if(id===currentSessionId){const ud=await(await fetch('/sessions/'+id)).json();chatTitleEl.textContent=ud.title||'New Chat';}}
-        else if(ev.type==='stopped'){tBo.classList.remove('open');tIc.innerHTML='<span style="color:var(--yellow);font-size:13px">\u23F9</span>';tLb.textContent='\u2699 Stopped';if(acc)tn.innerHTML=renderMarkdown(acc);scrollToBottom();}
-        else if(ev.type==='error'){atl('\u26a0 '+(ev.content||'Unknown error'),'error');tBo.classList.add('open');if(id===currentSessionId)setStatus('error','Error');}
+        else if(ev.type==='done'){tBo.classList.remove('open');tIc.innerHTML=steps>0?'<span style="color:var(--green);font-size:13px">\u2713</span>':'<span style="color:var(--muted);font-size:13px">\u2014</span>';
+        tLb.textContent=steps>0?('\u2699 '+steps+' step'+(steps>1?'s':'')+' completed'):'\u2699 No tools used';
+        tn.innerHTML=renderMarkdown(acc);if(answerModelLabel)addModelBadge(ab,answerModelLabel);scrollToBottom();refreshTasksBadge();await loadSessions();
+        const ud=await(await fetch('/sessions/'+currentSessionId)).json();
+        chatTitleEl.textContent=ud.title||'New Chat';
+        flashTabTitle("✅ Big's AI replied");
+      }else if(ev.type==='stopped'){tBo.classList.remove('open');tIc.innerHTML='<span style="color:var(--yellow);font-size:13px">\u23F9</span>';
+      tLb.textContent='\u2699 Stopped by user after '+steps+' step'+(steps!==1?'s':'');
+      if(acc)tn.innerHTML=renderMarkdown(acc);
+      scrollToBottom();
+     }else if(ev.type==='error'){atl('\u26a0 '+(ev.content||'Unknown error'),'error');tBo.classList.add('open');setStatus('error','Error');
+     }
       }
     }
   } catch(err) {
@@ -734,7 +749,62 @@ async function loadModels(){
 
 async function sendMessage(){
   const text=textarea.value.trim();
+
+  // ── Answer-to-task routing takes top priority ──────────────────────────────
+  // If an agent (Task Mode or Agent Mode) paused with a clarifying question,
+  // the user's next chat message is the ANSWER. Route it to the task's /answer
+  // endpoint instead of starting a new chat or a new orchestration. This must
+  // run before any streaming/empty guards so it can never be skipped.
+  if (_waitingForTaskAnswer && _taskQuestionId) {
+    if (!text) return;
+    const taskId = _taskQuestionId;
+    textarea.value = '';
+    textarea.style.height = 'auto';
+    _attachedFiles = [];
+    renderFilePreviews();
+
+    // Show the answer in the chat as a user message.
+    const _msgNow = new Date().toISOString();
+    const ub = createMessage('user', _msgNow);
+    ub.innerHTML = renderMarkdown(text);
+
+    setStatus('thinking', 'Submitting answer\u2026');
+    sendBtn.disabled = true;
+
+    // Capture the progress card before we clear state so we can update it.
+    const _progressEl = _taskQuestionProgressEl;
+    try {
+      const resp = await fetch('/agent/task/' + taskId + '/answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ answer: text }),
+      });
+      if (!resp.ok) {
+        const errData = await resp.json().catch(() => ({}));
+        throw new Error(errData.detail || ('HTTP ' + resp.status));
+      }
+      setStatus('thinking', 'Agent resuming\u2026');
+      // Clear the waiting state now that the answer is delivered.
+      _waitingForTaskAnswer = false;
+      _taskQuestionId = null;
+      _taskQuestionText = null;
+      _taskQuestionProgressEl = null;
+      document.querySelectorAll('.question-hint').forEach(h => h.remove());
+      if (_progressEl && typeof _updateTaskProgress === 'function') {
+        _updateTaskProgress(_progressEl, '\ud83d\udccb Continuing plan\u2026', 'planning');
+      }
+    } catch (err) {
+      showToast('Error submitting answer: ' + err.message);
+      setStatus('error', 'Failed to submit answer');
+    } finally {
+      sendBtn.disabled = false;
+      setStatus('ready', 'Ready');
+    }
+    return;
+  }
+
   if((!text && _attachedFiles.length===0)||isStreamingSession(currentSessionId))return;
+
   // Auto-create a session if none is active
   if(!currentSessionId){
     try{
@@ -1267,11 +1337,9 @@ document.addEventListener('click', e => {
       document.querySelector('[data-action="send"]') ||
       document.querySelector('button[type="submit"]') ||
       document.querySelector('.send-btn') ||
-      document.querySelector('.input-area button') ||
       document.querySelector('.chat-input-row button') ||
-      document.querySelector('#input-area button') ||
-      document.querySelector('form button');
-
+      document.querySelector('.chat-input-row button:not(#agent-mode-toggle)') ||
+      document.querySelector('#input-area button:not(#agent-mode-toggle)');
     if (!sendBtn) {
       console.warn('[TaskMode] Could not find send button — retrying in 1s');
       setTimeout(injectTaskToggle, 1000);
@@ -1396,6 +1464,11 @@ document.addEventListener('click', e => {
     // Hook into the document-level keydown (Enter key) and click
     document.addEventListener('keydown', (e) => {
       if (!orchestrateModeActive) return;
+      // If the agent paused with a question, DON'T start a new orchestration —
+      // let the normal sendMessage() route the text to the waiting task's
+      // /answer endpoint. Stepping aside (no preventDefault) lets the app's own
+      // textarea keydown handler call sendMessage().
+      if (_waitingForTaskAnswer && _taskQuestionId) return;
       if (e.key !== 'Enter' || e.shiftKey) return;
       const ta =
         document.querySelector('textarea') ||
@@ -1412,6 +1485,8 @@ document.addEventListener('click', e => {
     // Also hook the send button
     document.addEventListener('click', (e) => {
       if (!orchestrateModeActive) return;
+      // Same as above — defer to sendMessage() when answering a task question.
+      if (_waitingForTaskAnswer && _taskQuestionId) return;
       const sendBtn =
         document.getElementById('send-btn') ||
         document.getElementById('sendBtn') ||
@@ -1533,6 +1608,54 @@ document.addEventListener('click', e => {
     }
   }
 
+  // ── Cancel a running agent task ───────────────────────────
+  async function cancelTask(taskId, progressEl) {
+    if (!taskId) return;
+    try {
+      const resp = await fetch('/agent/task/' + taskId + '/cancel', { method: 'POST' });
+      if (resp.ok) {
+        if (progressEl) updateProgress(progressEl, '\u23f9 Stopped by user', 'failed');
+        if (typeof showToast === 'function') showToast('Agent stopped');
+      } else {
+        if (typeof showToast === 'function') showToast('Could not stop agent');
+      }
+    } catch (err) {
+      if (typeof showToast === 'function') showToast('Stop failed: ' + err.message);
+    }
+    // Clear any pending question state — the agent is gone.
+    _waitingForTaskAnswer = false;
+    _taskQuestionId = null;
+    _taskQuestionText = null;
+    _taskQuestionProgressEl = null;
+    document.querySelectorAll('.question-hint').forEach(h => h.remove());
+    // Stop streaming if still open.
+    if (taskEventSource) { try { taskEventSource.close(); } catch (e) {} taskEventSource = null; }
+    activeTaskId = null;
+    hideStopAgentBtn(progressEl);
+    // Mark done in the per-conversation map and clean up localStorage.
+    activeTaskByConversation.forEach((rec, sid) => {
+      if (rec.taskId === taskId) {
+        rec.done = true;
+        try { localStorage.removeItem('activeTask_' + sid); } catch (e) {}
+      }
+    });
+  }
+
+  // Reveal the Stop button on a progress card and wire it to cancelTask().
+  function wireStopButton(progressEl, taskId) {
+    if (!progressEl) return;
+    const btn = progressEl.querySelector('.task-stop-agent-btn');
+    if (!btn) return;
+    btn.style.display = 'inline-block';
+    btn.onclick = () => cancelTask(taskId, progressEl);
+  }
+
+  function hideStopAgentBtn(progressEl) {
+    if (!progressEl) return;
+    const btn = progressEl.querySelector('.task-stop-agent-btn');
+    if (btn) btn.style.display = 'none';
+  }
+
   // ── Stream SSE events from /agent/task/{id}/stream ────────
   // Uses fetch()+ReadableStream (same pattern as /chat/stream) instead of
   // native EventSource. The backend yields lines like:
@@ -1552,6 +1675,9 @@ document.addEventListener('click', e => {
         taskEventSource = null;
         return;
       }
+
+      // The task is live — reveal the Stop button so the user can cancel it.
+      wireStopButton(progressEl, taskId);
 
       const reader = resp.body.getReader();
       const dec = new TextDecoder();
@@ -1605,6 +1731,29 @@ document.addEventListener('click', e => {
               updateProgress(progressEl,
                 ev.message ? '\ud83d\udccb ' + ev.message : '\ud83d\udccb Planning steps\u2026',
                 'planning');
+              break;
+
+            case 'task_question':
+              // Agent is asking a clarifying question — pause execution and wait for answer
+              _waitingForTaskAnswer = true;
+              _taskQuestionId = ev.task_id;
+              _taskQuestionText = ev.question;
+              _taskQuestionProgressEl = progressEl;
+              updateProgress(progressEl, '\u2753 Waiting for your answer to: ' + (ev.question ? '"' + ev.question.slice(0, 60) + '"' : 'a question') + '\u2026', 'planning');
+              appendPhaseLog(progressEl, '\u2753', 'Clarifying Question', ev.question || '(no question text)');
+              if (progressEl.parentNode && progressEl.parentNode.parentNode) {
+                const container = progressEl.parentNode.parentNode;
+                const textarea = document.querySelector('textarea');
+                if (textarea) {
+                  const hint = document.createElement('div');
+                  hint.style.cssText = 'background:#6c63ff;color:#fff;padding:10px 14px;border-radius:8px;margin-top:6px;font-size:12px;font-weight:500;';
+                  hint.textContent = '\ud83d\udcc4 A question is waiting above. Answer it in the chat to resume the agent.';
+                  if (!container.querySelector('.question-hint')) {
+                    hint.className = 'question-hint';
+                    progressEl.after(hint);
+                  }
+                }
+              }
               break;
 
             case 'task_planned':
@@ -1687,6 +1836,7 @@ document.addEventListener('click', e => {
               }
               taskEventSource = null;
               activeTaskId = null;
+              hideStopAgentBtn(progressEl);
               // Mark done in the map and clean up localStorage
               activeTaskByConversation.forEach((rec, sid) => {
                 if (rec.taskId === taskId) {
@@ -1701,7 +1851,27 @@ document.addEventListener('click', e => {
               updateProgress(progressEl, `\u274c Task failed: ${ev.error || 'unknown error'}`, 'failed');
               taskEventSource = null;
               activeTaskId = null;
+              hideStopAgentBtn(progressEl);
               // Mark done in the map and clean up localStorage
+              activeTaskByConversation.forEach((rec, sid) => {
+                if (rec.taskId === taskId) {
+                  rec.done = true;
+                  try { localStorage.removeItem('activeTask_' + sid); } catch(e) {}
+                }
+              });
+              return;
+
+            case 'task_cancelled':
+              updateProgress(progressEl, '\u23f9 ' + (ev.error || 'Cancelled by user'), 'failed');
+              // Clear any pending question state — the agent is gone.
+              _waitingForTaskAnswer = false;
+              _taskQuestionId = null;
+              _taskQuestionText = null;
+              _taskQuestionProgressEl = null;
+              document.querySelectorAll('.question-hint').forEach(h => h.remove());
+              taskEventSource = null;
+              activeTaskId = null;
+              hideStopAgentBtn(progressEl);
               activeTaskByConversation.forEach((rec, sid) => {
                 if (rec.taskId === taskId) {
                   rec.done = true;
@@ -1712,6 +1882,7 @@ document.addEventListener('click', e => {
 
             case 'stream_done':
               taskEventSource = null;
+              hideStopAgentBtn(progressEl);
               return;
           }
         }
@@ -1798,7 +1969,12 @@ document.addEventListener('click', e => {
             description.slice(0, 60) + (description.length > 60 ? '\u2026' : '') +
           '</span>' +
         '</div>' +
-        '<div style="font-size:10px;color:#555;font-weight:400">' + displayTs + '</div>' +
+        '<div style="display:flex;align-items:center;gap:8px">' +
+          '<button class="task-stop-agent-btn" title="Stop this agent" ' +
+            'style="display:none;background:#f38ba8;color:#1a1a2e;border:none;border-radius:6px;' +
+            'padding:3px 10px;font-size:11px;font-weight:600;cursor:pointer">\u23f9 Stop</button>' +
+          '<div style="font-size:10px;color:#555;font-weight:400">' + displayTs + '</div>' +
+        '</div>' +
       '</div>' +
       '<div class="task-status" style="color:#cdd6f4">\u23f3 Submitting\u2026</div>' +
       '<div class="task-phase-log" style="margin-top:8px;max-height:300px;overflow-y:auto;' +
@@ -1881,6 +2057,8 @@ document.addEventListener('click', e => {
   function _doBootstrap() {
     _streamTaskEvents   = streamTaskEvents;
     _appendTaskProgress = appendTaskProgress;
+    _updateTaskProgress = updateProgress;
+    _cancelTask         = cancelTask;
     injectTaskToggle();
     interceptSend();
   }

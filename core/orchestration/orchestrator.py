@@ -26,6 +26,7 @@ Key behaviours
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from dataclasses import dataclass, field
@@ -123,6 +124,59 @@ class Orchestrator:
         self._emit_cb = emit
         self.session_conversation = session_conversation
         self._task_id = ""
+
+        # ── Interactive Q&A state ────────────────────────────────────────────
+        # The planner may surface a genuine clarifying question. When it does we
+        # pause on this event until the web layer calls submit_answer().
+        self._answer_event: Optional[asyncio.Event] = None
+        self._answer: Optional[str] = None
+        self._awaiting_answer = False
+        # Accumulated user clarifications, threaded into plan + act context.
+        self._clarifications = ""
+
+    # ── interactive Q&A ──────────────────────────────────────────────────────
+
+    def submit_answer(self, task_id: str, answer: str) -> bool:
+        """Called by the web layer when the user answers a clarifying question.
+
+        Returns True if the orchestrator was paused and is now resumed.
+        """
+        if not self._awaiting_answer or self._answer_event is None:
+            logger.warning("[%s] submit_answer called but not awaiting an answer", task_id)
+            return False
+        self._answer = answer
+        self._answer_event.set()
+        logger.info("[%s] Answer received: %s", task_id, (answer or "")[:80])
+        return True
+
+    @property
+    def awaiting_answer(self) -> bool:
+        return self._awaiting_answer
+
+    async def _ask_question(self, question: str, timeout: float = 1800.0) -> Optional[str]:
+        """Emit a task_question event, pause, and wait for the user's answer.
+
+        Returns the answer string, or None on timeout.
+        """
+        self._answer_event = asyncio.Event()
+        self._answer = None
+        self._awaiting_answer = True
+        self._emit("task_question", {"task_id": self._task_id, "question": question})
+        logger.info("[%s] Waiting for user answer to: %s", self._task_id, question)
+        try:
+            await asyncio.wait_for(self._answer_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("[%s] Question timed out after %.0fs — continuing without answer",
+                           self._task_id, timeout)
+            self._awaiting_answer = False
+            self._answer_event = None
+            return None
+        ans = self._answer
+        self._awaiting_answer = False
+        self._answer_event = None
+        self._answer = None
+        return ans
+
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
@@ -237,6 +291,31 @@ class Orchestrator:
                 plan = await self._phase_plan(
                     task_id, goal, research, verify_feedback, is_retry, result
                 )
+
+                # ── Interactive Q&A: ask any genuine clarifying questions ────
+                # Only on the first round, and only when a live UI is attached.
+                questions = plan.get("questions") or []
+                if questions and not is_retry and self._emit_cb:
+                    new_clar: List[str] = []
+                    for q in questions:
+                        answer = await self._ask_question(q)
+                        if answer:
+                            new_clar.append(f"Q: {q}\nA: {answer}")
+                    if new_clar:
+                        block = "\n\n".join(new_clar)
+                        self._clarifications = (
+                            self._clarifications + "\n\n" + block
+                            if self._clarifications else block
+                        )
+                        self._emit("task_planning", {
+                            "task_id": task_id,
+                            "message": "Got your answer — refining the plan…",
+                        })
+                        # Re-plan with the new clarifications so the steps reflect them.
+                        plan = await self._phase_plan(
+                            task_id, goal, research, verify_feedback, False, result
+                        )
+
                 steps: List[str] = plan["steps"]
                 result.acceptance_criteria = plan["acceptance_criteria"]
                 result.specialist = plan["specialist"]
@@ -350,37 +429,59 @@ class Orchestrator:
         })
         fb = ("\n\nPrevious verification FAILED:\n" + verify_feedback + "\nFix this."
               if is_retry and verify_feedback else "")
+        clar_block = (
+            "\n\nClarifications already provided by the user (treat as authoritative):\n"
+            + self._clarifications
+            if self._clarifications else ""
+        )
+        # Only invite a clarifying question on the first attempt and when there is
+        # a live UI to answer it — never re-ask once clarifications exist.
+        may_ask = (not is_retry) and bool(self._emit_cb) and not self._clarifications
+        question_rules = (
+            "\n\nQUESTION RULES — read carefully:\n"
+            "- You MAY include ONE clarifying question in \"questions\" ONLY if the goal is\n"
+            "  GENUINELY ambiguous and ONLY the user can resolve it (e.g. 'Deploy to\n"
+            "  staging or production?', 'Which branch should I target?').\n"
+            "- You MUST NOT ask for permission ('Should I proceed?') or anything you can\n"
+            "  discover with tools. If nothing is ambiguous, return an empty array.\n"
+            if may_ask else
+            "\n\nDo not ask any questions; return an empty \"questions\" array.\n"
+        )
         instruction = (
             "Create an execution plan for the goal. Choose the single best "
             "specialist to execute it and define explicit, testable acceptance "
             "criteria.\n\n"
-            f"Goal: {goal}\n\nResearch findings:\n{self._truncate(research, 5000)}{fb}\n\n"
+            f"Goal: {goal}\n\nResearch findings:\n{self._truncate(research, 5000)}{fb}{clar_block}\n\n"
             "Specialist must be one of: lead-software-engineer, devops, kubernetes, "
-            "data-engineer, sre, security — or another short role name if none fit.\n\n"
-            'Respond ONLY with JSON:\n'
+            "data-engineer, sre, security — or another short role name if none fit."
+            + question_rules +
+            '\nRespond ONLY with JSON:\n'
             '{"specialist": "<role>", '
             '"acceptance_criteria": ["criterion 1", "criterion 2"], '
+            '"questions": ["single clarifying question if truly needed, else empty array"], '
             '"steps": [{"description": "..."}]}'
         )
         data = await agent.reason_json(instruction)
-        steps, criteria, specialist = self._parse_plan(data, goal)
+        steps, criteria, specialist, questions = self._parse_plan(data, goal)
         record.output = safe_encode_string(str(data) if data else "")
         record.completed_at = datetime.now().isoformat()
         result.phases.append(record)
-        logger.info("[%s] PLAN done | specialist=%s | %d step(s) | %d criteria",
-                    task_id, specialist, len(steps), len(criteria))
+        logger.info("[%s] PLAN done | specialist=%s | %d step(s) | %d criteria | %d question(s)",
+                    task_id, specialist, len(steps), len(criteria), len(questions))
         self._emit("task_planned", {
             "task_id": task_id,
             "specialist": specialist,
             "acceptance_criteria": criteria,
             "steps": [{"step_id": i + 1, "description": s} for i, s in enumerate(steps)],
         })
-        return {"steps": steps, "acceptance_criteria": criteria, "specialist": specialist}
+        return {"steps": steps, "acceptance_criteria": criteria,
+                "specialist": specialist, "questions": questions}
 
     @staticmethod
     def _parse_plan(data, goal):
         steps: List[str] = []
         criteria: List[str] = []
+        questions: List[str] = []
         specialist = "lead-software-engineer"
         if isinstance(data, dict):
             specialist = str(data.get("specialist") or specialist).strip() or specialist
@@ -392,11 +493,21 @@ class Orchestrator:
                     steps.append(str(s["description"]).strip())
                 elif isinstance(s, str) and s.strip():
                     steps.append(s.strip())
+            # Filter out blank and permission-seeking questions.
+            _permission_words = (
+                "should i", "do you want", "can i", "would you like",
+                "shall i", "is it ok", "may i", "do you need",
+            )
+            for q in data.get("questions") or []:
+                if isinstance(q, str) and q.strip() and not any(
+                    p in q.lower() for p in _permission_words
+                ):
+                    questions.append(q.strip())
         if not steps:
             steps = [f"Complete the goal: {goal}"]
         if not criteria:
             criteria = ["The goal is fully and correctly accomplished."]
-        return steps, criteria, specialist
+        return steps, criteria, specialist, questions
 
     async def _phase_act(self, task_id, goal, research, steps, specialist, result) -> str:
         role = specialist_role(specialist)
@@ -409,6 +520,8 @@ class Orchestrator:
         })
 
         accumulated = f"Goal: {goal}\n\nResearch findings:\n{self._truncate(research, 3000)}"
+        if self._clarifications:
+            accumulated += f"\n\nUser clarifications (authoritative):\n{self._clarifications}"
         outputs: List[str] = []
         for idx, step in enumerate(steps, start=1):
             logger.info("[%s] ACT step %d/%d | %s | %s", task_id, idx, len(steps),

@@ -146,6 +146,11 @@ class AgentExecutor:
         logger.info("[Task %s] Answer received: %s", task_id, answer[:80])
         return True
 
+    @property
+    def awaiting_answer(self) -> bool:
+        """True when any task is currently paused waiting for a user answer."""
+        return bool(self._answer_events)
+
     async def _ask_question(self, task: Task, question: str,
                              timeout: float = 300.0) -> Optional[str]:
         """

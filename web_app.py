@@ -1434,7 +1434,22 @@ async def agent_cancel_task(task_id: str):
     if not state: raise HTTPException(status_code=404, detail="Task not found")
     at = state.get("asyncio_task")
     if at and not at.done():
-        at.cancel(); _agent_tasks[task_id]["done"] = True
+        # If the agent is paused waiting for an answer, release it first so the
+        # awaiting coroutine unblocks before we cancel the task.
+        target = state.get("executor") or state.get("orchestrator")
+        if target is not None and getattr(target, "awaiting_answer", False):
+            try:
+                target.submit_answer(task_id, "")
+            except Exception:
+                pass
+        at.cancel()
+        # Surface a cancelled event so the UI stops showing "running".
+        buf = state["event_buf"]
+        buf.append({"type": "task_cancelled", "task_id": task_id,
+                    "error": "Cancelled by user"})
+        if not buf or buf[-1].get("type") != "stream_done":
+            buf.append({"type": "stream_done", "task_id": task_id})
+        _agent_tasks[task_id]["done"] = True
         return {"status": "cancelled", "task_id": task_id}
     return {"status": "already_done", "task_id": task_id}
 
@@ -1453,11 +1468,13 @@ async def agent_task_answer(task_id: str, req: TaskAnswerRequest):
     if not state:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    executor = state.get("executor")
-    if executor is None:
-        raise HTTPException(status_code=409, detail="No executor attached to task")
+    # Works for both single-agent Task Mode (executor) and multi-agent
+    # Orchestrate / Agent Mode (orchestrator) — both expose submit_answer().
+    target = state.get("executor") or state.get("orchestrator")
+    if target is None:
+        raise HTTPException(status_code=409, detail="No agent attached to task")
 
-    resumed = executor.submit_answer(task_id, req.answer.strip())
+    resumed = target.submit_answer(task_id, req.answer.strip())
     if not resumed:
         raise HTTPException(
             status_code=409,
@@ -1538,6 +1555,8 @@ async def agent_orchestrate(req: OrchestrateRequest):
                 emit=cb,
                 session_conversation=session_conv,
             )
+            # Store so POST /agent/task/{id}/answer can resume it on a question.
+            _agent_tasks[task_id]["orchestrator"] = orchestrator
             await orchestrator.run(req.description, task_id=task_id)
         except Exception as exc:
             _agent_tasks[task_id]["event_buf"].append(
