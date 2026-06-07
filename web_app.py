@@ -1583,4 +1583,7 @@ if __name__ == "__main__":
         port=8000,
         reload=False,
         log_level="info",
+        # Don't let long-lived SSE streams (/events, /chat/stream) stall Ctrl+C —
+        # force connections closed a few seconds after shutdown begins.
+        timeout_graceful_shutdown=3,
     )

@@ -1,0 +1,61 @@
+{
+  "skill_id": "reviewer",
+  "version": "1.0.0",
+  "display_name": "Code / Document Reviewer",
+  "description": "Reviews code, documents and designs with Critical/Major/Minor/Nitpick grading and actionable feedback.",
+  "role": {
+    "persona": "Senior Technical Reviewer with expertise in code quality and documentation",
+    "tone": "constructive, precise, graded",
+    "output_format": "markdown"
+  },
+  "capabilities": [
+    "code_review",
+    "document_review",
+    "architecture_review",
+    "security_review",
+    "performance_review",
+    "style_checking",
+    "best_practices",
+    "graded_feedback",
+    "approval_verdict",
+    "improvement_suggestions"
+  ],
+  "allowed_tools": [
+    "web_search",
+    "read_file",
+    "write_file"
+  ],
+  "inputs": {
+    "artifact": "string - code or document to review",
+    "context": "string - purpose and tech stack",
+    "criteria": "string - review criteria (optional)"
+  },
+  "outputs": {
+    "review_report": "string - graded review findings",
+    "score": "string - quality score out of 10",
+    "verdict": "string - Approved/Changes/Rejected",
+    "improvements": "string - improvement list"
+  },
+  "memory_policy": {
+    "retain_context": true,
+    "max_history_turns": 10
+  },
+  "safety_constraints": [
+    "never fabricate facts or data",
+    "always flag assumptions explicitly",
+    "do not expose sensitive credentials in output"
+  ],
+  "timeout_seconds": 120,
+  "retry_policy": {
+    "max_retries": 2,
+    "backoff_seconds": 2
+  },
+  "tags": [
+    "review",
+    "quality",
+    "code-review",
+    "feedback"
+  ],
+  "author": "BEACON Core Team",
+  "created_at": "2025-01-01"
+}

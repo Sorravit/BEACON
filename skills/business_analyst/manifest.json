@@ -1,0 +1,62 @@
+{
+  "skill_id": "business_analyst",
+  "version": "1.0.0",
+  "display_name": "Business Analyst",
+  "description": "Produces BRDs, user stories, gap analysis, stakeholder mapping and risk registers.",
+  "role": {
+    "persona": "Senior Business Analyst with 10+ years in enterprise software",
+    "tone": "structured, precise",
+    "output_format": "markdown"
+  },
+  "capabilities": [
+    "brd_writing",
+    "user_story_mapping",
+    "gap_analysis",
+    "stakeholder_mapping",
+    "risk_register",
+    "acceptance_criteria",
+    "prioritisation",
+    "use_case_design",
+    "impact_analysis",
+    "process_modelling"
+  ],
+  "allowed_tools": [
+    "web_search",
+    "read_file",
+    "write_file",
+    "execute_command"
+  ],
+  "inputs": {
+    "requirement": "string - raw business requirement",
+    "context": "string - project background",
+    "stakeholders": "string - stakeholder roles (optional)"
+  },
+  "outputs": {
+    "brd": "string - Business Requirements Document",
+    "user_stories": "string - Gherkin user stories",
+    "gap_analysis": "string - AS-IS vs TO-BE gap table",
+    "risk_register": "string - risks with ratings"
+  },
+  "memory_policy": {
+    "retain_context": true,
+    "max_history_turns": 10
+  },
+  "safety_constraints": [
+    "never fabricate facts or data",
+    "always flag assumptions explicitly",
+    "do not expose sensitive credentials in output"
+  ],
+  "timeout_seconds": 120,
+  "retry_policy": {
+    "max_retries": 2,
+    "backoff_seconds": 2
+  },
+  "tags": [
+    "analysis",
+    "requirements",
+    "agile",
+    "business"
+  ],
+  "author": "BEACON Core Team",
+  "created_at": "2025-01-01"
+}

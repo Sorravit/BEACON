@@ -53,6 +53,14 @@ logger = logging.getLogger(__name__)
 # OTEL_EXPORTER_OTLP_ENDPOINT environment variable.
 DEFAULT_OTLP_ENDPOINT = "http://localhost:4317"
 
+# Per-export gRPC timeout (seconds). Kept short so a slow/unreachable collector
+# can never block a flush — critical for fast Ctrl+C shutdown.
+EXPORT_TIMEOUT_SECONDS = 3
+
+# Hard ceiling (seconds) for the whole telemetry teardown. If the exporters are
+# wedged, we give up and let the process exit rather than hang on Ctrl+C.
+SHUTDOWN_TIMEOUT_SECONDS = 4
+
 # ---------------------------------------------------------------------------
 # Module state
 # ---------------------------------------------------------------------------
@@ -125,7 +133,11 @@ def setup_telemetry(
     # -- Tracing pipeline ----------------------------------------------------
     if enable_tracing:
         provider = TracerProvider(resource=resource)
-        provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint)))
+        provider.add_span_processor(
+            BatchSpanProcessor(
+                OTLPSpanExporter(endpoint=endpoint, timeout=EXPORT_TIMEOUT_SECONDS)
+            )
+        )
         # Register as the global provider so auto-instrumentation (FastAPI, etc.)
         # shares the same pipeline. OTel ignores this if one is already set.
         trace.set_tracer_provider(provider)
@@ -136,7 +148,7 @@ def setup_telemetry(
         _logger_provider = LoggerProvider(resource=resource)
         _logger_provider.add_log_record_processor(
             BatchLogRecordProcessor(
-                OTLPLogExporter(endpoint=endpoint),
+                OTLPLogExporter(endpoint=endpoint, timeout=EXPORT_TIMEOUT_SECONDS),
                 schedule_delay_millis=5000,
                 max_export_batch_size=512,
                 max_queue_size=2048,
@@ -177,23 +189,37 @@ def get_tracer(name: str = "beacon"):
 
 
 def shutdown() -> None:
-    """Flush and tear down the trace + log pipelines."""
-    global _provider, _logger_provider
-    try:
-        if _provider is not None:
-            _provider.shutdown()
-    except Exception:
-        pass
-    finally:
-        _provider = None
+    """Flush and tear down the trace + log pipelines without ever hanging.
 
-    try:
-        if _logger_provider is not None:
-            _logger_provider.shutdown()
-    except Exception:
-        pass
-    finally:
-        _logger_provider = None
+    The OTLP/gRPC exporters can block while flushing to a slow or unreachable
+    collector. We therefore run the (potentially blocking) provider shutdowns on
+    a daemon thread and wait at most ``SHUTDOWN_TIMEOUT_SECONDS`` for them. If
+    they overrun, we abandon them and return so the process can exit promptly —
+    which is what makes Ctrl+C feel instant again.
+    """
+    global _provider, _logger_provider
+    provider, logger_provider = _provider, _logger_provider
+    # Drop module references up front so a re-entrant call is a no-op.
+    _provider = None
+    _logger_provider = None
+
+    def _teardown() -> None:
+        for target in (provider, logger_provider):
+            if target is None:
+                continue
+            try:
+                target.shutdown()
+            except Exception:
+                pass
+
+    worker = threading.Thread(target=_teardown, name="otel-shutdown", daemon=True)
+    worker.start()
+    worker.join(timeout=SHUTDOWN_TIMEOUT_SECONDS)
+    if worker.is_alive():
+        logger.warning(
+            "[telemetry] OTLP exporter slow to flush; abandoning teardown after %ss",
+            SHUTDOWN_TIMEOUT_SECONDS,
+        )
 
 
 # ---------------------------------------------------------------------------
