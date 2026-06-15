@@ -593,6 +593,7 @@ async function switchSession(id) {
         <div class="empty-subtitle">Ask me anything.</div>
         <div class="suggestions">
           <span class="suggestion-chip" onclick="useSuggestion('What time is it?')">🕐 What time is it?</span>
+          <span class="suggestion-chip" onclick="useSuggestion('What do you know about me?')">What do you know about me?</span>
           <span class="suggestion-chip" onclick="useSuggestion('List files in current directory')">📁 List files</span>
           <span class="suggestion-chip" onclick="useSuggestion('Search for latest AI news')">🔍 Latest AI news</span>
         </div>`;

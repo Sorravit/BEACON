@@ -1,0 +1,78 @@
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 2000
+    spike_limit_mib: 400
+
+  resourcedetection:
+    detectors: [system]
+    system:
+      hostname_sources: ["os"]
+
+  batch:
+    send_batch_size: 1000
+    timeout: 10s
+
+  tail_sampling:
+    decision_wait: 30s
+    num_traces: 50000
+    policies:
+      # Keep every trace that contains an error
+      - name: keep-errors
+        type: status_code
+        status_code: {status_codes: [ERROR]}
+
+      # For everything else, keep 100% (adjust for production)
+      - name: sample-success
+        type: probabilistic
+        probabilistic: {sampling_percentage: 100}
+
+exporters:
+  # Route Logs to Loki via OTLP
+  otlphttp/loki:
+    endpoint: "http://loki:3100/otlp"
+    tls: { insecure: true }
+
+  # Route Traces to Tempo
+  otlp/tempo:
+    endpoint: "tempo:4317"
+    tls: { insecure: true }
+
+  # Route Metrics to Prometheus (exposed for scraping)
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+
+  debug:
+    verbosity: normal
+
+service:
+  telemetry:
+    logs:
+      level: "info"
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, batch]
+      exporters: [otlphttp/loki, debug]
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, tail_sampling, batch]
+      exporters: [otlp/tempo, debug]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, batch]
+      exporters: [prometheus, debug]
+
