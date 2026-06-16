@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+# ── gRPC fork-safety (must be set BEFORE any grpc/otlp import) ─────────────
+# Crash: EXC_BREAKPOINT / BUG IN CLIENT OF LIBDISPATCH: trying to lock
+# recursively.  Root cause: subprocess.fork() called after grpc spawned
+# background threads that hold libdispatch / XPC dispatch_once locks.
+# Fix: tell grpc to support fork and avoid the broken kqueue poll strategy.
+import os as _grpc_os
+_grpc_os.environ.setdefault("GRPC_ENABLE_FORK_SUPPORT", "1")
+_grpc_os.environ.setdefault("GRPC_POLL_STRATEGY", "poll")
+_grpc_os.environ.setdefault("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES")
+# ────────────────────────────────────────────────────────────────────────────
 """
 AI Assistant - Agent with Skills
 Version: 4.2.0 (MCP Integration)

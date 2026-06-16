@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+# ── gRPC fork-safety (must be set BEFORE any grpc/otlp import) ─────────────
+# Crash: EXC_BREAKPOINT / BUG IN CLIENT OF LIBDISPATCH: trying to lock
+# recursively.  Root cause: subprocess.fork() called after grpc spawned
+# background threads that hold libdispatch / XPC dispatch_once locks.
+# Fix: tell grpc to support fork and avoid the broken kqueue poll strategy.
+import os as _grpc_os
+_grpc_os.environ.setdefault("GRPC_ENABLE_FORK_SUPPORT", "1")
+_grpc_os.environ.setdefault("GRPC_POLL_STRATEGY", "poll")
+_grpc_os.environ.setdefault("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES")
+# ────────────────────────────────────────────────────────────────────────────
 """
 AI Assistant - Web Application
 Serves a chat UI and exposes the AIAgent via FastAPI + SSE streaming.
@@ -444,7 +454,7 @@ async def upload_file(file: UploadFile = File(...)):
     contents = await file.read()
     dest.write_bytes(contents)
 
-    return {"path": str(dest), "name": dest.name, "size": dest.stat().st_size}
+    return {"path": str(dest.resolve()), "name": dest.name, "size": dest.stat().st_size}
 
 
 # ── Static pages ──────────────────────────────────────────────────────────────
