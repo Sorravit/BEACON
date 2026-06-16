@@ -22,3 +22,4 @@ opentelemetry-instrumentation-fastapi>=0.45b0
 opentelemetry-instrumentation-httpx>=0.45b0
 prometheus-client>=0.20.0
 opentelemetry-instrumentation-logging>=0.45b0
+python-pptx>=0.6.21

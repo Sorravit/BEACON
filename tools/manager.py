@@ -20,6 +20,7 @@ from tools.file.file_tools import FileToolsMixin
 from tools.mcp.mcp_tools import MCPToolsMixin
 from tools.memory.memory_tools import MemoryToolsMixin
 from tools.skill.skill_tools import SkillToolsMixin
+from tools.pptx.smart_pptx_tools import SmartPptxToolsMixin
 from tools.web.http_tools import HttpToolsMixin
 
 logger = logging.getLogger(__name__)
@@ -55,6 +56,7 @@ class ToolManager(
     MCPToolsMixin,
     MemoryToolsMixin,
     SkillToolsMixin,
+    SmartPptxToolsMixin,
 ):
     """Manages all agent tools, split by domain modules."""
 
@@ -112,6 +114,8 @@ class ToolManager(
             ("memory_delete_research", "Deletes research memory entries that match a keyword. Use this when the user asks to forget research about a topic.", {"keyword": "string"}, self._memory_delete_research),
             ("memory_clear_research", "Clears ALL research memory entries. Use only when user explicitly asks to clear all research memory.", {}, self._memory_clear_research),
             ("list_skills", "Lists all installed Agent Skills (specialised playbooks) with their names and descriptions. Use when deciding whether a skill applies to the user's request.", {}, self._list_skills),
+            ("generate_pptx", "Generate a beautiful PowerPoint (.pptx) on any topic using AI. Optionally provide template_pptx path to match brand style (colors, fonts, layouts). Saves to output/ folder. Use when user asks to create slides, a presentation, a PowerPoint, or a deck.", {"topic": "string", "outline": "string", "template_pptx": "string", "output_path": "string", "slide_count": "string"}, self._generate_pptx),
+            ("extract_pptx_style", "Inspect an existing .pptx and display its Style DNA: colors, fonts, slide size, logo positions. Use when user wants to see the style of a template before generating new slides.", {"pptx_path": "string"}, self._extract_pptx_style),
             ("load_skill", "Loads the full instruction body of an installed skill by name. Call this BEFORE acting on a task that matches a skill, then follow the returned instructions.", {"name": "string"}, self._load_skill),
         ]
 
