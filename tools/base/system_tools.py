@@ -2,8 +2,8 @@
 
 import json
 import logging
-import urllib.request as _ureq
-from urllib.parse import quote
+
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -44,12 +44,21 @@ class SystemToolsMixin:
 
         if not skip_api:
             try:
-                req = _ureq.Request(
-                    f"https://api.duckduckgo.com/?q={quote(query)}&format=json&no_redirect=1&no_html=1",
+                async with httpx.AsyncClient(
                     headers={"User-Agent": "Mozilla/5.0 (compatible; BigAI/1.0)"},
-                )
-                with _ureq.urlopen(req, timeout=8) as resp:
-                    data = json.loads(resp.read().decode())
+                    timeout=8.0,
+                    follow_redirects=True,
+                ) as client:
+                    response = await client.get(
+                        "https://api.duckduckgo.com/",
+                        params={
+                            "q": query,
+                            "format": "json",
+                            "no_redirect": "1",
+                            "no_html": "1",
+                        },
+                    )
+                    data = response.json()
 
                 rows = []
                 if data.get("AbstractText"):
@@ -127,4 +136,3 @@ class SystemToolsMixin:
             )
         except Exception as google_err:
             return f"All search methods failed for '{query}'. Last error: {google_err}"
-

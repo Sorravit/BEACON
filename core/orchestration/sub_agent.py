@@ -143,7 +143,7 @@ class SubAgent:
                         lambda: self.ai_agent.client.chat.completions.create(**params),
                     )
                     # --- attributes AFTER the call ---
-                    if resp.usage:
+                    if hasattr(resp, "usage") and resp.usage:
                         span.set_attribute("llm.prompt_tokens", resp.usage.prompt_tokens)
                         span.set_attribute("llm.completion_tokens", resp.usage.completion_tokens)
                     span.set_status(_StatusCode.OK)

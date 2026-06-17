@@ -8,6 +8,7 @@ import os as _grpc_os
 _grpc_os.environ.setdefault("GRPC_ENABLE_FORK_SUPPORT", "1")
 _grpc_os.environ.setdefault("GRPC_POLL_STRATEGY", "poll")
 _grpc_os.environ.setdefault("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES")
+_grpc_os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
 # ────────────────────────────────────────────────────────────────────────────
 """
 AI Assistant - Agent with Skills
@@ -77,7 +78,7 @@ LOG_FILE = "logs/ai_assistant.log"
 # AI Model Configuration
 DEFAULT_MODEL = "gpt-3.5-turbo"
 DEFAULT_TEMPERATURE = 0.7
-DEFAULT_MAX_TOKENS = 4096
+DEFAULT_MAX_TOKENS = 64000
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 
 # Tool Execution Limits

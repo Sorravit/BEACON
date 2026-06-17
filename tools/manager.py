@@ -15,8 +15,8 @@ from typing import Any, Callable, Dict, List
 from tools.base.command_tools import CommandToolsMixin
 from tools.base.system_tools import SystemToolsMixin
 from tools.base.task_tools import TaskToolsMixin
+from tools.base.file_tools import FileToolsMixin
 from tools.browser.browser_tools import BrowserToolsMixin
-from tools.file.file_tools import FileToolsMixin
 from tools.mcp.mcp_tools import MCPToolsMixin
 from tools.memory.memory_tools import MemoryToolsMixin
 from tools.skill.skill_tools import SkillToolsMixin

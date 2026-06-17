@@ -23,3 +23,11 @@ opentelemetry-instrumentation-httpx>=0.45b0
 prometheus-client>=0.20.0
 opentelemetry-instrumentation-logging>=0.45b0
 python-pptx>=0.6.21
+# -- Async I/O fix (Step 2) -------------------------------------------
+# aiofiles : async drop-in for built-in open(). Fixes blocking file I/O
+#            in read_file/write_file/list_files so they do not stall the
+#            asyncio event loop and block other concurrent sessions.
+# httpx    : already listed above (>=0.27.0, installed 0.28.1).
+#            AsyncClient replaces urllib.request.urlopen in web_search.
+# asyncio  : Python standard library - no install required.
+aiofiles>=24.1.0
