@@ -8,6 +8,7 @@ import os as _grpc_os
 _grpc_os.environ.setdefault("GRPC_ENABLE_FORK_SUPPORT", "1")
 _grpc_os.environ.setdefault("GRPC_POLL_STRATEGY", "poll")
 _grpc_os.environ.setdefault("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES")
+_grpc_os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
 # ────────────────────────────────────────────────────────────────────────────
 """
 AI Assistant - Web Application
@@ -370,7 +371,7 @@ async def _generate_smart_title(session_id: str, user_msg: str, assistant_msg: s
                 )
             }],
             temperature=0.3,
-            max_tokens=_config.max_tokens,
+            max_tokens=min(_config.max_tokens, 100),  # title is max 5 words
         )
         import contextlib as _cl_st
         _st_ctx = record_llm_call(_config.model, session_id=session_id) if _TELEMETRY_AVAILABLE else _cl_st.nullcontext()
@@ -751,6 +752,13 @@ async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent, model:
     def _emit(ev: dict):
         bg["event_buf"].append(ev)
 
+    # FIX 1: Build conversation BEFORE saving the new user message so that
+    # get_response() does NOT receive user_input twice (once from history,
+    # once when it appends it internally).  On message 2+ the old order
+    # produced a duplicate user→user tail that caused silent LLM rejections
+    # and session hangs with no server-side log output.
+    conversation = _build_conversation(agent, session_id)
+
     if s is not None:
         now = datetime.now().isoformat()
         already_saved = any(
@@ -763,8 +771,6 @@ async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent, model:
                 s["title"] = _auto_title(user_input)
             s["updated_at"] = now
             _save_session(session_id)
-
-    conversation = _build_conversation(agent, session_id)
 
     # Resolve the model that will actually answer so the UI can show it and we
     # can persist it with the message.
@@ -805,6 +811,10 @@ async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent, model:
             t0_tool = time.monotonic()
             status = "ok"
             error_text = None
+            # FIX 2: sentinel guards against UnboundLocalError in finally when
+            # original_execute raises before `result` is assigned.
+            _TOOL_UNSET = object()
+            result = _TOOL_UNSET
             try:
                 result = await original_execute(name, args)
                 return result
@@ -819,7 +829,7 @@ async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent, model:
                         name, duration_ms, status=status,
                         error=error_text, parameters=args,
                     )
-                if status == "ok":
+                if status == "ok" and result is not _TOOL_UNSET:
                     preview = str(result)
                     if len(preview) > 400:
                         preview = preview[:400] + "…"
@@ -961,11 +971,14 @@ async def _build_tasks_payload() -> dict:
 
     tasks = []
     for name in sorted(names):
-        check = subprocess.run(
-            ["pgrep", "-f", f"background_task.*--name.*{name}"],
-            capture_output=True
+        # Step7: asyncio.create_subprocess_exec
+        _proc = await asyncio.create_subprocess_exec(
+            "pgrep", "-f", f"background_task.*--name.*{name}",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
         )
-        alive = check.returncode == 0
+        await _proc.wait()
+        alive = _proc.returncode == 0
         log_file = f"logs/bg_{name}.log"
         # Rotate oversized logs in the background
         _rotate_log_if_needed(Path(log_file))
@@ -1089,7 +1102,7 @@ async def get_notifications():
     return {"notifications": notes}
 
 
-def _kill_task(name: str) -> str:
+async def _kill_task(name: str) -> str:
     import signal as _signal
     lockfile = f"/tmp/bg_task_{name}.lock"
     killed = False
@@ -1106,9 +1119,18 @@ def _kill_task(name: str) -> str:
         except Exception:
             pass
 
-    r1 = subprocess.run(["pkill", "-f", f"background_task.*--name.*{name}"], capture_output=True)
-    r2 = subprocess.run(["pkill", "-TERM", "-f", f"bg_{name}"], capture_output=True)
-    if r1.returncode == 0 or r2.returncode == 0:
+    # Step7: asyncio.create_subprocess_exec
+    _p1 = await asyncio.create_subprocess_exec(
+        "pkill", "-f", f"background_task.*--name.*{name}",
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    )
+    await _p1.wait()
+    _p2 = await asyncio.create_subprocess_exec(
+        "pkill", "-TERM", "-f", f"bg_{name}",
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    )
+    await _p2.wait()
+    if _p1.returncode == 0 or _p2.returncode == 0:
         killed = True
 
     return "stopped" if killed else "already_stopped"
@@ -1124,7 +1146,7 @@ async def stop_all_tasks():
         names.add(Path(lf).stem[3:])
     results = {}
     for name in names:
-        status = _kill_task(name)
+        status = await _kill_task(name)
         lockfile = f"/tmp/bg_task_{name}.lock"
         log_file = Path(f"logs/bg_{name}.log")
         try:
@@ -1144,7 +1166,7 @@ async def stop_all_tasks():
 # ── Per-task routes — must come AFTER all static /tasks/* routes ──────────────
 @app.post("/tasks/{name}/stop")
 async def stop_task(name: str):
-    return {"status": _kill_task(name), "name": name}
+    return {"status": await _kill_task(name), "name": name}
 
 
 @app.delete("/tasks/{name}/log")
@@ -1153,10 +1175,13 @@ async def clear_task_log(name: str):
     if not log_file.exists():
         return {"status": "not_found", "name": name}
     log_file.unlink()
-    check = subprocess.run(
-        ["pgrep", "-f", f"background_task.*--name.*{name}"], capture_output=True
+    # Step7: asyncio.create_subprocess_exec
+    _chk = await asyncio.create_subprocess_exec(
+        "pgrep", "-f", f"background_task.*--name.*{name}",
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
     )
-    if check.returncode != 0:
+    await _chk.wait()
+    if _chk.returncode != 0:
         lockfile = f"/tmp/bg_task_{name}.lock"
         try:
             if os.path.exists(lockfile):
@@ -1170,7 +1195,7 @@ async def clear_task_log(name: str):
 async def stop_and_clear_task(name: str):
     lockfile = f"/tmp/bg_task_{name}.lock"
     log_file = Path(f"logs/bg_{name}.log")
-    status = _kill_task(name)
+    status = await _kill_task(name)
     try:
         if os.path.exists(lockfile):
             os.remove(lockfile)
