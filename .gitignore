@@ -75,4 +75,5 @@ sessions/
 # MCP configuration
 mcp_config.json
 # Weaviate persistent data (bind mount - do not commit)
-data/weaviate/
+data/weaviate/*
+!data/weaviate/.gitkeep
