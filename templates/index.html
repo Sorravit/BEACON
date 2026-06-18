@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BEACON Chat</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f1117;
+      --surface: #1a1d27;
+      --surface2: #22263a;
+      --border: #2e3248;
+      --accent: #5b6af0;
+      --accent-hover: #7380f5;
+      --text: #e8eaf0;
+      --text-dim: #8b90a8;
+      --user-bubble: #2a3060;
+      --bot-bubble: #1e2235;
+      --success: #3ddc84;
+      --danger: #f0606e;
+      --radius: 12px;
+      --font: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    }
+
+    html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--font); font-size: 14px; }
+
+    /* ───── Layout ───── */
+    #app { display: flex; flex-direction: column; height: 100vh; max-width: 900px; margin: 0 auto; padding: 0 16px; }
+
+    /* ───── Header ───── */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 0 12px;
+      border-bottom: 1px solid var(--border);
+      gap: 12px;
+      flex-shrink: 0;
+    }
+    .logo { font-size: 18px; font-weight: 700; letter-spacing: .5px; color: var(--accent); }
+
+    /* ───── Model Selector ───── */
+    .model-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex: 1;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+    }
+    .model-bar label {
+      color: var(--text-dim);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    #model-select {
+      background: var(--surface2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 6px 32px 6px 10px;
+      font-size: 13px;
+      cursor: pointer;
+      appearance: none;
+      -webkit-appearance: none;
+      background-image: url("image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238b90a8' stroke-width='2.5'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 10px center;
+      min-width: 180px;
+      transition: border-color .2s;
+    }
+    #model-select:hover { border-color: var(--accent); }
+    #model-select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(91,106,240,.25); }
+    #model-select option { background: var(--surface2); }
+
+    /* model badge shown in header */
+    #active-model-badge {
+      font-size: 11px;
+      color: var(--text-dim);
+      padding: 3px 8px;
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      white-space: nowrap;
+      transition: all .3s;
+    }
+    #active-model-badge.changed {
+      border-color: var(--success);
+      color: var(--success);
+    }
+
+    /* ───── Chat Container ───── */
+    #chat-container {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px 0 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      scroll-behavior: smooth;
+    }
+    #chat-container::-webkit-scrollbar { width: 6px; }
+    #chat-container::-webkit-scrollbar-track { background: transparent; }
+    #chat-container::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    /* ───── Message Bubbles ───── */
+    .message { display: flex; gap: 10px; max-width: 100%; animation: fadeIn .2s ease; }
+    @keyframes fadeIn { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
+
+    .message.user { flex-direction: row-reverse; }
+    .message.user .bubble { background: var(--user-bubble); border-radius: var(--radius) var(--radius) 2px var(--radius); margin-left: auto; }
+    .message.bot .bubble { background: var(--bot-bubble); border: 1px solid var(--border); border-radius: var(--radius) var(--radius) var(--radius) 2px; }
+
+    .avatar {
+      width: 32px; height: 32px; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 14px; flex-shrink: 0; margin-top: 2px;
+    }
+    .message.user .avatar { background: var(--accent); }
+    .message.bot .avatar { background: var(--surface2); border: 1px solid var(--border); }
+
+    .bubble {
+      padding: 10px 14px;
+      line-height: 1.55;
+      max-width: 78%;
+      word-break: break-word;
+    }
+    .bubble .model-tag {
+      font-size: 10px;
+      color: var(--text-dim);
+      margin-bottom: 4px;
+      display: block;
+    }
+    .bubble pre {
+      background: #0d0f18;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      overflow-x: auto;
+      margin-top: 8px;
+      font-size: 12.5px;
+    }
+    .bubble code { font-family: 'JetBrains Mono', 'Fira Code', monospace; }
+
+    /* typing indicator */
+    .typing-dots { display: flex; gap: 4px; padding: 6px 0; }
+    .typing-dots span {
+      width: 7px; height: 7px; border-radius: 50%;
+      background: var(--text-dim);
+      animation: bounce .9s infinite;
+    }
+    .typing-dots span:nth-child(2) { animation-delay: .15s; }
+    .typing-dots span:nth-child(3) { animation-delay: .3s; }
+    @keyframes bounce { 0%,60%,100%{transform:translateY(0)} 30%{transform:translateY(-5px)} }
+
+    /* ───── Input Bar ───── */
+    #input-bar {
+      display: flex;
+      gap: 8px;
+      padding: 12px 0 16px;
+      border-top: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    #user-input {
+      flex: 1;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 14px;
+      color: var(--text);
+      font-size: 14px;
+      font-family: var(--font);
+      resize: none;
+      min-height: 44px;
+      max-height: 160px;
+      transition: border-color .2s;
+      line-height: 1.5;
+    }
+    #user-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(91,106,240,.2); }
+    #user-input::placeholder { color: var(--text-dim); }
+
+    #send-btn {
+      background: var(--accent);
+      border: none;
+      border-radius: 10px;
+      width: 44px;
+      height: 44px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      flex-shrink: 0;
+      transition: background .2s, transform .1s;
+    }
+    #send-btn:hover { background: var(--accent-hover); }
+    #send-btn:active { transform: scale(.95); }
+    #send-btn:disabled { background: var(--surface2); cursor: not-allowed; }
+    #send-btn svg { pointer-events: none; }
+
+    /* ───── Status Bar ───── */
+    #status-bar {
+      font-size: 11px;
+      color: var(--text-dim);
+      padding: 2px 0 8px;
+      min-height: 18px;
+      text-align: center;
+      flex-shrink: 0;
+    }
+    #status-bar.error { color: var(--danger); }
+    #status-bar.ok { color: var(--success); }
+
+    /* ───── Empty State ───── */
+    #empty-state {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      color: var(--text-dim);
+      pointer-events: none;
+    }
+    #empty-state .icon { font-size: 40px; opacity: .4; }
+    #empty-state p { font-size: 14px; opacity: .6; }
+  </style>
+</head>
+<body>
+<div id="app">
+
+  <!-- Header -->
+  <header>
+    <div class="logo">⚡ BEACON</div>
+
+    <div class="model-bar">
+      <label for="model-select">🔁 Switch model:</label>
+      <select id="model-select" title="Select AI model">
+        <option value="">Loading models…</option>
+      </select>
+      <span id="active-model-badge">—</span>
+    </div>
+  </header>
+
+  <!-- Status -->
+  <div id="status-bar"></div>
+
+  <!-- Chat -->
+  <div id="chat-container">
+    <div id="empty-state">
+      <div class="icon">💬</div>
+      <p>Choose a model above and start chatting</p>
+    </div>
+  </div>
+
+  <!-- Input -->
+  <div id="input-bar">
+    <textarea id="user-input" rows="1" placeholder="Message BEACON…" autocomplete="off"></textarea>
+    <button id="send-btn" title="Send (Enter)">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <line x1="22" y1="2" x2="11" y2="13"/>
+        <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+      </svg>
+    </button>
+  </div>
+
+</div>
+
+<script>
+// ───────────────────────────────────────────
+//  BEACON Chat UI
+// ───────────────────────────────────────────
+
+const modelSelect   = document.getElementById('model-select');
+const activeBadge   = document.getElementById('active-model-badge');
+const chatContainer = document.getElementById('chat-container');
+const emptyState    = document.getElementById('empty-state');
+const userInput     = document.getElementById('user-input');
+const sendBtn       = document.getElementById('send-btn');
+const statusBar     = document.getElementById('status-bar');
+
+let currentModel = '';
+let isLoading    = false;
+
+// ── Load models on page load ──────────────
+async function loadModels() {
+  setStatus('Fetching models…');
+  try {
+    const res  = await fetch('/models');
+    const data = await res.json();
+    const models = data.models || [];
+
+    modelSelect.innerHTML = '';
+
+    if (models.length === 0) {
+      modelSelect.innerHTML = '<option value="">No models available</option>';
+      setStatus('⚠ No models returned from server', 'error');
+      return;
+    }
+
+    models.forEach((id, i) => {
+      const opt = document.createElement('option');
+      opt.value = id;
+      // Pretty-print: take last segment after /
+      opt.textContent = prettyName(id);
+      if (i === 0) opt.selected = true;
+      modelSelect.appendChild(opt);
+    });
+
+    currentModel = models[0];
+    setBadge(currentModel);
+    setStatus(`✓ ${models.length} model${models.length !== 1 ? 's' : ''} loaded`, 'ok');
+    setTimeout(() => setStatus(''), 2500);
+
+  } catch (err) {
+    setStatus('Failed to load models — is the server running?', 'error');
+    console.error(err);
+  }
+}
+
+function prettyName(id) {
+  // e.g. "global/anthropic.claude-sonnet-4-6" → "claude-sonnet-4-6"
+  const parts = id.split('/');
+  return parts[parts.length - 1];
+}
+
+// ── Model switch ─────────────────────────
+modelSelect.addEventListener('change', () => {
+  currentModel = modelSelect.value;
+  setBadge(currentModel, true);
+  setStatus(`Model switched to ${prettyName(currentModel)}`, 'ok');
+  setTimeout(() => setStatus(''), 2000);
+});
+
+function setBadge(modelId, flash = false) {
+  activeBadge.textContent = prettyName(modelId);
+  if (flash) {
+    activeBadge.classList.add('changed');
+    setTimeout(() => activeBadge.classList.remove('changed'), 1500);
+  }
+}
+
+// ── Send message ─────────────────────────
+async function sendMessage() {
+  const text = userInput.value.trim();
+  if (!text || isLoading) return;
+  if (!currentModel) { setStatus('Please select a model first', 'error'); return; }
+
+  // Remove empty state
+  if (emptyState) emptyState.remove();
+
+  appendMessage('user', text);
+  userInput.value = '';
+  autoResize();
+
+  const typingEl = appendTyping();
+  setLoading(true);
+  setStatus('Thinking…');
+
+  try {
+    const res  = await fetch('/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text, model: currentModel }),
+    });
+    const data = await res.json();
+    typingEl.remove();
+
+    if (!res.ok) {
+      appendMessage('bot', `⚠ Error: ${data.detail || res.statusText}`, currentModel);
+      setStatus(`Error ${res.status}`, 'error');
+    } else {
+      appendMessage('bot', data.response || '(empty response)', data.model || currentModel);
+      setStatus('');
+    }
+  } catch (err) {
+    typingEl.remove();
+    appendMessage('bot', '⚠ Network error — could not reach the server.', currentModel);
+    setStatus('Network error', 'error');
+  }
+
+  setLoading(false);
+}
+
+// ── DOM helpers ──────────────────────────
+function appendMessage(role, text, modelId = '') {
+  const wrap = document.createElement('div');
+  wrap.className = `message ${role}`;
+
+  const avatar = document.createElement('div');
+  avatar.className = 'avatar';
+  avatar.textContent = role === 'user' ? '🧑' : '🤖';
+
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+
+  if (role === 'bot' && modelId) {
+    const tag = document.createElement('span');
+    tag.className = 'model-tag';
+    tag.textContent = prettyName(modelId);
+    bubble.appendChild(tag);
+  }
+
+  // Basic markdown: code blocks
+  bubble.appendChild(renderText(text));
+
+  wrap.appendChild(avatar);
+  wrap.appendChild(bubble);
+  chatContainer.appendChild(wrap);
+  chatContainer.scrollTop = chatContainer.scrollHeight;
+  return wrap;
+}
+
+function renderText(text) {
+  const frag = document.createDocumentFragment();
+  // Split on ```code``` blocks
+  const parts = text.split(/(```[\s\S]*?```)/g);
+  parts.forEach(part => {
+    if (part.startsWith('```')) {
+      const lines = part.slice(3, -3).split('\n');
+      const lang  = lines[0].trim();
+      const code  = lines.slice(lang ? 1 : 0).join('\n');
+      const pre   = document.createElement('pre');
+      const c     = document.createElement('code');
+      if (lang) c.className = `language-${lang}`;
+      c.textContent = code;
+      pre.appendChild(c);
+      frag.appendChild(pre);
+    } else {
+      const p = document.createElement('span');
+      p.style.whiteSpace = 'pre-wrap';
+      p.textContent = part;
+      frag.appendChild(p);
+    }
+  });
+  return frag;
+}
+
+function appendTyping() {
+  const wrap = document.createElement('div');
+  wrap.className = 'message bot';
+
+  const avatar = document.createElement('div');
+  avatar.className = 'avatar';
+  avatar.textContent = '🤖';
+
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  bubble.innerHTML = '<div class="typing-dots"><span></span><span></span><span></span></div>';
+
+  wrap.appendChild(avatar);
+  wrap.appendChild(bubble);
+  chatContainer.appendChild(wrap);
+  chatContainer.scrollTop = chatContainer.scrollHeight;
+  return wrap;
+}
+
+function setLoading(v) {
+  isLoading = v;
+  sendBtn.disabled = v;
+  userInput.disabled = v;
+}
+
+function setStatus(msg, type = '') {
+  statusBar.textContent = msg;
+  statusBar.className = type;
+}
+
+// ── Auto-resize textarea ─────────────────
+function autoResize() {
+  userInput.style.height = 'auto';
+  userInput.style.height = Math.min(userInput.scrollHeight, 160) + 'px';
+}
+userInput.addEventListener('input', autoResize);
+
+// ── Keyboard: Enter to send, Shift+Enter newline ──
+userInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+});
+
+sendBtn.addEventListener('click', sendMessage);
+
+// ── Boot ─────────────────────────────────
+loadModels();
+</script>
+</body>
+</html>
