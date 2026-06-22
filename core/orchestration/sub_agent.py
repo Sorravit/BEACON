@@ -16,6 +16,7 @@ each phase can use a different model.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 from typing import Any, Dict, List, Optional
@@ -125,23 +126,32 @@ class SubAgent:
         On exception the span status is set to ERROR and the exception is
         recorded on the span before the error string is returned.
         """
-        loop = asyncio.get_running_loop()
+        loop = asyncio.get_running_loop()  # retained for compatibility
         params = {
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": self.ai_agent.config.max_tokens,
         }
+        # Hard wall-clock timeout so a stalled response can never hang a phase
+        # forever (these direct calls bypass get_response's own guard).
+        import os as _os
+        _timeout = float(_os.getenv("LLM_REQUEST_TIMEOUT", "120")) + 30.0
+
+        async def _create():
+            # AsyncOpenAI returns a coroutine; sync clients/mocks return the
+            # response directly. Support both, and bound the awaitable path.
+            _call = self.ai_agent.client.chat.completions.create(**params)
+            if inspect.isawaitable(_call):
+                return await asyncio.wait_for(_call, timeout=_timeout)
+            return _call
 
         if _OTEL_AVAILABLE:
             with _tracer.start_as_current_span("llm_call") as span:
                 # --- attributes BEFORE the call ---
                 span.set_attribute("llm.model", self.model)
                 try:
-                    resp = await loop.run_in_executor(
-                        None,
-                        lambda: self.ai_agent.client.chat.completions.create(**params),
-                    )
+                    resp = await _create()
                     # --- attributes AFTER the call ---
                     if hasattr(resp, "usage") and resp.usage:
                         span.set_attribute("llm.prompt_tokens", resp.usage.prompt_tokens)
@@ -156,10 +166,7 @@ class SubAgent:
         else:
             # opentelemetry not installed -- pass through without instrumentation
             try:
-                resp = await loop.run_in_executor(
-                    None,
-                    lambda: self.ai_agent.client.chat.completions.create(**params),
-                )
+                resp = await _create()
                 return safe_encode_string((resp.choices[0].message.content or "").strip())
             except Exception as exc:  # pragma: no cover
                 logger.error("[%s] llm call failed: %s", self.role.key, exc)

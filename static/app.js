@@ -201,6 +201,148 @@ document.addEventListener('paste', async e => {
   if (files.length) { e.preventDefault(); await processDroppedFiles(files); }
 });
 
+// ── Phase 7 / #10: streaming token buffer + rAF batching ─────────────────────
+// Instead of appending one character at a time to the DOM, we accumulate tokens
+// and flush them in one requestAnimationFrame tick, which reduces reflow
+// from O(N characters) to O(1) per animation frame.
+let _rafPending = '';
+let _rafId      = null;
+let _rafEl      = null;   // the live streaming DOM element
+
+function _flushRaf() {
+  if (_rafEl && _rafPending) {
+    _rafEl.textContent += _rafPending;
+    _rafPending = '';
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+  _rafId = null;
+}
+
+function appendStreamingToken(el, token) {
+  _rafEl = el;
+  _rafPending += token;
+  if (!_rafId) _rafId = requestAnimationFrame(_flushRaf);
+}
+
+function flushStreamingElement(el, finalHtml) {
+  // Cancel any pending rAF, then set the final rendered HTML in one shot
+  if (_rafId) { cancelAnimationFrame(_rafId); _rafId = null; }
+  _rafPending = '';
+  _rafEl = null;
+  if (el) el.innerHTML = finalHtml;
+}
+
+// ── Phase 7 / #10: windowed session rendering ─────────────────────────────────
+const RENDER_WINDOW = 60;   // how many messages to show initially
+let _sessionMsgCache = [];  // full in-memory msg array for current session
+let _renderedFrom   = 0;    // index of first rendered message
+let _loadMoreObserver = null;
+
+function _clearLoadMoreObserver() {
+  if (_loadMoreObserver) { _loadMoreObserver.disconnect(); _loadMoreObserver = null; }
+}
+
+function _renderMessageItem(msg) {
+  if (msg.role === 'user') {
+    const b = createMessage('user', msg.ts);
+    b.innerHTML = msg._html || (msg._html = renderMarkdown(msg.content || ''));
+  } else if (msg.role === 'assistant') {
+    const isNotif = msg.notification === true;
+    const b = createMessage('ai', msg.ts);
+    b.innerHTML = msg._html || (msg._html = renderMarkdown(msg.content || ''));
+    if (msg.model_label) addModelBadge(b, msg.model_label);
+    if (isNotif) {
+      const levelIcon = {alert: '🚨', warning: '⚠️', success: '✅', info: '📋'};
+      const icon = levelIcon[msg.level] || '⚙';
+      const msgRow = b.closest ? b.closest('.msg') : null;
+      if (msgRow) {
+        const avatar = msgRow.querySelector('.avatar');
+        if (avatar) avatar.textContent = icon;
+        msgRow.classList.add('notif-' + (msg.level || 'info'));
+      }
+    }
+  }
+}
+
+function _renderWindow(messages, fromIndex) {
+  for (let i = fromIndex; i < messages.length; i++) {
+    _renderMessageItem(messages[i]);
+  }
+}
+
+function _setupLoadMore(messages, renderedFrom) {
+  _clearLoadMoreObserver();
+  if (renderedFrom <= 0) return;   // nothing older to load
+
+  // Insert a sentinel at the top
+  const sentinel = document.createElement('div');
+  sentinel.id = 'load-more-sentinel';
+  sentinel.style.cssText = 'height:1px;margin-top:8px;text-align:center;opacity:.5;font-size:12px;color:var(--muted)';
+  sentinel.textContent = `↑ ${renderedFrom} older message${renderedFrom !== 1 ? 's' : ''}`;
+  messagesEl.insertBefore(sentinel, messagesEl.firstChild);
+
+  _loadMoreObserver = new IntersectionObserver(entries => {
+    if (!entries[0].isIntersecting) return;
+    _clearLoadMoreObserver();
+    sentinel.remove();
+
+    const prevHeight = messagesEl.scrollHeight;
+    const loadCount = Math.min(renderedFrom, RENDER_WINDOW);
+    const newFrom   = renderedFrom - loadCount;
+
+    // Prepend older messages
+    const frag = document.createDocumentFragment();
+    const tmpDiv = document.createElement('div');
+    for (let i = newFrom; i < renderedFrom; i++) {
+      const msg = messages[i];
+      if (msg.role === 'user') {
+        const row = document.createElement('div'); row.className = 'msg user';
+        const av  = document.createElement('div'); av.className = 'avatar'; av.textContent = '👤';
+        const wr  = document.createElement('div'); wr.style.cssText = 'display:flex;flex-direction:column;max-width:76%';
+        const bub = document.createElement('div'); bub.className = 'bubble'; bub.style.maxWidth = '100%';
+        bub.innerHTML = msg._html || (msg._html = renderMarkdown(msg.content || ''));
+        wr.appendChild(bub);
+        if (msg.ts) { const t=document.createElement('div');t.className='msg-ts';t.textContent=fmtTs(msg.ts);wr.appendChild(t); }
+        row.appendChild(av); row.appendChild(wr);
+        frag.appendChild(row);
+      } else if (msg.role === 'assistant') {
+        const row = document.createElement('div'); row.className = 'msg ai';
+        const av  = document.createElement('div'); av.className = 'avatar'; av.textContent = '🤖';
+        const wr  = document.createElement('div'); wr.style.cssText = 'display:flex;flex-direction:column;max-width:76%';
+        const bub = document.createElement('div'); bub.className = 'bubble'; bub.style.maxWidth = '100%';
+        bub.innerHTML = msg._html || (msg._html = renderMarkdown(msg.content || ''));
+        wr.appendChild(bub);
+        if (msg.ts) { const t=document.createElement('div');t.className='msg-ts';t.textContent=fmtTs(msg.ts);wr.appendChild(t); }
+        row.appendChild(av); row.appendChild(wr);
+        frag.appendChild(row);
+      }
+    }
+    messagesEl.insertBefore(frag, messagesEl.firstChild);
+
+    // Preserve scroll position (don't jump to top)
+    messagesEl.scrollTop += (messagesEl.scrollHeight - prevHeight);
+    _renderedFrom = newFrom;
+    _setupLoadMore(messages, newFrom);
+  }, { root: messagesEl, threshold: 0 });
+
+  _loadMoreObserver.observe(sentinel);
+}
+
+function renderSessionMessages(messages) {
+  _clearLoadMoreObserver();
+  messagesEl.innerHTML = '';
+  _sessionMsgCache = messages;
+
+  if (!messages || messages.length === 0) return false;  // caller shows empty state
+
+  const fromIndex = Math.max(0, messages.length - RENDER_WINDOW);
+  _renderedFrom = fromIndex;
+  _renderWindow(messages, fromIndex);
+  scrollToBottom();
+  _setupLoadMore(messages, fromIndex);
+  return true;
+}
+
 // ── Markdown renderer ─────────────────────────────────────────────────────────
 function copyCode(btn) {
   const pre = btn.closest('pre');
@@ -563,30 +705,9 @@ async function switchSession(id) {
     window.history.replaceState({}, '', '/?session=' + encodeURIComponent(id));
     messagesEl.innerHTML = '';
     _currentSessionEmpty = (!data.messages || data.messages.length === 0);
-    if (data.messages && data.messages.length > 0) {
-      data.messages.forEach(msg => {
-        if (msg.role === 'user') {
-          const b = createMessage('user', msg.ts);
-          b.innerHTML = renderMarkdown(msg.content || '');
-        } else if (msg.role === 'assistant') {
-          const isNotif = msg.notification === true;
-          const b = createMessage('ai', msg.ts);
-          b.innerHTML = renderMarkdown(msg.content || '');
-          if (msg.model_label) addModelBadge(b, msg.model_label);
-          if (isNotif) {
-            const levelIcon = {alert: '🚨', warning: '⚠️', success: '✅', info: '📋'};
-            const icon = levelIcon[msg.level] || '⚙';
-            const msgRow = b.closest ? b.closest('.msg') : null;
-            if (msgRow) {
-              const avatar = msgRow.querySelector('.avatar');
-              if (avatar) avatar.textContent = icon;
-              msgRow.classList.add('notif-' + (msg.level || 'info'));
-            }
-          }
-        }
-      });
-      scrollToBottom();
-    } else {
+    // Phase 7 / #10: windowed rendering — only show last RENDER_WINDOW messages initially
+    const hasMessages = renderSessionMessages(data.messages || []);
+    if (!hasMessages) {
       const es = document.createElement('div');
       es.className = 'empty-state'; es.id = 'empty-state-active';
       es.innerHTML = `<div class="empty-icon">🤖</div><div class="empty-title">Big's Personal AI Assistant</div>
@@ -652,16 +773,22 @@ async function reconnectToSession(id) {
         else if(ev.type==='skill_active'){if(ev.skill)atl('\uD83C\uDFAF Skill activated: '+ev.skill,'tool-call');}
         else if(ev.type==='model'){answerModelLabel=ev.label||ev.content||'';addModelBadge(ab,answerModelLabel);}
         else if(ev.type==='result'){(ev.content||'').split('\n').forEach(l=>{if(l.trim())atl('   '+l,'tool-result');});if(id===currentSessionId)setStatus('thinking','Processing\u2026');}
-        else if(ev.type==='token'){acc+=ev.content||'';tn.innerHTML=renderMarkdown(acc);scrollToBottom();if(id===currentSessionId)setStatus('thinking','Responding\u2026');}
-        else if(ev.type==='done'){tBo.classList.remove('open');tIc.innerHTML=steps>0?'<span style="color:var(--green);font-size:13px">\u2713</span>':'<span style="color:var(--muted);font-size:13px">\u2014</span>';
-        tLb.textContent=steps>0?('\u2699 '+steps+' step'+(steps>1?'s':'')+' completed'):'\u2699 No tools used';
-        tn.innerHTML=renderMarkdown(acc);if(answerModelLabel)addModelBadge(ab,answerModelLabel);scrollToBottom();refreshTasksBadge();await loadSessions();
+         else if(ev.type==='token'){
+           acc+=ev.content||'';
+           appendStreamingToken(tn, ev.content||'');
+           if(id===currentSessionId)setStatus('thinking','Responding\u2026');
+         }
+         else if(ev.type==='done'){
+           flushStreamingElement(tn, renderMarkdown(acc));
+           tBo.classList.remove('open');tIc.innerHTML=steps>0?'<span style="color:var(--green);font-size:13px">\u2713</span>':'<span style="color:var(--muted);font-size:13px">\u2014</span>';
+         tLb.textContent=steps>0?('\u2699 '+steps+' step'+(steps>1?'s':'')+' completed'):'\u2699 No tools used';
+         if(answerModelLabel)addModelBadge(ab,answerModelLabel);scrollToBottom();refreshTasksBadge();await loadSessions();
         const ud=await(await fetch('/sessions/'+currentSessionId)).json();
         chatTitleEl.textContent=ud.title||'New Chat';
         flashTabTitle("✅ Big's AI replied");
       }else if(ev.type==='stopped'){tBo.classList.remove('open');tIc.innerHTML='<span style="color:var(--yellow);font-size:13px">\u23F9</span>';
       tLb.textContent='\u2699 Stopped by user after '+steps+' step'+(steps!==1?'s':'');
-      if(acc)tn.innerHTML=renderMarkdown(acc);
+      if(acc) flushStreamingElement(tn, renderMarkdown(acc));
       scrollToBottom();
      }else if(ev.type==='error'){atl('\u26a0 '+(ev.content||'Unknown error'),'error');tBo.classList.add('open');setStatus('error','Error');
      }
@@ -895,22 +1022,27 @@ async function sendMessage(){
           (ev.content||'').split('\n').forEach(l=>{if(l.trim())atl('   '+l,'tool-result');});
           setStatus('thinking','Processing\u2026');
         }else if(ev.type==='token'){
-          acc+=ev.content||'';tn.innerHTML=renderMarkdown(acc);scrollToBottom();setStatus('thinking','Responding\u2026');
+          // Phase 7 / #10: rAF-batched append — avoid full markdown re-render per token
+          acc+=ev.content||'';
+          appendStreamingToken(tn, ev.content||'');
+          setStatus('thinking','Responding\u2026');
         }else if(ev.type==='done'){
+          // Phase 7 / #10: flush with final rendered markdown (one re-render)
+          flushStreamingElement(tn, renderMarkdown(acc));
           tBo.classList.remove('open');
           tIc.innerHTML=steps>0?'<span style="color:var(--green);font-size:13px">\u2713</span>':'<span style="color:var(--muted);font-size:13px">\u2014</span>';
           tLb.textContent=steps>0?('\u2699 '+steps+' step'+(steps>1?'s':'')+' completed'):'\u2699 No tools used';
-          tn.innerHTML=renderMarkdown(acc);scrollToBottom();refreshTasksBadge();
+          scrollToBottom();refreshTasksBadge();
           if(answerModelLabel)addModelBadge(ab,answerModelLabel);
           await loadSessions();
           const ud=await(await fetch('/sessions/'+currentSessionId)).json();
           chatTitleEl.textContent=ud.title||'New Chat';
           flashTabTitle("✅ Big's AI replied");
         }else if(ev.type==='stopped'){
+          flushStreamingElement(tn, acc ? renderMarkdown(acc) : '');
           tBo.classList.remove('open');
           tIc.innerHTML='<span style="color:var(--yellow);font-size:13px">\u23F9</span>';
           tLb.textContent='\u2699 Stopped by user after '+steps+' step'+(steps!==1?'s':'');
-          if(acc)tn.innerHTML=renderMarkdown(acc);
           scrollToBottom();
         }else if(ev.type==='error'){
           atl('\u26a0 '+(ev.content||'Unknown error'),'error');tBo.classList.add('open');setStatus('error','Error');

@@ -38,6 +38,7 @@ Design notes
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from dataclasses import dataclass, field
@@ -115,13 +116,17 @@ async def _call_single_model(
     }
 
     try:
-        resp = await asyncio.wait_for(
-            loop.run_in_executor(
-                None,
-                lambda: client.chat.completions.create(**params),
-            ),
-            timeout=timeout_secs,
-        )
+        # Support both AsyncOpenAI (returns a coroutine) and a synchronous
+        # client/mock (returns the response directly). This keeps multi-inference
+        # working after the AsyncOpenAI migration without breaking sync test mocks.
+        _call = client.chat.completions.create(**params)
+        if inspect.isawaitable(_call):
+            resp = await asyncio.wait_for(_call, timeout=timeout_secs)
+        else:
+            resp = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: _call),
+                timeout=timeout_secs,
+            )
         elapsed = int((time.monotonic() - start) * 1000)
         text = (resp.choices[0].message.content or "").strip()
         usage = getattr(resp, "usage", None)

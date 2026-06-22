@@ -60,20 +60,22 @@ class ToolManager(
 ):
     """Manages all agent tools, split by domain modules."""
 
-    def __init__(self, vector_memory=None, mcp_manager=None, shared_browser=None, skill_manager=None):
+    def __init__(self, vector_memory=None, mcp_manager=None, shared_browser=None,
+                 skill_manager=None, shared_context=None):
         self.tools: List[Dict[str, Any]] = []
         self.tool_handlers: Dict[str, Callable] = {}
         self._shared_browser = shared_browser
+        # Phase 6 / #2: per-session BrowserContext from the pool
+        self._shared_context = shared_context
+        # If a shared_context is provided, pre-populate self._context so
+        # _ensure_browser skips launching / creating a new context.
         self.browser = None
         self.page = None
-        self._context = None
+        self._context = shared_context  # None or a BrowserContext from BrowserPool
         self.playwright = None
         self.vector_memory = vector_memory
         self.mcp_manager = mcp_manager
         self.skill_manager = skill_manager
-        # Assign a unique session ID immediately so every tool span is always
-        # associated with a session.  Callers (e.g. web_app._run_agent_bg) may
-        # override this with the HTTP-session UUID; that is intentional and safe.
         self.session_id: str = str(uuid.uuid4())
 
     async def initialize(self):
@@ -260,14 +262,22 @@ class ToolManager(
 
     async def cleanup(self):
         try:
-            if self._context:
+            if self._context and self._context is not self._shared_context:
+                # Only close contexts we own (not the shared pool context)
+                await self._context.close()
+                self._context = None
+                self.page = None
+            elif self._shared_context:
+                # Pooled context — just drop our page reference, pool owns lifecycle
+                self.page = None
+            elif self._context:
                 await self._context.close()
                 self._context = None
                 self.page = None
         except Exception:
             pass
 
-        if not self._shared_browser:
+        if not self._shared_browser and not self._shared_context:
             try:
                 if self.browser:
                     await self.browser.close()

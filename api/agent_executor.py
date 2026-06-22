@@ -334,17 +334,23 @@ class AgentExecutor:
     async def _llm_call(self, messages):
         """Direct LLM call bypassing the tool-executing agent loop.
         Used for RESEARCH, PLAN, VERIFY phases which must only analyse, never execute."""
-        import asyncio as _asyncio
-        loop = _asyncio.get_running_loop()
+        import inspect as _inspect
+        import os as _os
         params = {
             "model": self.ai_agent.config.model,
             "messages": messages,
             "temperature": 0.3,
             "max_tokens": self.ai_agent.config.max_tokens,
         }
-        response = await loop.run_in_executor(
-            None, lambda: self.ai_agent.client.chat.completions.create(**params)
-        )
+        # Hard wall-clock timeout so a stalled upstream response can never hang a
+        # task phase forever (these calls bypass get_response's own guard).
+        _timeout = float(_os.getenv("LLM_REQUEST_TIMEOUT", "120")) + 30.0
+        # AsyncOpenAI returns a coroutine; sync clients/mocks return directly.
+        _call = self.ai_agent.client.chat.completions.create(**params)
+        if _inspect.isawaitable(_call):
+            response = await asyncio.wait_for(_call, timeout=_timeout)
+        else:
+            response = _call
         return (response.choices[0].message.content or "").strip()
 
     async def _phase_research(self, task: Task):

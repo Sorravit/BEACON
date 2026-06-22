@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import os
-import subprocess
+import signal
 
 # ── gRPC fork-safety ─────────────────────────────────────────────────────────
 # subprocess.run(shell=True) calls os.fork() internally.  If gRPC background
@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 
 class CommandToolsMixin:
 
+    _TIMEOUT_KILL_GRACE_SECONDS = 2.0
+    _TIMEOUT_KILL_WAIT_SECONDS = 3.0
+
     @staticmethod
     def _looks_like_self_kill(command: str) -> bool:
         """Block obvious commands that can kill this server process itself."""
@@ -36,6 +39,58 @@ class CommandToolsMixin:
         if any(k in cmd for k in kill_tokens) and any(a in cmd for a in app_tokens):
             return True
         return False
+
+    async def _terminate_timed_out_process(self, proc: asyncio.subprocess.Process) -> None:
+        """Terminate timed-out process safely, including spawned children.
+
+        We launch shell commands with ``start_new_session=True`` so each command
+        gets its own process group. On timeout, kill the whole group to avoid
+        orphaned children holding stdout/stderr pipes open.
+        """
+        pgid = None
+        try:
+            pgid = os.getpgid(proc.pid)
+        except Exception:
+            pgid = None
+
+        try:
+            if pgid:
+                os.killpg(pgid, signal.SIGTERM)
+            else:
+                proc.terminate()
+        except ProcessLookupError:
+            return
+        except Exception:
+            try:
+                proc.terminate()
+            except Exception:
+                return
+
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=self._TIMEOUT_KILL_GRACE_SECONDS)
+            return
+        except asyncio.TimeoutError:
+            pass
+        except Exception:
+            return
+
+        try:
+            if pgid:
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                proc.kill()
+        except ProcessLookupError:
+            return
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                return
+
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=self._TIMEOUT_KILL_WAIT_SECONDS)
+        except Exception:
+            pass
 
     async def _execute_command(self, command: str):
         span = trace.get_current_span()
@@ -65,12 +120,12 @@ class CommandToolsMixin:
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
             )
             try:
                 stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=30)
             except asyncio.TimeoutError:
-                proc.kill()
-                await proc.communicate()
+                await self._terminate_timed_out_process(proc)
                 try:
                     span.set_attribute("tool.exit_code", -1)
                     span.set_attribute("tool.error", "TimeoutExpired(30s)")
@@ -124,14 +179,14 @@ class CommandToolsMixin:
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
             )
             try:
                 stdout_bytes, stderr_bytes = await asyncio.wait_for(
                     proc.communicate(), timeout=effective_timeout
                 )
             except asyncio.TimeoutError:
-                proc.kill()
-                await proc.communicate()
+                await self._terminate_timed_out_process(proc)
                 try:
                     span.set_attribute("tool.exit_code", -1)
                     span.set_attribute("tool.error", f"TimeoutExpired({timeout_val}s / {timeout_val // 60}min)")

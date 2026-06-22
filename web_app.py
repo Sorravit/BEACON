@@ -40,6 +40,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import AsyncGenerator, Dict, List, Optional
 
+import aiofiles
+
 import atexit
 import signal as _signal
 import sys as _sys
@@ -134,7 +136,7 @@ logger = logging.getLogger(__name__)
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _config, _shared_agent
+    global _config, _shared_agent, _events_producer_task
     # ── Startup ───────────────────────────────────────────────────────────────
     _config = Config()
     if not _config.validate():
@@ -157,12 +159,32 @@ async def lifespan(app: FastAPI):
         _rotate_log_if_needed(lf)
     _rotate_bg_logs()
 
+    # Phase 4 / #5: start the single global events producer
+    _events_producer_task = asyncio.create_task(
+        _events_producer(), name="events-producer"
+    )
+
     # OTel tracer already initialised at module load (top-level).
     logger.info("OTel tracer active ✓  (lifespan startup complete)")
 
     yield  # App runs here
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
+    # Stop the events producer
+    if _events_producer_task and not _events_producer_task.done():
+        _events_producer_task.cancel()
+        try:
+            await asyncio.wait_for(_events_producer_task, timeout=2)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+
+    # Flush any pending debounced session saves
+    for sid in list(_save_pending.keys()):
+        h = _save_pending.pop(sid, None)
+        if h:
+            h.cancel()
+        _save_session(sid)  # sync flush on shutdown
+
     # Pre-clean loky in case later shutdown steps are interrupted.
     _cleanup_loky()
 
@@ -276,13 +298,22 @@ _bg: Dict[str, dict] = {}
 # ── Tasks SSE: snapshot cache so we only push when something changes ──────────
 _last_tasks_snapshot: Optional[str] = None
 
+# ── Phase 3 / #6: async session persistence ───────────────────────────────────
+_save_locks: Dict[str, asyncio.Lock] = {}
+_save_pending: Dict[str, asyncio.TimerHandle] = {}
+
+# ── Phase 4 / #5: global events producer ─────────────────────────────────────
+_events_producer_task: Optional[asyncio.Task] = None
+_events_subscribers: set = set()
+_events_cache: dict = {"tasks": [], "notifications": [], "activity": {}}
+
 
 def _bg_state(session_id: str) -> dict:
     if session_id not in _bg:
         _bg[session_id] = {
             "task":       None,
             "event_buf":  [],
-            "done_event": asyncio.Event(),
+            "done_event": None,   # FIX1: created lazily inside running event loop
             "activity":   "",
         }
     return _bg[session_id]
@@ -310,6 +341,61 @@ def _save_session(session_id: str):
         _session_file(session_id).write_text(json.dumps(data, ensure_ascii=False, indent=2))
     except Exception as e:
         logger.warning(f"Could not save session {session_id}: {e}")
+
+
+# ── Phase 3 / #6: async atomic session writer ─────────────────────────────────
+
+async def _save_session_async(session_id: str):
+    """Write the session file atomically via a tmp file (non-blocking)."""
+    s = _sessions.get(session_id)
+    if not s:
+        return
+    data = {
+        "id":             session_id,
+        "title":          s["title"],
+        "created_at":     s["created_at"],
+        "updated_at":     s["updated_at"],
+        "messages":       s["messages"],
+        "manually_named": s.get("manually_named", False),
+        "pinned":         s.get("pinned", False),
+        "pin_order":      s.get("pin_order", 0),
+    }
+    lock = _save_locks.setdefault(session_id, asyncio.Lock())
+    async with lock:
+        # Unique tmp name so concurrent saves to different sessions never collide
+        tmp = _session_file(session_id).with_name(
+            f"{session_id}.{uuid.uuid4().hex[:8]}.tmp"
+        )
+        try:
+            async with aiofiles.open(tmp, "w", encoding="utf-8") as f:
+                await f.write(json.dumps(data, ensure_ascii=False, indent=2))
+            os.replace(tmp, _session_file(session_id))  # atomic on POSIX/macOS
+        except Exception as e:
+            logger.warning(f"Could not async-save session {session_id}: {e}")
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+_SESSION_SAVE_DEBOUNCE = float(os.getenv("SESSION_SAVE_DEBOUNCE_MS", "750")) / 1000.0
+
+
+def _schedule_save(session_id: str):
+    """Debounce session saves: coalesce rapid writes into one disk write."""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        # No running loop (e.g. startup) — fall back to sync save
+        _save_session(session_id)
+        return
+    h = _save_pending.pop(session_id, None)
+    if h:
+        h.cancel()
+    _save_pending[session_id] = loop.call_later(
+        _SESSION_SAVE_DEBOUNCE,
+        lambda: asyncio.create_task(_save_session_async(session_id)),
+    )
 
 
 def _load_all_sessions():
@@ -342,7 +428,7 @@ def _create_session() -> str:
         "pinned":         False,
         "pin_order":      0,
     }
-    _save_session(sid)
+    _save_session(sid)   # sync: ensure it exists immediately
     return sid
 
 
@@ -358,7 +444,6 @@ async def _generate_smart_title(session_id: str, user_msg: str, assistant_msg: s
         agent = _shared_agent
         if not agent or not agent.client:
             return
-        loop = asyncio.get_running_loop()
         params = dict(
             model=_config.model,
             messages=[{
@@ -371,14 +456,13 @@ async def _generate_smart_title(session_id: str, user_msg: str, assistant_msg: s
                 )
             }],
             temperature=0.3,
-            max_tokens=min(_config.max_tokens, 100),  # title is max 5 words
+            max_tokens=min(_config.max_tokens, 100),
         )
         import contextlib as _cl_st
         _st_ctx = record_llm_call(_config.model, session_id=session_id) if _TELEMETRY_AVAILABLE else _cl_st.nullcontext()
         with _st_ctx:
-            response = await loop.run_in_executor(
-                None, lambda: agent.client.chat.completions.create(**params)
-            )
+            # Phase 5: native async call
+            response = await agent.client.chat.completions.create(**params)
         raw = (response.choices[0].message.content or "").strip()
         title = raw.splitlines()[0].strip().strip("'\"")
         if title and len(title) > 2:
@@ -386,7 +470,7 @@ async def _generate_smart_title(session_id: str, user_msg: str, assistant_msg: s
             if s and not s.get("manually_named"):
                 s["title"] = title[:60]
                 s["updated_at"] = datetime.now().isoformat()
-                _save_session(session_id)
+                _schedule_save(session_id)
                 logger.info(f"Smart title for {session_id}: {title}")
     except Exception as e:
         logger.debug(f"Smart title generation skipped: {e}")
@@ -506,7 +590,7 @@ async def reorder_pins(req: ReorderRequest):
         s = _sessions.get(sid)
         if s and s.get("pinned"):
             s["pin_order"] = i
-            _save_session(sid)
+            _schedule_save(sid)
     return {"status": "ok"}
 
 
@@ -525,7 +609,7 @@ async def pin_session(session_id: str):
     else:
         s["pin_order"] = 0
     s["updated_at"] = datetime.now().isoformat()
-    _save_session(session_id)
+    await _save_session_async(session_id)   # immediate durability for pin
     return {"id": session_id, "pinned": s["pinned"], "pin_order": s["pin_order"]}
 
 
@@ -555,7 +639,7 @@ async def rename_session(session_id: str, req: RenameRequest):
     s["title"] = req.title.strip() or "New Chat"
     s["manually_named"] = True
     s["updated_at"] = datetime.now().isoformat()
-    _save_session(session_id)
+    await _save_session_async(session_id)   # immediate durability for rename
     return {"id": session_id, "title": s["title"]}
 
 
@@ -568,6 +652,12 @@ async def delete_session(session_id: str):
     if fp.exists():
         fp.unlink()
     _bg.pop(session_id, None)
+    # Phase 6 / #2: release browser context for this session
+    if _shared_agent and _shared_agent.browser_pool:
+        try:
+            await _shared_agent.browser_pool.close_session(session_id)
+        except Exception:
+            pass
     return {"status": "deleted", "id": session_id}
 
 
@@ -665,7 +755,7 @@ async def chat_clear(req: ChatRequest):
     if s:
         s["messages"] = []
         s["updated_at"] = datetime.now().isoformat()
-        _save_session(sid)
+        await _save_session_async(sid)   # immediate for clear
     _bg.pop(sid, None)
     return {"status": "cleared", "session_id": sid}
 
@@ -674,6 +764,35 @@ async def chat_clear(req: ChatRequest):
 @app.get("/health")
 async def health():
     return {"status": "ok", "sessions": len(_sessions)}
+
+
+@app.get("/memory/health")
+async def memory_health():
+    """Phase 2: inspect auto-memory worker health + Weaviate availability."""
+    a = _shared_agent
+    vm_ok = bool(a and a.memory_available)
+    stats = {}
+    if a and a.memory_worker:
+        stats = dict(a.memory_worker.stats)
+    auto_count = 0
+    personal_count = 0
+    if vm_ok:
+        try:
+            facts = await a.vector_memory.get_all_auto_facts()
+            auto_count = len(facts or [])
+        except Exception:
+            pass
+        try:
+            pfacts = await a.vector_memory.get_all_personal_facts()
+            personal_count = len(pfacts or [])
+        except Exception:
+            pass
+    return {
+        "weaviate": vm_ok,
+        "worker": stats,
+        "auto_fact_count": auto_count,
+        "personal_fact_count": personal_count,
+    }
 
 
 # ── Model registry endpoints ──────────────────────────────────────────────────
@@ -770,7 +889,7 @@ async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent, model:
             if not s.get("manually_named") and len([m for m in s["messages"] if m["role"] == "user"]) == 1:
                 s["title"] = _auto_title(user_input)
             s["updated_at"] = now
-            _save_session(session_id)
+            _schedule_save(session_id)  # Phase 3: debounced async write
 
     # Resolve the model that will actually answer so the UI can show it and we
     # can persist it with the message.
@@ -781,10 +900,12 @@ async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent, model:
 
     try:
         from main import ToolManager
+        # Phase 6 / #2: get per-session browser context from the pool
+        _browser_ctx = await agent.browser_pool.get_context(session_id) if agent.browser_pool else None
         per_request_tools = ToolManager(
             vector_memory=agent.vector_memory,
             mcp_manager=agent.mcp_manager,
-            shared_browser=await agent._get_shared_browser(),  # lazy init — one Chromium process shared
+            shared_context=_browser_ctx,
             skill_manager=agent.skill_manager,
         )
         await per_request_tools.initialize()
@@ -873,7 +994,7 @@ async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent, model:
             s["messages"].append({"role": "assistant", "content": content, "ts": now,
                                    "model": resolved_model, "model_label": model_label})
             s["updated_at"] = now
-            _save_session(session_id)
+            _schedule_save(session_id)  # Phase 3: debounced async write
 
         _emit({"type": "done"})
 
@@ -928,7 +1049,13 @@ async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent, model:
             except Exception as _re:
                 logger.debug(f"SessionReporter save error: {_re}")
         bg["activity"] = ""
-        bg["done_event"].set()
+        # FIX3: guard against None (done_event set lazily in chat_stream)
+        _dev = bg.get("done_event")
+        if _dev is not None:
+            _dev.set()
+        # Phase 9: cap event_buf to avoid unbounded growth
+        if len(bg["event_buf"]) > 4000:
+            bg["event_buf"] = bg["event_buf"][-2000:]
 
 
 async def _reconnect_stream(session_id: str) -> AsyncGenerator[str, None]:
@@ -936,18 +1063,29 @@ async def _reconnect_stream(session_id: str) -> AsyncGenerator[str, None]:
     Stream all buffered events then continue streaming live events until done.
     """
     bg = _bg_state(session_id)
+    done_event = bg.get("done_event")  # FIX2: snapshot once at entry
     cursor = 0
     idle_ticks = 0
 
     while True:
+        # FIX2: lazily pick up done_event if task not yet created at entry
+        if done_event is None:
+            done_event = bg.get("done_event")
+
         buf = bg["event_buf"]
+        # Phase 9: guard cursor if event_buf was capped
+        cursor = min(cursor, len(buf))
         while cursor < len(buf):
             ev = buf[cursor]
             cursor += 1
             yield " " + json.dumps(ev) + "\n\n"
 
         task = bg.get("task")
-        is_done = (task is None or task.done()) and bg["done_event"].is_set()
+        is_done = (
+            (task is None or task.done())
+            and done_event is not None  # FIX2: guard stale-ref freeze
+            and done_event.is_set()
+        )
         if is_done and cursor >= len(bg["event_buf"]):
             break
 
@@ -959,6 +1097,48 @@ async def _reconnect_stream(session_id: str) -> AsyncGenerator[str, None]:
 
 # ── Background tasks (CLI processes) ─────────────────────────────────────────
 
+# ── Phase 4 / #5: single global events producer ──────────────────────────────
+
+async def _events_producer():
+    """
+    Single background task that builds the tasks/notifications/activity
+    snapshot ONCE every 3 seconds and fans it out to all connected SSE clients.
+
+    Fixes two issues in the old per-client generator:
+    1. _build_tasks_payload (glob + pgrep) ran once per client per tick.
+    2. _collect_notifications unlinked files inside each client's loop →
+       with 2+ open /events connections only one client received each note.
+    """
+    global _events_cache
+    while True:
+        try:
+            payload = await _build_tasks_payload()   # globs + pgrep exactly ONCE
+            activity = {
+                sid: bg["activity"]
+                for sid, bg in _bg.items()
+                if bg.get("task") and not bg["task"].done() and bg.get("activity")
+            }
+            _events_cache = {
+                "tasks":         payload["tasks"],
+                "notifications": payload["notifications"],
+                "activity":      activity,
+            }
+            snap = json.dumps(_events_cache)
+            for q in list(_events_subscribers):
+                try:
+                    if not q.full():
+                        q.put_nowait(snap)
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.warning("events producer error: %s", exc)
+        await asyncio.sleep(3)
+
+
+# ── Background tasks payload builder ─────────────────────────────────────────
+
 async def _build_tasks_payload() -> dict:
     """Build the current tasks + notifications payload (used by both REST and SSE)."""
     names = set()
@@ -969,18 +1149,25 @@ async def _build_tasks_payload() -> dict:
         name = Path(lf).stem[3:]
         names.add(name)
 
+    # FIX4: parallelise pgrep — sequential awaits starved event loop
+    async def _check_alive(name: str) -> bool:
+        try:
+            _proc = await asyncio.create_subprocess_exec(
+                "pgrep", "-f", f"background_task.*--name.*{name}",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await _proc.wait()
+            return _proc.returncode == 0
+        except Exception:
+            return False
+
+    sorted_names = sorted(names)
+    alive_results = await asyncio.gather(*[_check_alive(n) for n in sorted_names])
+
     tasks = []
-    for name in sorted(names):
-        # Step7: asyncio.create_subprocess_exec
-        _proc = await asyncio.create_subprocess_exec(
-            "pgrep", "-f", f"background_task.*--name.*{name}",
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await _proc.wait()
-        alive = _proc.returncode == 0
+    for name, alive in zip(sorted_names, alive_results):
         log_file = f"logs/bg_{name}.log"
-        # Rotate oversized logs in the background
         _rotate_log_if_needed(Path(log_file))
         tasks.append({
             "name": name,
@@ -1021,7 +1208,7 @@ async def _collect_notifications() -> list:
                     "task_name": data.get("task_name", "")
                 })
                 s["updated_at"] = ts
-                _save_session(sid)
+                _schedule_save(sid)
         except Exception as e:
             logger.warning(f"Could not read notification {f}: {e}")
     return notes
@@ -1039,39 +1226,30 @@ async def event_stream(request: Request):
 
 
 async def _events_generator(request: Request) -> AsyncGenerator[str, None]:
-    """Yield task status + notifications + chat activity as SSE events every 3 seconds."""
-    tick = 0
-    while True:
-        if await request.is_disconnected():
-            logger.debug("SSE /events client disconnected — stopping generator")
-            return
-        try:
-            payload = await _build_tasks_payload()
-
-            # Build activity dict: session_id → current activity string for running sessions
-            activity = {}
-            for sid, bg in _bg.items():
-                task = bg.get("task")
-                running = task is not None and not task.done()
-                if running and bg.get("activity"):
-                    activity[sid] = bg["activity"]
-
-            full_payload = {
-                "tasks": payload["tasks"],
-                "notifications": payload["notifications"],
-                "activity": activity,
-            }
-            yield "data: " + json.dumps(full_payload) + "\n\n"
-
-            tick += 1
-            await asyncio.sleep(3)
-            if tick % 5 == 0:  # keepalive every 15 s
+    """
+    Phase 4 / #5: thin SSE subscriber.
+    Subscribes to the single global _events_producer via an asyncio.Queue.
+    Notifications are consumed once by the producer and broadcast to all
+    connected clients, so every tab receives every notification exactly once.
+    """
+    q: asyncio.Queue = asyncio.Queue(maxsize=4)
+    _events_subscribers.add(q)
+    try:
+        # Send current snapshot immediately on connect
+        yield "data: " + json.dumps(_events_cache) + "\n\n"
+        while True:
+            if await request.is_disconnected():
+                logger.debug("SSE /events client disconnected — stopping generator")
+                return
+            try:
+                snap = await asyncio.wait_for(q.get(), timeout=15)
+                yield "data: " + snap + "\n\n"
+            except asyncio.TimeoutError:
                 yield ": keepalive\n\n"
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.warning(f"_events_generator error: {e}")
-            await asyncio.sleep(3)
+            except asyncio.CancelledError:
+                break
+    finally:
+        _events_subscribers.discard(q)
 
 
 # ── Legacy SSE endpoint kept for backward compat ──────────────────────────────
@@ -1272,6 +1450,13 @@ from api.agent_executor import AgentExecutor, Task, TaskStatus
 from core.orchestration import Orchestrator
 _agent_tasks = {}
 
+
+async def _evict_task_later(task_id: str, delay: int = 600):
+    """Phase 9 / #9: evict finished agent tasks from memory after `delay` seconds."""
+    await asyncio.sleep(delay)
+    _agent_tasks.pop(task_id, None)
+    logger.debug("Evicted agent task %s from memory", task_id)
+
 class AgentTaskRequest(BaseModel):
     description: str
     session_id: str = None
@@ -1329,7 +1514,7 @@ def _make_task_callback(task_id, session_id=None):
                     "ts": now,
                 })
                 s["updated_at"] = now
-                _save_session(session_id)
+                _schedule_save(session_id)
         elif event in ("task_failed", "task_cancelled"):
             error = _safe_task_text(data.get("error", "unknown error"))
             s["messages"].append({
@@ -1338,7 +1523,7 @@ def _make_task_callback(task_id, session_id=None):
                 "ts": now,
             })
             s["updated_at"] = now
-            _save_session(session_id)
+            _schedule_save(session_id)
 
     return _cb
 
@@ -1387,7 +1572,7 @@ async def agent_submit_task(req: AgentTaskRequest):
             if not s.get("manually_named") and len([m for m in s["messages"] if m["role"] == "user"]) == 1:
                 s["title"] = _auto_title(req.description)
             s["updated_at"] = now
-            _save_session(session_id)
+            _schedule_save(session_id)
             logger.info(f"Saved task command to session {session_id}: {req.description[:60]}")
 
     executor = _make_agent_executor(task_id, session_id=session_id)
@@ -1402,6 +1587,8 @@ async def agent_submit_task(req: AgentTaskRequest):
             buf = _agent_tasks[task_id]["event_buf"]
             if not buf or buf[-1].get("type") != "stream_done": buf.append({"type": "stream_done", "task_id": task_id})
             _agent_tasks[task_id]["done"] = True
+            # Phase 9: schedule eviction after 10 minutes
+            asyncio.create_task(_evict_task_later(task_id, delay=600))
     _agent_tasks[task_id]["asyncio_task"] = asyncio.create_task(_run())
     return {"task_id": task_id, "status": "started"}
 
@@ -1536,7 +1723,7 @@ def _save_task_command(session_id: str, description: str, prefix: str):
         if not s.get("manually_named") and len([m for m in s["messages"] if m["role"] == "user"]) == 1:
             s["title"] = _auto_title(description)
         s["updated_at"] = now
-        _save_session(session_id)
+        _schedule_save(session_id)
 
 
 @app.post("/agent/orchestrate")
@@ -1573,10 +1760,12 @@ async def agent_orchestrate(req: OrchestrateRequest):
                 _orch_span_cm = None
         try:
             from main import ToolManager
+            # Phase 6 / #2: per-session browser context from the pool
+            _orch_browser_ctx = await _shared_agent.browser_pool.get_context(session_id) if (session_id and _shared_agent.browser_pool) else None
             tools = ToolManager(
                 vector_memory=_shared_agent.vector_memory,
                 mcp_manager=_shared_agent.mcp_manager,
-                shared_browser=await _shared_agent._get_shared_browser(),
+                shared_context=_orch_browser_ctx,
                 skill_manager=_shared_agent.skill_manager,
             )
             await tools.initialize()
@@ -1625,6 +1814,8 @@ async def agent_orchestrate(req: OrchestrateRequest):
             if not buf or buf[-1].get("type") != "stream_done":
                 buf.append({"type": "stream_done", "task_id": task_id})
             _agent_tasks[task_id]["done"] = True
+            # Phase 9: schedule eviction after 10 minutes
+            asyncio.create_task(_evict_task_later(task_id, delay=600))
 
     _agent_tasks[task_id]["asyncio_task"] = asyncio.create_task(_run())
     return {"task_id": task_id, "status": "started"}

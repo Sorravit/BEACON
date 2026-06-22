@@ -25,6 +25,7 @@ import os
 import sys
 import warnings
 from contextlib import nullcontext
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -44,7 +45,7 @@ warnings.filterwarnings(
     module=r"multiprocessing\.resource_tracker",
 )
 
-from openai import OpenAI
+from openai import AsyncOpenAI, OpenAI
 from core.mcp_client import MCPManager
 from core.models import ModelRegistry
 from core.skills import SkillManager
@@ -122,6 +123,34 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ── Module-level cached tiktoken encoder (Phase 1 / #7) ──────────────────────
+@lru_cache(maxsize=1)
+def _get_encoder():
+    """Return the cached cl100k_base tiktoken encoder (loaded once per process)."""
+    import tiktoken
+    return tiktoken.get_encoding("cl100k_base")
+
+
+# ── LLM concurrency gate (Phase 5 / #3) ──────────────────────────────────────
+_LLM_MAX_CONCURRENCY = int(os.getenv("LLM_MAX_CONCURRENCY", "8"))
+# A single process-wide semaphore bounds in-flight LLM calls across chat and all
+# task/orchestrate runs. It is created lazily on first use (Python 3.10+ binds a
+# Semaphore to the running loop only when awaited, so one global instance is safe
+# for the single uvicorn/asyncio loop this app runs on).
+# NOTE: every acquirer MUST bound its network call with a timeout (see
+# get_response / _llm_call / SubAgent._llm) so a stalled request cannot hold a
+# permit indefinitely and exhaust the pool — which would freeze every task.
+_llm_sem: Optional[asyncio.Semaphore] = None
+
+
+def _get_llm_sem() -> asyncio.Semaphore:
+    """Return (or create) the shared LLM concurrency semaphore."""
+    global _llm_sem
+    if _llm_sem is None:
+        _llm_sem = asyncio.Semaphore(_LLM_MAX_CONCURRENCY)
+    return _llm_sem
+
+
 
 class Config:
     """Configuration manager for the AI assistant."""
@@ -191,7 +220,7 @@ class AIAgent:
     def __init__(self, config: Config):
         """Initialize the AI agent with configuration."""
         self.config = config
-        self.client: Optional[OpenAI] = None
+        self.client: Optional[AsyncOpenAI] = None
         self.conversation: List[Dict[str, Any]] = []
         self.tools: Optional[ToolManager] = None
         self.mcp_manager: Optional[MCPManager] = None
@@ -199,20 +228,16 @@ class AIAgent:
         self.vector_memory: Optional[VectorMemory] = None
         self.memory_available = False
         self.skill_manager: Optional[SkillManager] = None
-        self._shared_browser = None  # shared Playwright browser process
-        self._playwright = None
-        self._last_dispatched_skill: str = ""  # set when skill dispatch fires (Path-1)
+        self.memory_worker = None          # MemoryWorker (Phase 2)
+        self.browser_pool = None           # BrowserPool  (Phase 6)
+        self._last_dispatched_skill: str = ""
 
-    async def _get_shared_browser(self):
-        """Lazily create ONE shared Chromium process for all per-request ToolManagers.
-        Each ToolManager creates its own isolated BrowserContext from this browser.
-        """
-        if self._shared_browser is None:
-            from playwright.async_api import async_playwright
-            self._playwright = await async_playwright().start()
-            self._shared_browser = await self._playwright.chromium.launch(headless=False)
-            logger.info("Shared browser process started (lazy init)")
-        return self._shared_browser
+    async def _get_browser_context(self, session_id: str = ""):
+        """Return the BrowserContext for session_id from the shared pool."""
+        if self.browser_pool is None:
+            from core.browser_pool import BrowserPool
+            self.browser_pool = BrowserPool()
+        return await self.browser_pool.get_context(session_id or "default")
     
     async def initialize(self) -> bool:
         """
@@ -222,7 +247,19 @@ class AIAgent:
             bool: True if initialization successful, False otherwise.
         """
         try:
-            self.client = OpenAI(api_key=self.config.api_key, base_url=self.config.base_url)
+            # Phase 5 / #3: AsyncOpenAI client — no worker threads for LLM calls.
+            # IMPORTANT: an explicit timeout + retry budget is required. Without it
+            # a half-open/stalled streaming connection hangs forever and keeps its
+            # _llm_sem permit (see _get_llm_sem), which can exhaust the shared
+            # concurrency pool and make every task/chat appear to "stop".
+            _llm_timeout = float(os.getenv("LLM_REQUEST_TIMEOUT", "120"))
+            _llm_retries = int(os.getenv("LLM_MAX_RETRIES", "2"))
+            self.client = AsyncOpenAI(
+                api_key=self.config.api_key,
+                base_url=self.config.base_url,
+                timeout=_llm_timeout,
+                max_retries=_llm_retries,
+            )
             
             # Initialize MCP manager
             self.mcp_manager = MCPManager()
@@ -246,8 +283,16 @@ class AIAgent:
             self.memory_available = await self.vector_memory.initialize()
             if self.memory_available:
                 logger.info("✅ Vector memory (Weaviate) available")
+                # Phase 2 / auto-memory: start the background extraction worker
+                from core.memory_worker import MemoryWorker
+                self.memory_worker = MemoryWorker(self)
+                self.memory_worker.start()
             else:
                 logger.info("ℹ️  Vector memory unavailable — running without persistent memory")
+
+            # Phase 6 / #2: create browser pool (lazy — Chromium launched on first use)
+            from core.browser_pool import BrowserPool
+            self.browser_pool = BrowserPool()
 
             if self.config.enable_tools:
                 self.tools = ToolManager(vector_memory=self.vector_memory, mcp_manager=self.mcp_manager, skill_manager=self.skill_manager)
@@ -389,17 +434,17 @@ class AIAgent:
                 f'Respond ONLY with JSON like: {{"topic": "oven", "fact": "I have a Samsung NV75K5571RS oven"}}\n'
                 f'If no personal fact found, respond: {{"topic": null, "fact": null}}'
             )
-            _loop = asyncio.get_running_loop()
             _extract_params = dict(
                 model=self.config.model,
                 messages=[{"role": "user", "content": extraction_prompt}],
                 temperature=0,
                 max_tokens=100
             )
-            with (record_llm_call(self.config.model, session_id=get_session_id()) if _TELEMETRY_AVAILABLE else nullcontext()):
-                extraction_response = await _loop.run_in_executor(
-                    None, lambda: self.client.chat.completions.create(**_extract_params)
-                )
+            import contextlib as _cl_ef
+            _ef_ctx = record_llm_call(self.config.model, session_id=get_session_id()) if _TELEMETRY_AVAILABLE else _cl_ef.nullcontext()
+            with _ef_ctx:
+                # Phase 5: use native async client — no run_in_executor
+                extraction_response = await self.client.chat.completions.create(**_extract_params)
             text = extraction_response.choices[0].message.content or ""
             # Parse JSON
             json_start = text.find('{')
@@ -415,31 +460,32 @@ class AIAgent:
             logger.debug(f"Fact extraction skipped: {e}")
 
 
-    async def _auto_memory_hook(self, user_input: str, ai_response: str):
+    async def _auto_memory_extract(
+        self, user_input: str, ai_response: str, session_id: str = ""
+    ) -> int:
         """
-        Auto-learning memory hook — fires after every final AI response.
-        Sends the exchange to Claude Sonnet to extract meaningful facts about
-        the user, then stores them in the AutoLearned Weaviate collection.
-        Completely separate from PersonalFacts (explicit memory).
-        Non-blocking: always called via asyncio.create_task().
+        Extract facts from a conversation exchange and store them in AutoLearned.
+
+        Renamed from _auto_memory_hook. Returns the number of facts stored (>= 0)
+        so the MemoryWorker can accumulate the total.  Raises on hard failures
+        so the worker can log at WARNING.
         """
         if not self.memory_available or not self.vector_memory:
-            return
-        # Skip trivial exchanges (one-liners, time queries, greetings)
-        if len(user_input.strip()) < 20 or len(ai_response.strip()) < 20:
-            return
-        try:
-            # Get existing auto-facts topics to avoid duplication
-            existing = await self.vector_memory.get_all_auto_facts() or []
-            existing_topics = [f.get('topic', '').lower() for f in existing]
-            existing_summary = ', '.join(existing_topics[:50]) if existing_topics else 'none yet'
+            return 0
+        # Get existing topics to avoid duplication
+        existing = await self.vector_memory.get_all_auto_facts() or []
+        existing_topics = [f.get('topic', '').lower() for f in existing]
+        existing_summary = ', '.join(existing_topics[:50]) if existing_topics else 'none yet'
 
-            # Get existing personal facts topics too
-            personal = await self.vector_memory.get_all_personal_facts() or []
-            personal_topics = [f.get('topic', '').lower() for f in personal]
-            personal_summary = ', '.join(personal_topics[:50]) if personal_topics else 'none'
+        # Get existing personal facts topics too
+        personal = await self.vector_memory.get_all_personal_facts() or []
+        personal_topics = [f.get('topic', '').lower() for f in personal]
+        personal_summary = ', '.join(personal_topics[:50]) if personal_topics else 'none'
 
-            extraction_prompt = f"""You are a memory extraction assistant. Analyze this conversation exchange and extract meaningful facts about the USER (not about AI, not tool outputs).
+        # Use cheaper model if configured via AUTO_LEARN_MODEL
+        extract_model = os.getenv("AUTO_LEARN_MODEL", self.config.model)
+
+        extraction_prompt = f"""You are a memory extraction assistant. Analyze this conversation exchange and extract meaningful facts about the USER (not about AI, not tool outputs).
 
 Conversation:
 User: {user_input[:1000]}
@@ -470,45 +516,41 @@ If nothing meaningful to extract, respond with: []
 
 JSON:"""
 
-            with (record_llm_call(self.config.model, session_id=get_session_id()) if _TELEMETRY_AVAILABLE else nullcontext()):
-                result = await asyncio.get_running_loop().run_in_executor(
-                    None,
-                    lambda: self.client.chat.completions.create(
-                        model=self.config.model,
-                        messages=[{"role": "user", "content": extraction_prompt}],
-                        temperature=0.2,
-                        max_tokens=800
-                    )
-                )
+        import contextlib as _cl_am
+        _am_ctx = record_llm_call(extract_model, session_id=session_id) if _TELEMETRY_AVAILABLE else _cl_am.nullcontext()
+        with _am_ctx:
+            # Phase 5: native async call — no run_in_executor
+            result = await self.client.chat.completions.create(
+                model=extract_model,
+                messages=[{"role": "user", "content": extraction_prompt}],
+                temperature=0.2,
+                max_tokens=800,
+            )
 
-            raw = result.choices[0].message.content.strip()
-            # Strip markdown code fences if present
-            if raw.startswith('```'):
-                raw = raw.split('```')[1]
-                if raw.startswith('json'):
-                    raw = raw[4:]
-            raw = raw.strip()
+        raw = (result.choices[0].message.content or "").strip()
+        # Strip markdown code fences if present
+        if raw.startswith('```'):
+            raw = raw.split('```')[1]
+            if raw.startswith('json'):
+                raw = raw[4:]
+        raw = raw.strip()
 
-            import json as _json
-            facts = _json.loads(raw)
-            if not isinstance(facts, list):
-                return
+        import json as _json
+        facts = _json.loads(raw)
+        if not isinstance(facts, list):
+            return 0
 
-            stored_count = 0
-            for item in facts:
-                topic = item.get('topic', '').strip()
-                fact = item.get('fact', '').strip()
-                confidence = item.get('confidence', 'medium')
-                if topic and fact and len(fact) > 5:
-                    ok = await self.vector_memory.store_auto_fact(topic, fact, confidence)
-                    if ok:
-                        stored_count += 1
+        stored_count = 0
+        for item in facts:
+            topic = item.get('topic', '').strip()
+            fact = item.get('fact', '').strip()
+            confidence = item.get('confidence', 'medium')
+            if topic and fact and len(fact) > 5:
+                ok = await self.vector_memory.store_auto_fact(topic, fact, confidence)
+                if ok:
+                    stored_count += 1
 
-            if stored_count > 0:
-                logger.info(f"Auto-memory hook stored {stored_count} new/updated facts")
-
-        except Exception as e:
-            logger.debug(f"Auto-memory hook failed (non-critical): {e}")
+        return stored_count
 
     _SKILL_TRIGGERS = {
         "business_analyst":           ["act as ba", "act as business analyst", "write user stories", "write brd"],
@@ -769,10 +811,17 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
             _skill_out = await self._maybe_dispatch_skill(user_input)
             if _skill_out is not None:
                 if token_callback:
-                    for _ch in _skill_out:
-                        try: token_callback(_ch)
+                    # Phase 1 / #4: batch emit (24-char chunks)
+                    _BATCH = 24
+                    for _i in range(0, len(_skill_out), _BATCH):
+                        try: token_callback(_skill_out[_i:_i+_BATCH])
                         except Exception: pass
                 conv.append({"role": "assistant", "content": _skill_out})
+                # Phase 2 / auto-memory: also learn from skill dispatches
+                if self.memory_worker and self.memory_available:
+                    self.memory_worker.submit(
+                        user_input, _skill_out, get_session_id() or ""
+                    )
                 return _skill_out
             # END SKILL DISPATCH
 
@@ -818,11 +867,7 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                 
                 # NO tools parameter - use prompt-based approach instead
                 
-                _loop = asyncio.get_running_loop()
-
-                # One OTel span per LLM request — records the model + request
-                # parameters now; token counts are filled in once we have a
-                # response. Falls back to a no-op when telemetry is disabled.
+                # One OTel span per LLM request
                 llm_span_cm = (
                     record_llm_call(
                         effective_model,
@@ -836,65 +881,61 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                     else nullcontext()
                 )
 
-                if token_callback:
-                    # STREAMING MODE — the blocking SDK iteration runs in a worker
-                    # thread and pushes tokens onto a queue; the event loop drains
-                    # the queue so SSE tokens flush to the browser in real time.
-                    # This avoids the UI freeze where a sync for-loop blocked the
-                    # event loop and tokens never reached the browser.
-                    import queue as _queue
-                    token_q: "_queue.Queue" = _queue.Queue()
-                    stream_params = {**params, "stream": True}
-
-                    def _stream_in_thread():
-                        try:
-                            stream = self.client.chat.completions.create(**stream_params)
-                            for chunk in stream:
-                                delta = chunk.choices[0].delta.content if chunk.choices else None
-                                if delta:
-                                    token_q.put(delta)
-                        except Exception as exc:
-                            token_q.put(exc)
-                        finally:
-                            token_q.put(None)  # sentinel — stream finished
-
-                    with llm_span_cm as llm_span:
-                        stream_future = _loop.run_in_executor(None, _stream_in_thread)
-                        response_text = ""
-                        while True:
+                # Phase 5 / #3: both paths use AsyncOpenAI + _llm_sem (no threads).
+                # A hard wall-clock timeout guards every call so a stalled stream
+                # cannot hold its semaphore permit forever and wedge other tasks.
+                _call_timeout = float(os.getenv("LLM_REQUEST_TIMEOUT", "120")) + 30.0
+                async with _get_llm_sem():
+                    if token_callback:
+                        # STREAMING MODE — native async streaming, zero worker threads.
+                        stream_params = {**params, "stream": True}
+                        with llm_span_cm as llm_span:
+                            async def _consume_stream():
+                                _text = ""
+                                stream = await self.client.chat.completions.create(**stream_params)
+                                async for chunk in stream:
+                                    delta = (
+                                        chunk.choices[0].delta.content
+                                        if chunk.choices else None
+                                    )
+                                    if delta:
+                                        _text += delta
+                                return _text
                             try:
-                                item = token_q.get_nowait()
-                            except _queue.Empty:
-                                await asyncio.sleep(0)  # yield → event loop flushes SSE
-                                continue
-                            if item is None:
-                                break  # sentinel: stream done
-                            if isinstance(item, Exception):
-                                raise item
-                            # Buffer tokens until we know this is the final answer
-                            # (no tool calls); replayed to the UI further below.
-                            response_text += item
-
-                        await stream_future  # ensure the worker thread is joined
-                        if llm_span is not None:
-                            llm_span.set_attribute("llm.response_chars", len(response_text))
-                            llm_span.set_attribute(
-                                "llm.output_tokens", self._estimate_tokens(response_text)
-                            )
-                else:
-                    # NON-STREAMING MODE: CLI / planning / background tasks.
-                    with llm_span_cm as llm_span:
-                        response = await _loop.run_in_executor(
-                            None, lambda: self.client.chat.completions.create(**params)
-                        )
-                        response_text = response.choices[0].message.content
-                        usage = getattr(response, "usage", None)
-                        if llm_span is not None and usage:
+                                response_text = await asyncio.wait_for(
+                                    _consume_stream(), timeout=_call_timeout
+                                )
+                            except asyncio.TimeoutError:
+                                logger.warning(
+                                    "LLM streaming call timed out after %.0fs", _call_timeout
+                                )
+                                response_text = ""
+                            if llm_span is not None:
+                                llm_span.set_attribute("llm.response_chars", len(response_text))
+                                llm_span.set_attribute(
+                                    "llm.output_tokens", self._estimate_tokens(response_text)
+                                )
+                    else:
+                        # NON-STREAMING MODE: CLI / planning / background tasks.
+                        with llm_span_cm as llm_span:
                             try:
-                                llm_span.set_attribute("llm.input_tokens", usage.prompt_tokens or 0)
-                                llm_span.set_attribute("llm.output_tokens", usage.completion_tokens or 0)
-                            except Exception:
-                                pass
+                                response = await asyncio.wait_for(
+                                    self.client.chat.completions.create(**params),
+                                    timeout=_call_timeout,
+                                )
+                            except asyncio.TimeoutError:
+                                logger.warning(
+                                    "LLM call timed out after %.0fs", _call_timeout
+                                )
+                                return "No response from AI (request timed out)"
+                            response_text = response.choices[0].message.content
+                            usage = getattr(response, "usage", None)
+                            if llm_span is not None and usage:
+                                try:
+                                    llm_span.set_attribute("llm.input_tokens", usage.prompt_tokens or 0)
+                                    llm_span.set_attribute("llm.output_tokens", usage.completion_tokens or 0)
+                                except Exception:
+                                    pass
                 
                 if not response_text:
                     return "No response from AI"
@@ -967,23 +1008,23 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                     # Continue loop to let AI process tool results
                     continue
                 else:
-                    # No tool calls — final response. NOW stream tokens to UI.
-                    # This means the browser never sees raw <tool_use> XML blocks
-                    # from intermediate iterations — only the clean final answer.
+                    # No tool calls — final response. NOW emit tokens to UI.
+                    # Phase 1 / #4: batch-emit in 24-char chunks (not per-char).
                     if token_callback:
                         import re as _re
                         clean = _re.sub(r'<tool_use>.*?</tool_use>', '', response_text, flags=_re.DOTALL).strip()
-                        for ch in clean:
+                        _BATCH = 24
+                        for _i in range(0, len(clean), _BATCH):
                             try:
-                                token_callback(ch)
+                                token_callback(clean[_i:_i+_BATCH])
                             except Exception:
                                 pass
                     conv.append({"role": "assistant", "content": response_text})
-                    # Fire auto-learning hook (non-blocking)
-                    try:
-                        asyncio.create_task(self._auto_memory_hook(user_input, response_text))
-                    except Exception:
-                        pass
+                    # Phase 2 / auto-memory: submit to durable worker queue
+                    if self.memory_worker and self.memory_available:
+                        self.memory_worker.submit(
+                            user_input, response_text, get_session_id() or ""
+                        )
                     return response_text
             
             # If we hit max iterations, inform user but don't fail
@@ -1000,13 +1041,12 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
     
     def _estimate_tokens(self, text: str) -> int:
         """
-        Accurate token count using tiktoken (cl100k_base covers gpt-4, gpt-4o, claude via proxy).
+        Accurate token count using the module-level cached tiktoken encoder.
         Falls back to conservative char-based estimate if tiktoken unavailable.
+        Phase 1 / #7: encoder cached via @lru_cache — no repeated construction.
         """
         try:
-            import tiktoken
-            enc = tiktoken.get_encoding("cl100k_base")
-            return len(enc.encode(text))
+            return len(_get_encoder().encode(text))
         except Exception:
             # Fallback: len//2 is safer than //3 for Thai/CJK text
             return max(1, len(text) // 2)
@@ -1077,27 +1117,27 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
         self.conversation.clear()
 
     async def shutdown(self):
-        """Shut down agent resources including the shared browser process."""
+        """Shut down agent resources: worker, browser pool, tools, memory."""
+        # Stop the auto-memory background worker first
+        try:
+            if self.memory_worker:
+                await self.memory_worker.stop()
+        except Exception as e:
+            logger.debug(f"MemoryWorker shutdown failed: {e}")
+
         try:
             if self.tools:
                 await self.tools.cleanup()
         except Exception as e:
             logger.debug(f"Tool cleanup during shutdown failed: {e}")
 
-        # Close shared browser process owned by this agent
+        # Phase 6 / #2: shut down the browser pool
         try:
-            if self._shared_browser:
-                await self._shared_browser.close()
-                self._shared_browser = None
+            if self.browser_pool:
+                await self.browser_pool.shutdown()
+                self.browser_pool = None
         except Exception as e:
-            logger.debug(f"Shared browser shutdown failed: {e}")
-
-        try:
-            if self._playwright:
-                await self._playwright.stop()
-                self._playwright = None
-        except Exception as e:
-            logger.debug(f"Playwright shutdown failed: {e}")
+            logger.debug(f"BrowserPool shutdown failed: {e}")
 
         # Always attempt vector memory shutdown last so loky resources are released.
         try:
