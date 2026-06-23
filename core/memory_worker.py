@@ -57,7 +57,14 @@ class MemoryWorker:
         # Skip trivial exchanges — same guard as the original hook
         if len(user_input.strip()) < 20 or len(ai_response.strip()) < 20:
             self.stats["skipped"] += 1
+            logger.info(
+                "[MemoryWorker] Skipping memory extraction: exchange too short "
+                "(user_len=%d ai_len=%d) — stats.skipped=%d",
+                len(user_input.strip()), len(ai_response.strip()), self.stats['skipped'],
+            )
             return
+        logger.info("[MemoryWorker] submit queued session=%s user=%d chars ai=%d chars",
+                    session_id or "?", len(user_input.strip()), len(ai_response.strip()))
         try:
             self._q.put_nowait((user_input, ai_response, session_id))
             self.stats["queued"] += 1

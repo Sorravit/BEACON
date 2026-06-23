@@ -23,6 +23,7 @@ import logging
 import logging.handlers
 import os
 import sys
+import time
 import warnings
 from contextlib import nullcontext
 from functools import lru_cache
@@ -84,10 +85,10 @@ DEFAULT_BASE_URL = "https://api.openai.com/v1"
 
 # Tool Execution Limits
 # MAX_TOOL_ITERATIONS: Maximum number of tool calls per user message
-# - 1000 = ~8-10 hours of continuous execution (recommended for courses)
-# - 2000 = ~16-20 hours (for very long courses)
-# - 5000 = ~40-50 hours (for multi-day tasks)
-MAX_TOOL_ITERATIONS = 1000
+# - 10_000_000 = effectively unlimited (token is free — run as long as needed)
+# - Previous value was 1000 (~8-10 hours). Raised per user request.
+# - This is a safety backstop only; agent exits normally via the 'no tool calls' branch.
+MAX_TOOL_ITERATIONS = 10_000_000  # effectively unlimited — run as long as needed (token is free)
 
 # Conversation Management
 # MAX_CONVERSATION_TOKENS: Maximum tokens to keep in conversation history
@@ -131,24 +132,21 @@ def _get_encoder():
     return tiktoken.get_encoding("cl100k_base")
 
 
-# ── LLM concurrency gate (Phase 5 / #3) ──────────────────────────────────────
-_LLM_MAX_CONCURRENCY = int(os.getenv("LLM_MAX_CONCURRENCY", "8"))
-# A single process-wide semaphore bounds in-flight LLM calls across chat and all
-# task/orchestrate runs. It is created lazily on first use (Python 3.10+ binds a
-# Semaphore to the running loop only when awaited, so one global instance is safe
-# for the single uvicorn/asyncio loop this app runs on).
-# NOTE: every acquirer MUST bound its network call with a timeout (see
-# get_response / _llm_call / SubAgent._llm) so a stalled request cannot hold a
-# permit indefinitely and exhaust the pool — which would freeze every task.
-_llm_sem: Optional[asyncio.Semaphore] = None
+# ── LLM concurrency ──────────────────────────────────────────────────────────
+# The previous global semaphore (LLM_MAX_CONCURRENCY) has been removed: this app
+# serves a single local user, the per-session background-task guard already
+# serialises a session's own turns, and the artificial cap added no protection
+# that the per-call wall-clock timeout does not already provide. Every LLM call
+# MUST still be bounded by a timeout (see get_response) so a stalled request can
+# never hang forever.
+#
+# nullcontext keeps the existing ``async with _get_llm_sem():`` call sites
+# working without re-indenting, while imposing no concurrency limit.
 
 
-def _get_llm_sem() -> asyncio.Semaphore:
-    """Return (or create) the shared LLM concurrency semaphore."""
-    global _llm_sem
-    if _llm_sem is None:
-        _llm_sem = asyncio.Semaphore(_LLM_MAX_CONCURRENCY)
-    return _llm_sem
+def _get_llm_sem():
+    """No-op async context manager (LLM concurrency is unbounded)."""
+    return nullcontext()
 
 
 
@@ -231,6 +229,10 @@ class AIAgent:
         self.memory_worker = None          # MemoryWorker (Phase 2)
         self.browser_pool = None           # BrowserPool  (Phase 6)
         self._last_dispatched_skill: str = ""
+        # Cache for the (expensive, ~80k-char) tools prompt. Invalidated when the
+        # available tool/MCP set changes (keyed on tool-name signature).
+        self._tools_prompt_cache: Optional[str] = None
+        self._tools_prompt_key: Optional[tuple] = None
 
     async def _get_browser_context(self, session_id: str = ""):
         """Return the BrowserContext for session_id from the shared pool."""
@@ -469,55 +471,90 @@ class AIAgent:
         Renamed from _auto_memory_hook. Returns the number of facts stored (>= 0)
         so the MemoryWorker can accumulate the total.  Raises on hard failures
         so the worker can log at WARNING.
+
+        Logging checkpoints (Step-5 requirements):
+          (a) Entry   — session id, per-session turn counter, input sizes
+          (b) Pre-LLM — model name, prompt char length
+          (c) Post-LLM — raw LLM response char length
+          (d) Per item found   — topic, confidence, fact preview
+          (e) Per item skipped — topic/fact and reason
+          (f) Exit    — total candidates parsed, total stored
         """
+        # ── (a) ENTRY: increment per-session turn counter ────────────────────
+        _turn_attr = "_am_turn_" + (session_id or "default").replace("-", "_").replace(".", "_")
+        _turn = getattr(self, _turn_attr, 0) + 1
+        setattr(self, _turn_attr, _turn)
+        logger.info(
+            "[AutoMemory] ENTER _auto_memory_extract "
+            "turn=%d session=%s user_chars=%d ai_chars=%d",
+            _turn, session_id or "?", len(user_input), len(ai_response),
+        )
+
+        # ── Memory guard ─────────────────────────────────────────────────────
         if not self.memory_available or not self.vector_memory:
+            logger.info(
+                "[AutoMemory] SKIP (memory unavailable) "
+                "turn=%d session=%s memory_available=%s vector_memory=%s",
+                _turn, session_id or "?",
+                self.memory_available, bool(self.vector_memory),
+            )
             return 0
+
         # Get existing topics to avoid duplication
         existing = await self.vector_memory.get_all_auto_facts() or []
-        existing_topics = [f.get('topic', '').lower() for f in existing]
-        existing_summary = ', '.join(existing_topics[:50]) if existing_topics else 'none yet'
+        existing_topics = [f.get("topic", "").lower() for f in existing]
+        existing_summary = ", ".join(existing_topics[:50]) if existing_topics else "none yet"
 
         # Get existing personal facts topics too
         personal = await self.vector_memory.get_all_personal_facts() or []
-        personal_topics = [f.get('topic', '').lower() for f in personal]
-        personal_summary = ', '.join(personal_topics[:50]) if personal_topics else 'none'
+        personal_topics = [f.get("topic", "").lower() for f in personal]
+        personal_summary = ", ".join(personal_topics[:50]) if personal_topics else "none"
 
         # Use cheaper model if configured via AUTO_LEARN_MODEL
         extract_model = os.getenv("AUTO_LEARN_MODEL", self.config.model)
 
-        extraction_prompt = f"""You are a memory extraction assistant. Analyze this conversation exchange and extract meaningful facts about the USER (not about AI, not tool outputs).
+        extraction_prompt = (
+            "You are a memory extraction assistant. Analyze this conversation exchange"
+            " and extract meaningful facts about the USER"
+            " (not about AI, not tool outputs).\n\n"
+            f"Conversation:\nUser: {user_input[:1000]}\nAssistant: {ai_response[:800]}\n\n"
+            f"Already known personal facts (do NOT re-extract these topics): {personal_summary}\n"
+            f"Already auto-learned topics (update if changed, skip if same): {existing_summary}\n\n"
+            "Extract facts about:\n"
+            "- User preferences, dislikes, opinions\n"
+            "- Projects they work on, tools they use\n"
+            "- People they mention (names, roles, relationships)\n"
+            "- Technical environment (OS, languages, stack)\n"
+            "- Decisions they made\n"
+            "- Problems they solved or encountered\n"
+            "- Things they corrected the AI about\n"
+            "- Work context and habits\n\n"
+            "Do NOT extract:\n"
+            "- Questions the user asked\n"
+            "- AI responses or tool results\n"
+            "- One-time lookups (time, weather)\n"
+            "- Greetings or small talk\n"
+            "- Anything already in personal facts\n\n"
+            'Respond ONLY with a JSON array. Each item: {"topic": "short_snake_case_key",'
+            ' "fact": "concise fact sentence", "confidence": "high|medium|low"}\n'
+            "If nothing meaningful to extract, respond with: []\n\n"
+            "JSON:"
+        )
 
-Conversation:
-User: {user_input[:1000]}
-Assistant: {ai_response[:800]}
-
-Already known personal facts (do NOT re-extract these topics): {personal_summary}
-Already auto-learned topics (update if changed, skip if same): {existing_summary}
-
-Extract facts about:
-- User preferences, dislikes, opinions
-- Projects they work on, tools they use
-- People they mention (names, roles, relationships)
-- Technical environment (OS, languages, stack)
-- Decisions they made
-- Problems they solved or encountered
-- Things they corrected the AI about
-- Work context and habits
-
-Do NOT extract:
-- Questions the user asked
-- AI responses or tool results
-- One-time lookups (time, weather)
-- Greetings or small talk
-- Anything already in personal facts
-
-Respond ONLY with a JSON array. Each item: {{"topic": "short_snake_case_key", "fact": "concise fact sentence", "confidence": "high|medium|low"}}
-If nothing meaningful to extract, respond with: []
-
-JSON:"""
+        # ── (b) PRE-LLM call log ─────────────────────────────────────────────
+        logger.info(
+            "[AutoMemory] PRE-LLM turn=%d session=%s model=%s "
+            "prompt_chars=%d existing_auto=%d existing_personal=%d",
+            _turn, session_id or "?", extract_model, len(extraction_prompt),
+            len(existing_topics), len(personal_topics),
+        )
 
         import contextlib as _cl_am
-        _am_ctx = record_llm_call(extract_model, session_id=session_id) if _TELEMETRY_AVAILABLE else _cl_am.nullcontext()
+        _am_ctx = (
+            record_llm_call(extract_model, session_id=session_id)
+            if _TELEMETRY_AVAILABLE
+            else _cl_am.nullcontext()
+        )
         with _am_ctx:
             # Phase 5: native async call — no run_in_executor
             result = await self.client.chat.completions.create(
@@ -528,29 +565,104 @@ JSON:"""
             )
 
         raw = (result.choices[0].message.content or "").strip()
+
+        # ── (c) POST-LLM response log ────────────────────────────────────────
+        logger.info(
+            "[AutoMemory] POST-LLM turn=%d session=%s "
+            "raw_response_chars=%d raw_preview=%r",
+            _turn, session_id or "?", len(raw), raw[:120],
+        )
+
         # Strip markdown code fences if present
-        if raw.startswith('```'):
-            raw = raw.split('```')[1]
-            if raw.startswith('json'):
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
                 raw = raw[4:]
         raw = raw.strip()
 
         import json as _json
-        facts = _json.loads(raw)
+        try:
+            facts = _json.loads(raw)
+        except _json.JSONDecodeError as _jde:
+            logger.warning(
+                "[AutoMemory] JSON parse FAILED turn=%d session=%s "
+                "error=%s raw_preview=%r",
+                _turn, session_id or "?", _jde, raw[:200],
+            )
+            raise  # propagate so MemoryWorker logs at WARNING level
+
         if not isinstance(facts, list):
+            logger.warning(
+                "[AutoMemory] LLM returned non-list type=%s "
+                "turn=%d session=%s — skipping",
+                type(facts).__name__, _turn, session_id or "?",
+            )
             return 0
 
-        stored_count = 0
-        for item in facts:
-            topic = item.get('topic', '').strip()
-            fact = item.get('fact', '').strip()
-            confidence = item.get('confidence', 'medium')
-            if topic and fact and len(fact) > 5:
-                ok = await self.vector_memory.store_auto_fact(topic, fact, confidence)
-                if ok:
-                    stored_count += 1
+        logger.info(
+            "[AutoMemory] PARSE OK turn=%d session=%s candidates=%d",
+            _turn, session_id or "?", len(facts),
+        )
 
+        stored_count = 0
+        skipped_count = 0
+        for _idx, item in enumerate(facts):
+            topic      = item.get("topic", "").strip()
+            fact       = item.get("fact",  "").strip()
+            confidence = item.get("confidence", "medium")
+
+            # ── (e) SKIP logs ────────────────────────────────────────────────
+            if not topic:
+                logger.info(
+                    "[AutoMemory] SKIP item[%d] turn=%d session=%s "
+                    "reason=blank_topic raw_item=%r",
+                    _idx, _turn, session_id or "?", item,
+                )
+                skipped_count += 1
+                continue
+            if not fact:
+                logger.info(
+                    "[AutoMemory] SKIP item[%d] turn=%d session=%s "
+                    "reason=blank_fact topic=%r",
+                    _idx, _turn, session_id or "?", topic,
+                )
+                skipped_count += 1
+                continue
+            if len(fact) <= 5:
+                logger.info(
+                    "[AutoMemory] SKIP item[%d] turn=%d session=%s "
+                    "reason=fact_too_short topic=%r fact_len=%d fact=%r",
+                    _idx, _turn, session_id or "?", topic, len(fact), fact,
+                )
+                skipped_count += 1
+                continue
+
+            # ── (d) FOUND log — valid item about to be stored ────────────────
+            logger.info(
+                "[AutoMemory] STORE item[%d] turn=%d session=%s "
+                "topic=%r confidence=%s fact_chars=%d fact_preview=%r",
+                _idx, _turn, session_id or "?",
+                topic, confidence, len(fact), fact[:120],
+            )
+
+            ok = await self.vector_memory.store_auto_fact(topic, fact, confidence)
+            if ok:
+                stored_count += 1
+            else:
+                logger.info(
+                    "[AutoMemory] STORE FAILED item[%d] turn=%d session=%s "
+                    "topic=%r (store_auto_fact returned falsy)",
+                    _idx, _turn, session_id or "?", topic,
+                )
+
+        # ── (f) EXIT log ─────────────────────────────────────────────────────
+        logger.info(
+            "[AutoMemory] EXIT turn=%d session=%s "
+            "candidates=%d skipped=%d stored=%d",
+            _turn, session_id or "?", len(facts), skipped_count, stored_count,
+        )
         return stored_count
+
 
     _SKILL_TRIGGERS = {
         "business_analyst":           ["act as ba", "act as business analyst", "write user stories", "write brd"],
@@ -601,11 +713,89 @@ JSON:"""
             inst = cls()
             result = inst.execute({"user_request": user_input, "context": ""})
             header = "\n\U0001f916 **[" + matched.replace("_", " ").title() + " Agent]**\n\n"
+            # ── SkillResult unwrap ladder ────────────────────────────────────────
+            # BEACON skill agents return SkillResult where .data is a dict with
+            # keys: skill_id, display_name, persona, reasoning_steps,
+            # inputs_received, outputs (nested dict of actual results),
+            # ready_for_llm.  The old code checked .data["output"|"result"|
+            # "content"] which do not exist, so every branch fell through to
+            # str(result) → "<SkillResult object at 0x…>" in the chat.
+            # Fix: try .output/.content direct attrs first, then .data["outputs"]
+            # (the real nested outputs dict used by all BEACON skill agents),
+            # then a structured summary, then str() as absolute last resort.
+            # logger.debug records which branch resolved for easy diagnosis.
+            _result_type = type(result).__name__
             if isinstance(result, dict):
-                out = result.get("output") or result.get("result") or result.get("content") or str(result)
+                out = (result.get("output") or result.get("result")
+                       or result.get("content") or str(result))
+                logger.debug("[SkillDispatch] result type=dict keys=%s", list(result.keys()))
+            elif hasattr(result, "output") and result.output:
+                out = str(result.output)
+                logger.debug("[SkillDispatch] result type=%s resolved via .output attr", _result_type)
+            elif hasattr(result, "content") and result.content:
+                out = str(result.content)
+                logger.debug("[SkillDispatch] result type=%s resolved via .content attr", _result_type)
+            elif hasattr(result, "data") and isinstance(result.data, dict):
+                _d = result.data
+                # 1) direct key check (for any agent that uses output/result/content)
+                _direct = (_d.get("output") or _d.get("result") or _d.get("content"))
+                if _direct:
+                    out = str(_direct)
+                    logger.debug("[SkillDispatch] result type=%s resolved via .data direct key", _result_type)
+                else:
+                    # 2) BEACON agents store real work product in data["outputs"] (nested dict)
+                    #    e.g. {"review_report": "…", "score": "…", "verdict": "…", "improvements": "…"}
+                    _nested = _d.get("outputs")
+                    if isinstance(_nested, dict) and _nested:
+                        _parts = []
+                        for _k, _v in _nested.items():
+                            _vs = str(_v).strip()
+                            _parts.append(f"**{_k.replace('_', ' ').title()}**\n{_vs}")
+                        out = "\n\n".join(_parts) if _parts else str(_d)
+                        logger.debug(
+                            "[SkillDispatch] result type=%s resolved via .data['outputs'] keys=%s",
+                            _result_type, list(_nested.keys()))
+                    elif _d.get("persona") or _d.get("reasoning_steps"):
+                        # 3) Render a structured summary from known SkillResult data fields
+                        _parts = []
+                        _persona = _d.get("persona", "")
+                        _steps   = _d.get("reasoning_steps", [])
+                        if _persona:
+                            _parts.append(f"**Role:** {_persona}")
+                        if _steps:
+                            _parts.append("**Execution Steps:**\n" + "\n".join(_steps))
+                        _nested2 = _d.get("outputs", {})
+                        if isinstance(_nested2, dict):
+                            for _k, _v in _nested2.items():
+                                _parts.append(f"**{_k.replace('_', ' ').title()}:** {_v}")
+                        out = "\n\n".join(_parts) if _parts else str(_d)
+                        logger.debug("[SkillDispatch] result type=%s resolved via .data structured summary", _result_type)
+                    else:
+                        out = str(_d)
+                        logger.debug("[SkillDispatch] result type=%s fell back to str(.data)", _result_type)
+            elif hasattr(result, "to_dict"):
+                _td = result.to_dict()
+                _direct2 = (_td.get("output") or _td.get("result") or _td.get("content"))
+                if _direct2:
+                    out = str(_direct2)
+                else:
+                    _inner = _td.get("data", {})
+                    if isinstance(_inner, dict):
+                        _nested3 = _inner.get("outputs")
+                        if isinstance(_nested3, dict) and _nested3:
+                            _parts3 = [f"**{_k.replace('_', ' ').title()}**\n{_v}"
+                                       for _k, _v in _nested3.items()]
+                            out = "\n\n".join(_parts3) if _parts3 else str(_inner)
+                        else:
+                            out = str(_inner) if _inner else str(_td)
+                    else:
+                        out = str(_td)
+                logger.debug("[SkillDispatch] result type=%s resolved via .to_dict()", _result_type)
             else:
                 out = str(result)
-            logger.info("Skill dispatched: " + matched)
+                logger.debug("[SkillDispatch] result type=%s final str() fallback", _result_type)
+            logger.info("[SkillDispatch] skill=%s resolved_type=%s content_len=%d",
+                        matched, _result_type, len(out))
             self._last_dispatched_skill = matched  # signal for web_app skill indicator
             return header + out
         except Exception as e:
@@ -614,7 +804,26 @@ JSON:"""
 
 
     def _build_tools_prompt(self) -> str:
-        """Build system prompt with tool descriptions"""
+        """Build system prompt with tool descriptions.
+
+        The result (~80k chars) is cached and only rebuilt when the available
+        tool/MCP set changes. Rebuilding this string on every request added
+        avoidable CPU on the single event loop and contributed to concurrent
+        requests stalling.
+        """
+        # Cheap signature of the current toolset — rebuild only when it changes.
+        builtin_names = (
+            tuple(t['function']['name'] for t in self.tools.tools)
+            if (self.tools_available and self.tools) else ()
+        )
+        mcp_names = (
+            tuple(t['function']['name'] for t in self.mcp_manager.get_all_tools_for_openai())
+            if self.mcp_manager else ()
+        )
+        cache_key = (builtin_names, mcp_names)
+        if self._tools_prompt_cache is not None and self._tools_prompt_key == cache_key:
+            return self._tools_prompt_cache
+
         prompt = "\n\nYou have access to the following tools:\n\n"
         
         # Add built-in tools
@@ -666,7 +875,9 @@ JSON:"""
 
 You can use multiple tools in sequence. After I execute each tool, I'll provide the result and you can continue or use another tool.
 IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. After I give you the result, then provide your final answer."""
-        
+
+        self._tools_prompt_cache = prompt
+        self._tools_prompt_key = cache_key
         return prompt
     
     def _parse_tool_calls(self, response_text: str) -> List[Dict[str, Any]]:
@@ -818,7 +1029,12 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                         except Exception: pass
                 conv.append({"role": "assistant", "content": _skill_out})
                 # Phase 2 / auto-memory: also learn from skill dispatches
-                if self.memory_worker and self.memory_available:
+                if self.memory_worker is None:
+                    logger.warning(
+                        "[AutoMemory] memory_worker is None — skipping"
+                        " _auto_memory_extract for this turn (skill-dispatch path)"
+                    )
+                elif self.memory_available:
                     self.memory_worker.submit(
                         user_input, _skill_out, get_session_id() or ""
                     )
@@ -841,8 +1057,11 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
             user_message = (memory_prefix + user_input) if memory_prefix else user_input
             conv.append({"role": "user", "content": user_message})
 
-            # Trim AFTER adding the new message so trimming sees the full picture
-            self._trim_conversation(conv)
+            # Trim AFTER adding the new message so trimming sees the full picture.
+            # tiktoken encoding is CPU-bound; run it in a worker thread so the
+            # single asyncio event loop stays responsive and concurrent streams
+            # are not starved (root cause of intermittent "returns nothing").
+            await asyncio.to_thread(self._trim_conversation, conv)
             
             # Agent loop - allow multiple tool calls
             # For long-running tasks (courses, etc.), use a very high limit
@@ -881,10 +1100,42 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                     else nullcontext()
                 )
 
-                # Phase 5 / #3: both paths use AsyncOpenAI + _llm_sem (no threads).
-                # A hard wall-clock timeout guards every call so a stalled stream
-                # cannot hold its semaphore permit forever and wedge other tasks.
+                # Both paths use AsyncOpenAI (no worker threads). LLM concurrency
+                # is unbounded (the global semaphore was removed); a hard
+                # wall-clock timeout guards every call so a stalled stream can
+                # never hang forever.
                 _call_timeout = float(os.getenv("LLM_REQUEST_TIMEOUT", "120")) + 30.0
+
+                # One non-streaming completion. Returns (text, reason) where
+                # reason is "" on success, else "timeout" / "empty" / "error: …".
+                async def _nonstream_once(span=None):
+                    try:
+                        _resp = await asyncio.wait_for(
+                            self.client.chat.completions.create(**params),
+                            timeout=_call_timeout,
+                        )
+                    except asyncio.TimeoutError:
+                        return "", "timeout"
+                    except Exception as _exc:
+                        logger.warning(
+                            "LLM non-streaming call failed: %s: %s",
+                            type(_exc).__name__, _exc,
+                        )
+                        return "", f"error: {type(_exc).__name__}: {_exc}"
+                    _txt = _resp.choices[0].message.content or ""
+                    _usage = getattr(_resp, "usage", None)
+                    if span is not None and _usage:
+                        try:
+                            span.set_attribute("llm.input_tokens", _usage.prompt_tokens or 0)
+                            span.set_attribute("llm.output_tokens", _usage.completion_tokens or 0)
+                        except Exception:
+                            pass
+                    return _txt, ("" if _txt.strip() else "empty")
+
+                response_text = ""
+                fail_reason = ""
+                _t_start = time.monotonic()
+
                 async with _get_llm_sem():
                     if token_callback:
                         # STREAMING MODE — native async streaming, zero worker threads.
@@ -905,11 +1156,38 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                                 response_text = await asyncio.wait_for(
                                     _consume_stream(), timeout=_call_timeout
                                 )
+                                if not response_text.strip():
+                                    fail_reason = "empty"
                             except asyncio.TimeoutError:
                                 logger.warning(
                                     "LLM streaming call timed out after %.0fs", _call_timeout
                                 )
+                                response_text, fail_reason = "", "timeout"
+                            except Exception as _sexc:
+                                logger.warning(
+                                    "LLM streaming call failed: %s: %s",
+                                    type(_sexc).__name__, _sexc,
+                                )
                                 response_text = ""
+                                fail_reason = f"error: {type(_sexc).__name__}: {_sexc}"
+
+                            # Resilience: a streaming stall/empty/error is the #1
+                            # cause of "returns nothing". Retry ONCE via the more
+                            # robust non-streaming call before giving up.
+                            if fail_reason:
+                                logger.warning(
+                                    "Streaming response failed (%s) after %.1fs — "
+                                    "retrying once non-streaming (model=%s)",
+                                    fail_reason, time.monotonic() - _t_start, effective_model,
+                                )
+                                _retry_text, _retry_reason = await _nonstream_once(llm_span)
+                                if _retry_text.strip():
+                                    # Recovered. The final-response branch below
+                                    # emits tokens to the UI, so don't stream here.
+                                    response_text, fail_reason = _retry_text, ""
+                                else:
+                                    fail_reason = _retry_reason or fail_reason
+
                             if llm_span is not None:
                                 llm_span.set_attribute("llm.response_chars", len(response_text))
                                 llm_span.set_attribute(
@@ -918,28 +1196,27 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                     else:
                         # NON-STREAMING MODE: CLI / planning / background tasks.
                         with llm_span_cm as llm_span:
-                            try:
-                                response = await asyncio.wait_for(
-                                    self.client.chat.completions.create(**params),
-                                    timeout=_call_timeout,
-                                )
-                            except asyncio.TimeoutError:
-                                logger.warning(
-                                    "LLM call timed out after %.0fs", _call_timeout
-                                )
-                                return "No response from AI (request timed out)"
-                            response_text = response.choices[0].message.content
-                            usage = getattr(response, "usage", None)
-                            if llm_span is not None and usage:
-                                try:
-                                    llm_span.set_attribute("llm.input_tokens", usage.prompt_tokens or 0)
-                                    llm_span.set_attribute("llm.output_tokens", usage.completion_tokens or 0)
-                                except Exception:
-                                    pass
-                
-                if not response_text:
-                    return "No response from AI"
-                
+                            response_text, fail_reason = await _nonstream_once(llm_span)
+
+                if not response_text or fail_reason:
+                    _elapsed = time.monotonic() - _t_start
+                    if fail_reason == "timeout":
+                        _detail = f"the request timed out after {_call_timeout:.0f}s"
+                    elif fail_reason == "empty" or not fail_reason:
+                        _detail = "the model returned an empty response"
+                    elif fail_reason.startswith("error:"):
+                        _detail = f"an upstream error occurred ({fail_reason[7:].strip()})"
+                    else:
+                        _detail = "no content was returned"
+                    logger.warning(
+                        "[get_response] No usable response: reason=%s model=%s elapsed=%.1fs",
+                        fail_reason or "empty", effective_model, _elapsed,
+                    )
+                    return (
+                        f"⚠️ No response from AI — {_detail} "
+                        f"(model: {effective_model}, {_elapsed:.0f}s). Please try again."
+                    )
+
                 # Parse tool calls from response
                 tool_calls = self._parse_tool_calls(response_text)
                 
@@ -1021,15 +1298,20 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                                 pass
                     conv.append({"role": "assistant", "content": response_text})
                     # Phase 2 / auto-memory: submit to durable worker queue
-                    if self.memory_worker and self.memory_available:
+                    if self.memory_worker is None:
+                        logger.warning(
+                            "[AutoMemory] memory_worker is None — skipping"
+                            " _auto_memory_extract for this turn (response path)"
+                        )
+                    elif self.memory_available:
                         self.memory_worker.submit(
                             user_input, response_text, get_session_id() or ""
                         )
                     return response_text
             
             # If we hit max iterations, inform user but don't fail
-            logger.warning(f"Reached maximum iterations ({MAX_TOOL_ITERATIONS}). Task may not be complete.")
-            return f"I've executed {MAX_TOOL_ITERATIONS} tool calls. The task may need to be continued. Please check the current state and let me know if you want me to continue."
+            logger.warning(f"Reached safety backstop of {MAX_TOOL_ITERATIONS} iterations — this should never happen in normal use.")
+            return f"I've reached the iteration safety backstop ({MAX_TOOL_ITERATIONS} calls). This should never happen in normal use — please report this."
                 
         except Exception as e:
             logger.error(f"Error: {e}")

@@ -832,7 +832,9 @@ def _build_conversation(agent: AIAgent, session_id: str) -> list:
     conv = []
 
     if agent.conversation and agent.conversation[0]["role"] == "system":
-        conv.append(agent.conversation[0])
+        # Defensive copy: never share the agent's system-message dict by
+        # reference across per-request conversations.
+        conv.append(dict(agent.conversation[0]))
 
     if s:
         for msg in s["messages"]:
