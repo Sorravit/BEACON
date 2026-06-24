@@ -65,7 +65,6 @@ except ImportError:
     def setup_telemetry(*a, **kw): pass  # type: ignore
     def install_print_bridge(*a, **kw): pass  # type: ignore
 
-
 # ============================================================================
 # CONFIGURATION CONSTANTS - Modify these to customize behavior
 # ============================================================================
@@ -123,14 +122,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 # ── Module-level cached tiktoken encoder (Phase 1 / #7) ──────────────────────
 @lru_cache(maxsize=1)
 def _get_encoder():
     """Return the cached cl100k_base tiktoken encoder (loaded once per process)."""
     import tiktoken
     return tiktoken.get_encoding("cl100k_base")
-
 
 # ── LLM concurrency ──────────────────────────────────────────────────────────
 # The previous global semaphore (LLM_MAX_CONCURRENCY) has been removed: this app
@@ -143,12 +140,9 @@ def _get_encoder():
 # nullcontext keeps the existing ``async with _get_llm_sem():`` call sites
 # working without re-indenting, while imposing no concurrency limit.
 
-
 def _get_llm_sem():
     """No-op async context manager (LLM concurrency is unbounded)."""
     return nullcontext()
-
-
 
 class Config:
     """Configuration manager for the AI assistant."""
@@ -210,7 +204,6 @@ class Config:
         print(f"Endpoint: {self.base_url}")
         print(f"Tools: {self.enable_tools}")
         print(f"Models available: {len(self.models.ids())}")
-
 
 class AIAgent:
     """Main AI agent that handles conversations and tool execution."""
@@ -369,6 +362,13 @@ class AIAgent:
                             "    - Line range: sed -n '100,200p' filename\n"
                             "    - Count lines: wc -l filename\n"
                             "19. Never include raw binary or huge JSON blobs in your response — summarise them.\n\n"
+                            "SERVER LAUNCH RULE:\n"
+                            "- To start a web server, ASGI/WSGI server, or any long-lived/never-returning process\n"
+                            "  (uvicorn, gunicorn, flask run, manage.py runserver, python -m http.server,\n"
+                            "   npm start, npm run dev, yarn dev, pnpm dev, next dev, serve, nohup ...)\n"
+                            "  ALWAYS use delegate_background_task — NEVER execute_command or execute_long_command.\n"
+                            "  execute_command blocks for 30s then kills the server; execute_long_command blocks for 2h.\n\n"
+                            "- One-shot commands (pip install, pytest, build, grep, etc.) use execute_command as normal.\n\n"
                             "BE PROACTIVE. ACT FIRST. EXPLAIN AFTER."
                         )
                     }
@@ -460,7 +460,6 @@ class AIAgent:
                     print(f"  🧠 Remembered: [{topic}] {fact}")
         except Exception as e:
             logger.debug(f"Fact extraction skipped: {e}")
-
 
     async def _auto_memory_extract(
         self, user_input: str, ai_response: str, session_id: str = ""
@@ -663,7 +662,6 @@ class AIAgent:
         )
         return stored_count
 
-
     _SKILL_TRIGGERS = {
         "business_analyst":           ["act as ba", "act as business analyst", "write user stories", "write brd"],
         "lead_qa":                    ["act as lead qa", "qa strategy", "test strategy", "test plan"],
@@ -801,7 +799,6 @@ class AIAgent:
         except Exception as e:
             logger.warning("Skill dispatch failed: " + str(e))
             return None
-
 
     def _build_tools_prompt(self) -> str:
         """Build system prompt with tool descriptions.
@@ -1583,7 +1580,6 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
         
         await self.shutdown()
 
-
 async def main():
     import argparse
     parser = argparse.ArgumentParser(description="Autonomous AI Agent")
@@ -1618,7 +1614,6 @@ async def main():
     except Exception as e:
         logger.error(f"Fatal: {e}")
         return 1
-
 
 if __name__ == "__main__":
     sys.exit(asyncio.run(main()))
