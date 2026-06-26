@@ -1027,7 +1027,19 @@ async function sendMessage(){
           appendStreamingToken(tn, ev.content||'');
           setStatus('thinking','Responding\u2026');
         }else if(ev.type==='done'){
-          // Phase 7 / #10: flush with final rendered markdown (one re-render)
+          // Phase 7 / #10: flush with final rendered markdown (one re-render).
+          // Authoritative render: prefer the server's saved final assistant
+          // message (clean, tool-markup-free) over the live-streamed acc. This
+          // guarantees the bubble shows the clean final answer even if some
+          // intermediate prose streamed live, and is never blank.
+          let sd=null;
+          try{
+            sd=await(await fetch('/sessions/'+currentSessionId)).json();
+            const msgs=(sd&&sd.messages)||[];
+            for(let i=msgs.length-1;i>=0;i--){
+              if(msgs[i].role==='assistant'){const c=msgs[i].content||'';if(c)acc=c;break;}
+            }
+          }catch(e){}
           flushStreamingElement(tn, renderMarkdown(acc));
           tBo.classList.remove('open');
           tIc.innerHTML=steps>0?'<span style="color:var(--green);font-size:13px">\u2713</span>':'<span style="color:var(--muted);font-size:13px">\u2014</span>';
@@ -1035,8 +1047,7 @@ async function sendMessage(){
           scrollToBottom();refreshTasksBadge();
           if(answerModelLabel)addModelBadge(ab,answerModelLabel);
           await loadSessions();
-          const ud=await(await fetch('/sessions/'+currentSessionId)).json();
-          chatTitleEl.textContent=ud.title||'New Chat';
+          chatTitleEl.textContent=(sd&&sd.title)||'New Chat';
           flashTabTitle("✅ Big's AI replied");
         }else if(ev.type==='stopped'){
           flushStreamingElement(tn, acc ? renderMarkdown(acc) : '');

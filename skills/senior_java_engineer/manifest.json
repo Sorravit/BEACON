@@ -1,63 +1,123 @@
 {
   "skill_id": "senior_java_engineer",
-  "version": "1.0.0",
-  "display_name": "Senior Java Engineer",
-  "description": "Designs Spring Boot services, REST APIs, JUnit5 tests and Maven build configurations.",
+  "version": "3.0.0",
+  "display_name": "Senior / Lead Java Backend Engineer",
+  "description": "Acts as a Senior/Lead Java Backend Engineer. Designs, implements, reviews, and architects Java 17/21 Spring Boot 3 microservices, REST/gRPC APIs, event-driven systems, JPA/Hibernate, security, observability, and production-grade test suites.",
   "role": {
-    "persona": "Senior Java Engineer specialising in Spring Boot microservices",
-    "tone": "technical, best-practices oriented",
-    "output_format": "code"
+    "persona": "Senior/Lead Java Backend Engineer with 10+ years in Spring Boot microservices, DDD, Clean Architecture, and event-driven systems",
+    "tone": "precise, opinionated, best-practices oriented, production-focused",
+    "output_format": "structured markdown with labelled code blocks and file paths"
   },
   "capabilities": [
-    "spring_boot",
-    "rest_api",
-    "jpa_hibernate",
-    "junit5",
-    "mockito",
-    "maven",
-    "exception_handling",
-    "security",
-    "design_patterns",
-    "code_review"
+    "spring_boot_3",
+    "spring_security_6",
+    "spring_data_jpa",
+    "spring_cloud",
+    "java_17_21",
+    "records_sealed_classes_pattern_matching",
+    "virtual_threads_loom",
+    "rest_api_openapi3",
+    "grpc",
+    "kafka_rabbitmq",
+    "hibernate_6",
+    "flyway_liquibase",
+    "mapstruct",
+    "junit5_mockito_testcontainers_assertj_wiremock",
+    "micrometer_opentelemetry",
+    "spring_actuator",
+    "structured_logging_logback",
+    "oauth2_jwt_rbac",
+    "owasp_top10",
+    "clean_architecture",
+    "hexagonal_architecture",
+    "ddd",
+    "cqrs",
+    "event_sourcing",
+    "maven_gradle",
+    "docker_kubernetes",
+    "postgresql_redis",
+    "code_review",
+    "performance_optimisation",
+    "architecture_decision_records"
+  ],
+  "modes": [
+    "new_feature",
+    "code_review",
+    "refactor",
+    "architecture",
+    "debug_fix",
+    "test_writing",
+    "performance"
   ],
   "allowed_tools": [
     "web_search",
     "read_file",
     "write_file",
-    "execute_command"
+    "execute_command",
+    "load_skill"
   ],
   "inputs": {
-    "requirement": "string - feature or API requirement",
-    "domain": "string - business domain context",
-    "existing_code": "string - existing code (optional)"
+    "requirement": "string - feature, bug, or architectural requirement",
+    "domain": "string - business domain context (e.g. payments, orders, identity)",
+    "mode": "string - one of: new_feature | code_review | refactor | architecture | debug_fix | test_writing | performance (optional, auto-detected if omitted)",
+    "existing_code": "string - existing code to review, refactor, or extend (optional)",
+    "constraints": "string - non-functional requirements: SLA, scale, team, stack version (optional)"
   },
   "outputs": {
-    "service_class": "string - Spring Boot Service",
-    "controller": "string - REST Controller",
-    "test_class": "string - JUnit5 tests",
-    "pom_snippet": "string - Maven dependencies"
+    "objective": "string - clear statement of what is being built or solved",
+    "design": "string - domain model, API contract, architectural decisions",
+    "project_structure": "string - recommended package layout",
+    "implementation": "string - production-ready Java source files with paths",
+    "tests": "string - JUnit5/Mockito/Testcontainers test files with paths",
+    "db_migration": "string - Flyway/Liquibase SQL migration script (if schema changes)",
+    "configuration": "string - application.yml snippets",
+    "maven_dependencies": "string - pom.xml dependency additions",
+    "assumptions": "string - numbered list of assumptions",
+    "review_findings": "string - rated findings for code review mode",
+    "follow_up_recommendations": "string - security, performance, observability notes"
   },
   "memory_policy": {
     "retain_context": true,
-    "max_history_turns": 10
+    "max_history_turns": 20
   },
   "safety_constraints": [
-    "never fabricate facts or data",
-    "always flag assumptions explicitly",
-    "do not expose sensitive credentials in output"
+    "never fabricate APIs, library methods, or Spring annotations that do not exist",
+    "always flag assumptions explicitly before writing code",
+    "never expose sensitive credentials, tokens, or PII in output code or logs",
+    "never use field injection (@Autowired) — constructor injection only",
+    "never expose JPA entities directly in API responses",
+    "always add pagination for collection endpoints",
+    "always flag N+1 query risks",
+    "always use SLF4J — never System.out.println"
   ],
-  "timeout_seconds": 120,
+  "timeout_seconds": 180,
   "retry_policy": {
     "max_retries": 2,
-    "backoff_seconds": 2
+    "backoff_seconds": 3
   },
   "tags": [
     "engineering",
     "java",
+    "java17",
+    "java21",
     "spring-boot",
+    "spring-security",
+    "spring-cloud",
     "backend",
-    "microservices"
+    "microservices",
+    "ddd",
+    "clean-architecture",
+    "hexagonal",
+    "kafka",
+    "rest",
+    "grpc",
+    "testcontainers",
+    "observability",
+    "performance",
+    "security",
+    "lead"
   ],
   "author": "BEACON Core Team",
-  "created_at": "2025-01-01"
+  "created_at": "2025-01-01",
+  "updated_at": "2025-07-14"
 }

@@ -22,6 +22,7 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import sys
 import time
 import warnings
@@ -51,6 +52,7 @@ from core.mcp_client import MCPManager
 from core.models import ModelRegistry
 from core.skills import SkillManager
 from core.vector_memory import VectorMemory
+from core.mem0_memory import Mem0Memory
 from tools.manager import ToolManager
 
 # ── Telemetry ─────────────────────────────────────────────────────────────────
@@ -144,6 +146,88 @@ def _get_llm_sem():
     """No-op async context manager (LLM concurrency is unbounded)."""
     return nullcontext()
 
+
+class _ToolMarkupStreamFilter:
+    """Incremental filter that strips prompt-based tool-call markup from a token
+    stream so it never reaches the chat UI.
+
+    Suppresses the regions:
+      * ``<tool_use> … </tool_use>``  (and ``_``/``-`` and mismatched closes)
+      * ``<function_calls> … </function_calls>``  (with nested ``<invoke>``)
+      * ``<invoke name=…> … </invoke>``
+
+    ``feed(delta)`` returns the safe text to emit for that delta (possibly empty);
+    ``flush()`` returns any remaining safe text at end of stream. Ambiguous
+    partial-tag tails (a ``<`` that might begin one of the markers) are held back
+    until the next delta disambiguates them.
+    """
+
+    _OPEN = re.compile(r'<(tool[_-]use|function_calls|invoke)\b', re.IGNORECASE)
+    # Per-marker close patterns. function_calls is matched specifically so a
+    # nested <invoke>…</invoke> inside it does not end suppression early.
+    _CLOSE_TOOL = re.compile(r'</(?:tool[_-](?:use|invoke|call)|use)>', re.IGNORECASE)
+    _CLOSE_FUNCTION = re.compile(r'</function_calls>', re.IGNORECASE)
+    _CLOSE_INVOKE = re.compile(r'</invoke>', re.IGNORECASE)
+    # Longest marker we might need to recognise from a partial tail.
+    _MAX_MARKER = len("<function_calls>")
+
+    def __init__(self):
+        self._buf = ""
+        self._close_re = None  # active close pattern while suppressing
+
+    def _close_for(self, marker: str):
+        m = marker.lower()
+        if m.startswith("function"):
+            return self._CLOSE_FUNCTION
+        if m.startswith("invoke"):
+            return self._CLOSE_INVOKE
+        return self._CLOSE_TOOL
+
+    def feed(self, delta: str) -> str:
+        self._buf += delta
+        out = []
+        while True:
+            if self._close_re is None:
+                m = self._OPEN.search(self._buf)
+                if m is None:
+                    safe, hold = self._split_safe_tail(self._buf)
+                    if safe:
+                        out.append(safe)
+                    self._buf = hold
+                    break
+                out.append(self._buf[:m.start()])
+                self._buf = self._buf[m.start():]
+                self._close_re = self._close_for(m.group(1))
+            else:
+                m = self._close_re.search(self._buf)
+                if m is None:
+                    # Still inside a tool block — keep buffering, emit nothing.
+                    break
+                self._buf = self._buf[m.end():]
+                self._close_re = None
+        return "".join(out)
+
+    def flush(self) -> str:
+        # An unterminated tool block at EOS is dropped; otherwise emit leftovers
+        # (e.g. a held-back '<' that turned out to be ordinary prose).
+        if self._close_re is not None:
+            self._buf = ""
+            return ""
+        out, self._buf = self._buf, ""
+        return out
+
+    def _split_safe_tail(self, s: str):
+        """Split ``s`` into (emit_now, hold_back). Hold back a trailing fragment
+        that could still grow into one of the suppressed markers."""
+        idx = s.rfind('<')
+        if idx == -1:
+            return s, ""
+        tail = s[idx:]
+        # Only hold a short, tag-shaped tail (could be a partial open/close tag).
+        if len(tail) <= self._MAX_MARKER and re.fullmatch(r'</?[a-zA-Z_-]*', tail):
+            return s[:idx], tail
+        return s, ""
+
 class Config:
     """Configuration manager for the AI assistant."""
     
@@ -220,6 +304,8 @@ class AIAgent:
         self.memory_available = False
         self.skill_manager: Optional[SkillManager] = None
         self.memory_worker = None          # MemoryWorker (Phase 2)
+        self.mem0_memory: Optional[Mem0Memory] = None  # mem0 auto-learning
+        self._mem0_tasks: set = set()       # strong refs to fire-and-forget adds
         self.browser_pool = None           # BrowserPool  (Phase 6)
         self._last_dispatched_skill: str = ""
         # Cache for the (expensive, ~80k-char) tools prompt. Invalidated when the
@@ -243,16 +329,16 @@ class AIAgent:
         """
         try:
             # Phase 5 / #3: AsyncOpenAI client — no worker threads for LLM calls.
-            # IMPORTANT: an explicit timeout + retry budget is required. Without it
-            # a half-open/stalled streaming connection hangs forever and keeps its
-            # _llm_sem permit (see _get_llm_sem), which can exhaust the shared
-            # concurrency pool and make every task/chat appear to "stop".
-            _llm_timeout = float(os.getenv("LLM_REQUEST_TIMEOUT", "120"))
+            # The SDK's own (httpx) timeout must be generous enough not to pre-empt
+            # long, legitimately-streaming responses. Per-call inactivity limits are
+            # enforced in get_response (LLM_STREAM_IDLE_TIMEOUT for streaming, a total
+            # wall-clock guard for non-streaming), so here we set a large ceiling.
+            _llm_timeout = float(os.getenv("LLM_REQUEST_TIMEOUT", "0"))
             _llm_retries = int(os.getenv("LLM_MAX_RETRIES", "2"))
             self.client = AsyncOpenAI(
                 api_key=self.config.api_key,
                 base_url=self.config.base_url,
-                timeout=_llm_timeout,
+                timeout=_llm_timeout if _llm_timeout > 0 else None,
                 max_retries=_llm_retries,
             )
             
@@ -282,9 +368,16 @@ class AIAgent:
                 from core.memory_worker import MemoryWorker
                 self.memory_worker = MemoryWorker(self)
                 self.memory_worker.start()
+                # ── mem0 auto-learning (lib mode, backed by same Weaviate) ──
+                self.mem0_memory = Mem0Memory()
+                _mem0_ok = await self.mem0_memory.initialize()
+                if _mem0_ok:
+                    logger.info("✅ mem0 auto-learning memory ready")
+                else:
+                    logger.warning("⚠️  mem0 unavailable — will rely on AutoLearned only")
+                    self.mem0_memory = None
             else:
                 logger.info("ℹ️  Vector memory unavailable — running without persistent memory")
-
             # Phase 6 / #2: create browser pool (lazy — Chromium launched on first use)
             from core.browser_pool import BrowserPool
             self.browser_pool = BrowserPool()
@@ -884,8 +977,10 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
         tool_calls = []
         
         # ── Format 1: <tool_use>...<tool_name>NAME</tool_name>...</tool_use> ──
-        # Also tolerates mismatched closing tags: </tool_invoke>, </tool_call>
-        pattern = r'<tool_use>(.*?)</(?:tool_use|tool_invoke|tool_call|use)>'
+        # Also tolerates mismatched closing tags: </tool_invoke>, </tool_call>.
+        # Separator-tolerant: open/close may use '_' or '-' for the same word
+        # (e.g. opens <tool_use> but closes </tool-use>).
+        pattern = r'<tool[_-]use>(.*?)</(?:tool[_-](?:use|invoke|call)|use)>'
         matches = re.findall(pattern, response_text, re.DOTALL)
 
         # ── Format 2: <function_calls><invoke name="NAME">...</invoke></function_calls> ──
@@ -902,7 +997,7 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
         for match in matches:
             try:
                 # Parse tool name
-                tool_name_match = re.search(r'<tool_name>(.*?)</tool_name>', match)
+                tool_name_match = re.search(r'<tool[_-]name>(.*?)</tool[_-]name>', match)
                 if not tool_name_match:
                     continue
                 tool_name = tool_name_match.group(1).strip()
@@ -952,7 +1047,36 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                 continue
         
         return tool_calls
-    
+
+    def _mem0_learn(self, user_input: str, ai_output: str) -> None:
+        """
+        Fire-and-forget: feed a turn to mem0 for auto fact-extraction.
+
+        Keeps a strong reference to the task (so it isn't garbage-collected
+        before completion) and logs any failure instead of swallowing it.
+        """
+        if not self.mem0_memory:
+            return
+        try:
+            task = asyncio.create_task(
+                self.mem0_memory.add(
+                    user_input, ai_output,
+                    user_id=get_session_id() or "default",
+                )
+            )
+        except RuntimeError:
+            # No running event loop (e.g. sync test context) — skip silently.
+            return
+        self._mem0_tasks.add(task)
+
+        def _done(t: "asyncio.Task") -> None:
+            self._mem0_tasks.discard(t)
+            exc = t.exception() if not t.cancelled() else None
+            if exc is not None:
+                logger.warning("mem0 background add failed: %s", exc)
+
+        task.add_done_callback(_done)
+
     async def get_response(self, user_input: str, conversation: Optional[List[Dict]] = None, tools: Optional["ToolManager"] = None, token_callback=None, model: Optional[str] = None) -> Optional[str]:
         """
         Get AI response with prompt-based tool execution loop (Cline/Roo style).
@@ -978,6 +1102,19 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
 
         # Resolve which ToolManager to use for this call — never mutate self.tools
         effective_tools = tools if tools is not None else self.tools
+
+        # Helper: push a full string to the UI via token_callback in 24-char
+        # batches. Used by every return path that must not produce a blank bubble
+        # (warning fallback, iteration backstop, empty-after-strip recovery).
+        def _stream_out(text: str) -> None:
+            if not token_callback or not text:
+                return
+            _BATCH = 24
+            for _i in range(0, len(text), _BATCH):
+                try:
+                    token_callback(text[_i:_i + _BATCH])
+                except Exception:
+                    pass
 
         # Use passed-in conversation or fall back to self.conversation (backward compat)
         if conversation is not None:
@@ -1035,6 +1172,8 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                     self.memory_worker.submit(
                         user_input, _skill_out, get_session_id() or ""
                     )
+                # ── mem0: learn from skill dispatch ──────────────────────
+                self._mem0_learn(user_input, _skill_out)
                 return _skill_out
             # END SKILL DISPATCH
 
@@ -1050,6 +1189,13 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                 if raw_prefix and len(raw_prefix) > MAX_MEMORY_CONTEXT_CHARS:
                     raw_prefix = raw_prefix[:MAX_MEMORY_CONTEXT_CHARS] + "\n...[memory truncated]\n\n"
                 memory_prefix = raw_prefix
+                # ── mem0: inject conversation-learned memories ──────────────
+                if self.mem0_memory:
+                    _mem0_ctx = await self.mem0_memory.build_context_snippet(
+                        user_input, user_id=get_session_id() or "default", limit=8
+                    )
+                    if _mem0_ctx:
+                        memory_prefix = (memory_prefix or "") + "\n" + _mem0_ctx + "\n"
 
             user_message = (memory_prefix + user_input) if memory_prefix else user_input
             conv.append({"role": "user", "content": user_message})
@@ -1074,6 +1220,9 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                     else:
                         conv[0] = {"role": "system", "content": _base_system_content}
 
+                # Reset per-iteration live-streaming flag (each LLM call is independent).
+                _live_streamed = False
+
                 params = {
                     "model": effective_model,
                     "messages": conv,
@@ -1097,20 +1246,30 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                     else nullcontext()
                 )
 
-                # Both paths use AsyncOpenAI (no worker threads). LLM concurrency
-                # is unbounded (the global semaphore was removed); a hard
-                # wall-clock timeout guards every call so a stalled stream can
-                # never hang forever.
-                _call_timeout = float(os.getenv("LLM_REQUEST_TIMEOUT", "120")) + 30.0
+                # Streaming uses an INACTIVITY (idle) timeout rather than a total
+                # wall-clock cap: a response may take arbitrarily long as long as
+                # the server keeps sending chunks. The timer resets on every chunk
+                # received (including empty/keepalive/reasoning chunks), so only a
+                # genuine stall (no data for LLM_STREAM_IDLE_TIMEOUT seconds) aborts.
+                # Set LLM_STREAM_IDLE_TIMEOUT=0 to disable the idle guard entirely
+                # (default). A positive value (e.g. 180) caps the inter-chunk silence.
+                # Non-streaming calls can't measure inactivity (single blocking
+                # call) so they use a generous total wall-clock guard instead;
+                # set LLM_REQUEST_TIMEOUT=0 to disable that guard entirely.
+                _idle_raw     = float(os.getenv("LLM_STREAM_IDLE_TIMEOUT", "0"))
+                _idle_timeout = _idle_raw if _idle_raw > 0 else None   # None = no limit
+                _total_timeout = float(os.getenv("LLM_REQUEST_TIMEOUT", "0"))
+                _nonstream_timeout = _total_timeout if _total_timeout > 0 else None
 
                 # One non-streaming completion. Returns (text, reason) where
                 # reason is "" on success, else "timeout" / "empty" / "error: …".
                 async def _nonstream_once(span=None):
                     try:
-                        _resp = await asyncio.wait_for(
-                            self.client.chat.completions.create(**params),
-                            timeout=_call_timeout,
-                        )
+                        _coro = self.client.chat.completions.create(**params)
+                        if _nonstream_timeout is not None:
+                            _resp = await asyncio.wait_for(_coro, timeout=_nonstream_timeout)
+                        else:
+                            _resp = await _coro
                     except asyncio.TimeoutError:
                         return "", "timeout"
                     except Exception as _exc:
@@ -1131,33 +1290,69 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
 
                 response_text = ""
                 fail_reason = ""
+                _live_streamed = False  # set True when delta tokens reach token_callback live
                 _t_start = time.monotonic()
 
                 async with _get_llm_sem():
                     if token_callback:
                         # STREAMING MODE — native async streaming, zero worker threads.
+                        # Tokens are emitted to the UI live inside the chunk loop so
+                        # the user sees incremental output instead of a frozen spinner.
+                        # A tool-markup filter suppresses <tool_use>/<function_calls>/
+                        # <invoke> blocks so raw tool XML never reaches the chat.
                         stream_params = {**params, "stream": True}
                         with llm_span_cm as llm_span:
                             async def _consume_stream():
+                                nonlocal _live_streamed
                                 _text = ""
-                                stream = await self.client.chat.completions.create(**stream_params)
-                                async for chunk in stream:
+                                _filter = _ToolMarkupStreamFilter()
+
+                                def _emit(piece: str):
+                                    nonlocal _live_streamed
+                                    if not piece:
+                                        return
+                                    try:
+                                        token_callback(piece)
+                                        _live_streamed = True
+                                    except Exception:
+                                        pass
+
+                                stream = await asyncio.wait_for(
+                                    self.client.chat.completions.create(**stream_params),
+                                    timeout=_idle_timeout,  # time-to-first-token guard
+                                )
+                                # Manual iteration so each chunk fetch has its own
+                                # inactivity timeout. The timer resets on every chunk
+                                # received (regardless of whether it carries visible
+                                # content), so long-but-active streams never time out
+                                # while a true stall is still bounded.
+                                _aiter = stream.__aiter__()
+                                while True:
+                                    try:
+                                        chunk = await asyncio.wait_for(
+                                            _aiter.__anext__(), timeout=_idle_timeout
+                                        )
+                                    except StopAsyncIteration:
+                                        break
                                     delta = (
                                         chunk.choices[0].delta.content
                                         if chunk.choices else None
                                     )
                                     if delta:
                                         _text += delta
+                                        # Live-stream the filtered (tool-markup-free) text.
+                                        _emit(_filter.feed(delta))
+                                # Flush any safe text held back by the filter.
+                                _emit(_filter.flush())
                                 return _text
                             try:
-                                response_text = await asyncio.wait_for(
-                                    _consume_stream(), timeout=_call_timeout
-                                )
+                                response_text = await _consume_stream()
                                 if not response_text.strip():
                                     fail_reason = "empty"
                             except asyncio.TimeoutError:
                                 logger.warning(
-                                    "LLM streaming call timed out after %.0fs", _call_timeout
+                                    "LLM streaming call stalled — no data for %.0fs",
+                                    _idle_timeout or 0,
                                 )
                                 response_text, fail_reason = "", "timeout"
                             except Exception as _sexc:
@@ -1198,7 +1393,14 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                 if not response_text or fail_reason:
                     _elapsed = time.monotonic() - _t_start
                     if fail_reason == "timeout":
-                        _detail = f"the request timed out after {_call_timeout:.0f}s"
+                        if token_callback:
+                            _detail = (
+                                f"the response stalled — no output for {_idle_timeout:.0f}s"
+                                if _idle_timeout
+                                else "the response stalled with no output"
+                            )
+                        else:
+                            _detail = f"the request timed out after {_nonstream_timeout:.0f}s"
                     elif fail_reason == "empty" or not fail_reason:
                         _detail = "the model returned an empty response"
                     elif fail_reason.startswith("error:"):
@@ -1209,10 +1411,12 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                         "[get_response] No usable response: reason=%s model=%s elapsed=%.1fs",
                         fail_reason or "empty", effective_model, _elapsed,
                     )
-                    return (
+                    _warn = (
                         f"⚠️ No response from AI — {_detail} "
                         f"(model: {effective_model}, {_elapsed:.0f}s). Please try again."
                     )
+                    _stream_out(_warn)
+                    return _warn
 
                 # Parse tool calls from response
                 tool_calls = self._parse_tool_calls(response_text)
@@ -1282,18 +1486,36 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                     # Continue loop to let AI process tool results
                     continue
                 else:
-                    # No tool calls — final response. NOW emit tokens to UI.
-                    # Phase 1 / #4: batch-emit in 24-char chunks (not per-char).
-                    if token_callback:
-                        import re as _re
-                        clean = _re.sub(r'<tool_use>.*?</tool_use>', '', response_text, flags=_re.DOTALL).strip()
+                    # No tool calls — final response.
+                    # Compute the clean (tool-markup-free) text once; it is the
+                    # canonical value we stream, save, learn from, and return so
+                    # raw tool XML never reaches the chat, history, or memory.
+                    clean = re.sub(
+                        r'<tool[_-]use>.*?</(?:tool[_-](?:use|invoke|call)|use)>',
+                        '', response_text, flags=re.DOTALL,
+                    ).strip()
+                    # Empty-after-strip: the model emitted only a tool block that
+                    # _parse_tool_calls could not parse. Fall back to raw text so
+                    # the user sees something instead of "no response".
+                    if not clean:
+                        clean = response_text.strip() or (
+                            "⚠️ The model returned only a malformed tool call "
+                            "and no readable text. Please try again."
+                        )
+
+                    # If we were in streaming mode and tokens were already emitted
+                    # live (delta-by-delta, already filtered), do NOT re-emit them.
+                    # Otherwise (non-streaming retry recovery) batch-emit here.
+                    if token_callback and not _live_streamed:
                         _BATCH = 24
                         for _i in range(0, len(clean), _BATCH):
                             try:
                                 token_callback(clean[_i:_i+_BATCH])
                             except Exception:
                                 pass
-                    conv.append({"role": "assistant", "content": response_text})
+
+                    final_text = clean
+                    conv.append({"role": "assistant", "content": final_text})
                     # Phase 2 / auto-memory: submit to durable worker queue
                     if self.memory_worker is None:
                         logger.warning(
@@ -1302,13 +1524,17 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                         )
                     elif self.memory_available:
                         self.memory_worker.submit(
-                            user_input, response_text, get_session_id() or ""
+                            user_input, final_text, get_session_id() or ""
                         )
-                    return response_text
+                    # mem0: learn from every final response
+                    self._mem0_learn(user_input, final_text)
+                    return final_text
             
             # If we hit max iterations, inform user but don't fail
             logger.warning(f"Reached safety backstop of {MAX_TOOL_ITERATIONS} iterations — this should never happen in normal use.")
-            return f"I've reached the iteration safety backstop ({MAX_TOOL_ITERATIONS} calls). This should never happen in normal use — please report this."
+            _backstop = f"I've reached the iteration safety backstop ({MAX_TOOL_ITERATIONS} calls). This should never happen in normal use — please report this."
+            _stream_out(_backstop)
+            return _backstop
                 
         except Exception as e:
             logger.error(f"Error: {e}")
@@ -1401,6 +1627,9 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
         try:
             if self.memory_worker:
                 await self.memory_worker.stop()
+            if self.mem0_memory:
+                self.mem0_memory = None
+                logger.info("mem0 memory released")
         except Exception as e:
             logger.debug(f"MemoryWorker shutdown failed: {e}")
 

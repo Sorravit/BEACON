@@ -311,10 +311,11 @@ _events_cache: dict = {"tasks": [], "notifications": [], "activity": {}}
 def _bg_state(session_id: str) -> dict:
     if session_id not in _bg:
         _bg[session_id] = {
-            "task":       None,
-            "event_buf":  [],
-            "done_event": None,   # FIX1: created lazily inside running event loop
-            "activity":   "",
+            "task":        None,
+            "event_buf":   [],
+            "trim_offset": 0,     # monotonic index of event_buf[0]; cursors use logical indices
+            "done_event":  None,   # FIX1: created lazily inside running event loop
+            "activity":    "",
         }
     return _bg[session_id]
 
@@ -701,6 +702,7 @@ async def chat_stream(req: ChatRequest):
 
     agent = _shared_agent
     bg["event_buf"] = []
+    bg["trim_offset"] = 0
     bg["done_event"] = asyncio.Event()
     bg["activity"] = ""
     bg["task"] = asyncio.create_task(_run_agent_bg(req.message, sid, agent, model=req.model))
@@ -961,8 +963,16 @@ async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent, model:
         per_request_tools.execute_tool = instrumented_execute
 
         bg["activity"] = "Thinking..."
+        # Track whether any token actually reached the UI. Several get_response()
+        # return paths (empty/timeout warning, iteration backstop, empty-after-
+        # strip) produce content without streaming it. The frontend renders the
+        # bubble purely from streamed tokens, so without this guard those turns
+        # show a blank "no response" bubble. See the emit-fallback below.
+        _streamed = {"any": False}
         try:
             def _token_cb(token: str):
+                if token:
+                    _streamed["any"] = True
                 _emit({"type": "token", "content": token})
             response = await agent.get_response(user_input, conversation=conversation, tools=per_request_tools, token_callback=_token_cb, model=model)
             # ── Skill indicator Path-1: agent.py keyword dispatch ──
@@ -990,6 +1000,12 @@ async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent, model:
 
         # Tokens already streamed live via token_callback during LLM inference.
         content = response or ""
+
+        # Safety net: if get_response produced content but streamed nothing (empty/
+        # timeout warning, iteration backstop, empty-after-strip, etc.), emit it now
+        # so the UI never shows a blank "no response" bubble.
+        if content and not _streamed["any"]:
+            _emit({"type": "token", "content": content})
 
         if s is not None:
             now = datetime.now().isoformat()
@@ -1055,18 +1071,30 @@ async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent, model:
         _dev = bg.get("done_event")
         if _dev is not None:
             _dev.set()
-        # Phase 9: cap event_buf to avoid unbounded growth
-        if len(bg["event_buf"]) > 4000:
-            bg["event_buf"] = bg["event_buf"][-2000:]
+        # Cap event_buf to avoid unbounded growth. We only trim AFTER marking done
+        # (done_event.set() above) so no active _reconnect_stream consumer can lose
+        # unseen events. trim_offset tracks the logical start index so consumers
+        # that reconnect after trimming still compute the correct list index.
+        _buf = bg["event_buf"]
+        if len(_buf) > 4000:
+            keep = _buf[-2000:]
+            bg["trim_offset"] = bg.get("trim_offset", 0) + (len(_buf) - len(keep))
+            bg["event_buf"] = keep
 
 
 async def _reconnect_stream(session_id: str) -> AsyncGenerator[str, None]:
     """
     Stream all buffered events then continue streaming live events until done.
+
+    Uses a logical cursor (monotonic event index) combined with bg['trim_offset']
+    so that post-turn event_buf trimming never causes unseen events to be skipped
+    or already-seen events to be re-sent on reconnect.
     """
     bg = _bg_state(session_id)
     done_event = bg.get("done_event")  # FIX2: snapshot once at entry
-    cursor = 0
+    # logical_cursor is the monotonic index of the next event to send.
+    # buf[logical_cursor - trim_offset] gives the list position.
+    logical_cursor = bg.get("trim_offset", 0)
     idle_ticks = 0
 
     while True:
@@ -1075,11 +1103,20 @@ async def _reconnect_stream(session_id: str) -> AsyncGenerator[str, None]:
             done_event = bg.get("done_event")
 
         buf = bg["event_buf"]
-        # Phase 9: guard cursor if event_buf was capped
-        cursor = min(cursor, len(buf))
-        while cursor < len(buf):
-            ev = buf[cursor]
-            cursor += 1
+        offset = bg.get("trim_offset", 0)
+
+        # Drain any new events since last iteration
+        while True:
+            list_idx = logical_cursor - offset
+            if list_idx < 0:
+                # trim_offset advanced past our cursor (shouldn't happen since we
+                # only trim after done, but guard defensively: jump to buf start).
+                logical_cursor = offset
+                list_idx = 0
+            if list_idx >= len(buf):
+                break
+            ev = buf[list_idx]
+            logical_cursor += 1
             yield " " + json.dumps(ev) + "\n\n"
 
         task = bg.get("task")
@@ -1088,7 +1125,9 @@ async def _reconnect_stream(session_id: str) -> AsyncGenerator[str, None]:
             and done_event is not None  # FIX2: guard stale-ref freeze
             and done_event.is_set()
         )
-        if is_done and cursor >= len(bg["event_buf"]):
+        # Re-check buffer length (logical) after refreshing offset
+        buf_logical_end = bg.get("trim_offset", 0) + len(bg["event_buf"])
+        if is_done and logical_cursor >= buf_logical_end:
             break
 
         await asyncio.sleep(0.25)

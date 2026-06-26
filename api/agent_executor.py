@@ -344,11 +344,12 @@ class AgentExecutor:
         }
         # Hard wall-clock timeout so a stalled upstream response can never hang a
         # task phase forever (these calls bypass get_response's own guard).
-        _timeout = float(_os.getenv("LLM_REQUEST_TIMEOUT", "120")) + 30.0
+        _t_raw = float(_os.getenv("LLM_REQUEST_TIMEOUT", "0"))
+        _timeout = (_t_raw + 30.0) if _t_raw > 0 else None  # None = no limit
         # AsyncOpenAI returns a coroutine; sync clients/mocks return directly.
         _call = self.ai_agent.client.chat.completions.create(**params)
         if _inspect.isawaitable(_call):
-            response = await asyncio.wait_for(_call, timeout=_timeout)
+            response = await (asyncio.wait_for(_call, timeout=_timeout) if _timeout else _call)
         else:
             response = _call
         return (response.choices[0].message.content or "").strip()

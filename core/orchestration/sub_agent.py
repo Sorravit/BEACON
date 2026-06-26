@@ -136,14 +136,15 @@ class SubAgent:
         # Hard wall-clock timeout so a stalled response can never hang a phase
         # forever (these direct calls bypass get_response's own guard).
         import os as _os
-        _timeout = float(_os.getenv("LLM_REQUEST_TIMEOUT", "120")) + 30.0
+        _t_raw = float(_os.getenv("LLM_REQUEST_TIMEOUT", "0"))
+        _timeout = (_t_raw + 30.0) if _t_raw > 0 else None  # None = no limit
 
         async def _create():
             # AsyncOpenAI returns a coroutine; sync clients/mocks return the
             # response directly. Support both, and bound the awaitable path.
             _call = self.ai_agent.client.chat.completions.create(**params)
             if inspect.isawaitable(_call):
-                return await asyncio.wait_for(_call, timeout=_timeout)
+                return await (asyncio.wait_for(_call, timeout=_timeout) if _timeout else _call)
             return _call
 
         if _OTEL_AVAILABLE:
