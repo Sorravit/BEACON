@@ -168,10 +168,21 @@ def fetch_live_models_sync(
             raw = resp.read().decode("utf-8")
         data = _json.loads(raw)
     except urllib.error.HTTPError as exc:
-        logger.warning(
-            "Dynamic model listing HTTP %s from %s — falling back to static registry",
-            exc.code, url,
-        )
+        if exc.code == 403:
+            # IBM ICA: this API key can call chat/completions but is not
+            # permitted to list models.  Expected — log at DEBUG, not WARNING.
+            logger.debug(
+                "Dynamic model listing HTTP 403 from %s — "
+                "/models endpoint not permitted for this API key "
+                "(chat/completions still works). "
+                "Set DYNAMIC_MODEL_LISTING_ENABLED=false to silence.",
+                url,
+            )
+        else:
+            logger.warning(
+                "Dynamic model listing HTTP %s from %s — falling back to static registry",
+                exc.code, url,
+            )
         return []
     except urllib.error.URLError as exc:
         logger.warning(

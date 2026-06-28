@@ -27,7 +27,6 @@ from core.agent.runtime import (
     ModelRegistry,
     SkillManager,
     VectorMemory,
-    Mem0Memory,
     ToolManager,
     MCP_CONFIG_FILE,
 )
@@ -54,8 +53,6 @@ class AIAgent(MemoryMixin, SkillsMixin, ToolingMixin, ResponseMixin, Conversatio
         self.memory_available = False
         self.skill_manager: Optional[SkillManager] = None
         self.memory_worker = None  # MemoryWorker (Phase 2)
-        self.mem0_memory: Optional[Mem0Memory] = None  # mem0 auto-learning
-        self._mem0_tasks: set = set()  # strong refs to fire-and-forget adds
         self.browser_pool = None  # BrowserPool  (Phase 6)
         self._last_dispatched_skill: str = ""
         # Cache for the (expensive, ~80k-char) tools prompt. Invalidated when the
@@ -119,14 +116,6 @@ class AIAgent(MemoryMixin, SkillsMixin, ToolingMixin, ResponseMixin, Conversatio
                 from core.memory_worker import MemoryWorker
                 self.memory_worker = MemoryWorker(self)
                 self.memory_worker.start()
-                # ── mem0 auto-learning (lib mode, backed by same Weaviate) ──
-                self.mem0_memory = Mem0Memory()
-                _mem0_ok = await self.mem0_memory.initialize()
-                if _mem0_ok:
-                    logger.info("✅ mem0 auto-learning memory ready")
-                else:
-                    logger.warning("⚠️  mem0 unavailable — will rely on AutoLearned only")
-                    self.mem0_memory = None
             else:
                 logger.info("ℹ️  Vector memory unavailable — running without persistent memory")
             # Phase 6 / #2: create browser pool (lazy — Chromium launched on first use)
@@ -151,19 +140,20 @@ class AIAgent(MemoryMixin, SkillsMixin, ToolingMixin, ResponseMixin, Conversatio
                         "content": (
                             "You are an AUTONOMOUS AI AGENT. Your job is to TAKE ACTION, not explain.\n\n"
                             "CRITICAL RULES:\n"
-                            "1. When user asks a question → USE TOOLS IMMEDIATELY to get the answer\n"
-                            "2. NEVER say 'I cannot' or 'I don't have access' - you have tools, USE THEM\n"
-                            "3. NEVER explain how to do something - JUST DO IT\n"
-                            "4. For time/date questions → use get_current_time\n"
-                            "5. For recent events/news/current info → use web_search\n"
-                            "6. For system info → use execute_command\n"
-                            "7. Chain multiple tools when needed\n"
-                            "8. Only respond in text AFTER you've used tools to get the answer\n\n"
+                            "1. Do not invent, if you don't know just say so\n"
+                            "2. When user asks a question → USE TOOLS IMMEDIATELY to get the answer\n"
+                            "3. NEVER say 'I cannot' or 'I don't have access' - you have tools, USE THEM\n"
+                            "4. NEVER explain how to do something - JUST DO IT\n"
+                            "5. For time/date questions → use get_current_time\n"
+                            "6. For recent events/news/current info → use web_search\n"
+                            "7. For system info → use execute_command\n"
+                            "8. Chain multiple tools when needed\n"
+                            "9. Only respond in text AFTER you've used tools to get the answer\n\n"
                             "FILE CREATION RULES (ALWAYS FOLLOW):\n"
-                            "9. ALWAYS save screenshots, images, and temp files to the 'output/' folder (e.g. output/screenshot.png)\n"
-                            "10. ALWAYS save intermediate/scratch files to the 'temp/' folder (e.g. temp/work.txt)\n"
-                            "11. NEVER create temp/image files in the project root directory\n"
-                            "12. If a filename has no directory prefix, prepend 'output/' automatically\n\n"
+                            "10. ALWAYS save screenshots, images, and temp files to the 'output/' folder (e.g. output/screenshot.png)\n"
+                            "11. ALWAYS save intermediate/scratch files to the 'temp/' folder (e.g. temp/work.txt)\n"
+                            "12. NEVER create temp/image files in the project root directory\n"
+                            "13. If a filename has no directory prefix, prepend 'output/' automatically\n\n"
                             "BACKGROUND TASK CAPABILITIES — CRITICAL:\n"
                             "You CAN proactively send messages into this chat using background tasks.\n"
                             "'Send me', 'tell me', 'notify me', 'alert me', 'say X to me' = use delegate_background_task.\n\n"
@@ -198,14 +188,14 @@ class AIAgent(MemoryMixin, SkillsMixin, ToolingMixin, ResponseMixin, Conversatio
                             "Example: User asks 'latest aviation accident' → Call web_search('latest aviation accident') → Summarize results\n"
                             "Example: Taking a screenshot → use filename 'output/screenshot.png' not 'screenshot.png'\n\n"
                             "LARGE FILE HANDLING RULES:\n"
-                            "17. If read_file returns a very large result, DO NOT try to read it again — it will be the same size.\n"
-                            "18. For large files, use execute_command with grep/head/tail/sed to navigate:\n"
+                            "14. If read_file returns a very large result, DO NOT try to read it again — it will be the same size.\n"
+                            "15. For large files, use execute_command with grep/head/tail/sed to navigate:\n"
                             "    - Search: grep -n 'keyword' filename\n"
                             "    - First N lines: head -100 filename\n"
                             "    - Last N lines: tail -100 filename\n"
                             "    - Line range: sed -n '100,200p' filename\n"
                             "    - Count lines: wc -l filename\n"
-                            "19. Never include raw binary or huge JSON blobs in your response — summarise them.\n\n"
+                            "16. Never include raw binary or huge JSON blobs in your response — summarise them.\n\n"
                             "SERVER LAUNCH RULE:\n"
                             "- To start a web server, ASGI/WSGI server, or any long-lived/never-returning process\n"
                             "  (uvicorn, gunicorn, flask run, manage.py runserver, python -m http.server,\n"
@@ -268,9 +258,6 @@ class AIAgent(MemoryMixin, SkillsMixin, ToolingMixin, ResponseMixin, Conversatio
         try:
             if self.memory_worker:
                 await self.memory_worker.stop()
-            if self.mem0_memory:
-                self.mem0_memory = None
-                logger.info("mem0 memory released")
         except Exception as e:
             logger.debug(f"MemoryWorker shutdown failed: {e}")
 

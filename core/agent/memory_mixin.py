@@ -31,7 +31,6 @@ from core.agent.runtime import (
     ModelRegistry,
     SkillManager,
     VectorMemory,
-    Mem0Memory,
     ToolManager,
     VERSION,
     LOG_FILE,
@@ -154,29 +153,27 @@ class MemoryMixin:
 
         extraction_prompt = (
             "You are a memory extraction assistant. Analyze this conversation exchange"
-            " and extract meaningful facts about the USER"
-            " (not about AI, not tool outputs).\n\n"
+            " and extract ONLY HIGHLY RELEVANT and MEANINGFUL facts about the USER.\n\n"
+            "CRITICAL: If the information is trivial, common sense, or not worth remembering, "
+            "do NOT extract it. Only remember things that will be useful for personalizing "
+            "future interactions or provide deep context about the user's work/life.\n\n"
             f"Conversation:\nUser: {user_input[:1000]}\nAssistant: {ai_response[:800]}\n\n"
-            f"Already known personal facts (do NOT re-extract these topics): {personal_summary}\n"
-            f"Already auto-learned topics (update if changed, skip if same): {existing_summary}\n\n"
-            "Extract facts about:\n"
-            "- User preferences, dislikes, opinions\n"
-            "- Projects they work on, tools they use\n"
-            "- People they mention (names, roles, relationships)\n"
-            "- Technical environment (OS, languages, stack)\n"
-            "- Decisions they made\n"
-            "- Problems they solved or encountered\n"
-            "- Things they corrected the AI about\n"
-            "- Work context and habits\n\n"
-            "Do NOT extract:\n"
-            "- Questions the user asked\n"
-            "- AI responses or tool results\n"
-            "- One-time lookups (time, weather)\n"
-            "- Greetings or small talk\n"
-            "- Anything already in personal facts\n\n"
+            f"Already known personal facts: {personal_summary}\n"
+            f"Already auto-learned topics: {existing_summary}\n\n"
+            "Focus on:\n"
+            "- Core user preferences and persistent context\n"
+            "- Specific projects, unique tools, or technical stacks used\n"
+            "- Key relationships or roles mentioned\n"
+            "- Direct corrections made to the AI\n"
+            "- Decisions and specific problem-solving context\n\n"
+            "STRICTLY IGNORE:\n"
+            "- Trivial observations (e.g., 'User likes to ask questions')\n"
+            "- One-off tasks or temporary lookups\n"
+            "- Greetings, small talk, or polite fillers\n"
+            "- Anything the user is just asking ABOUT (rather than sharing info)\n\n"
             'Respond ONLY with a JSON array. Each item: {"topic": "short_snake_case_key",'
             ' "fact": "concise fact sentence", "confidence": "high|medium|low"}\n'
-            "If nothing meaningful to extract, respond with: []\n\n"
+            "If nothing worthwhile to extract, respond with: []\n\n"
             "JSON:"
         )
 
@@ -303,33 +300,4 @@ class MemoryMixin:
         )
         return stored_count
 
-
-    def _mem0_learn(self, user_input: str, ai_output: str) -> None:
-        """
-        Fire-and-forget: feed a turn to mem0 for auto fact-extraction.
-
-        Keeps a strong reference to the task (so it isn't garbage-collected
-        before completion) and logs any failure instead of swallowing it.
-        """
-        if not self.mem0_memory:
-            return
-        try:
-            task = asyncio.create_task(
-                self.mem0_memory.add(
-                    user_input, ai_output,
-                    user_id=get_session_id() or "default",
-                )
-            )
-        except RuntimeError:
-            # No running event loop (e.g. sync test context) — skip silently.
-            return
-        self._mem0_tasks.add(task)
-
-        def _done(t: "asyncio.Task") -> None:
-            self._mem0_tasks.discard(t)
-            exc = t.exception() if not t.cancelled() else None
-            if exc is not None:
-                logger.warning("mem0 background add failed: %s", exc)
-
-        task.add_done_callback(_done)
 

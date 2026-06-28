@@ -29,7 +29,6 @@ from core.agent.runtime import (
     ModelRegistry,
     SkillManager,
     VectorMemory,
-    Mem0Memory,
     ToolManager,
     VERSION,
     LOG_FILE,
@@ -145,8 +144,6 @@ class ResponseMixin:
                     self.memory_worker.submit(
                         user_input, _skill_out, get_session_id() or ""
                     )
-                # ── mem0: learn from skill dispatch ──────────────────────
-                self._mem0_learn(user_input, _skill_out)
                 return _skill_out
             # END SKILL DISPATCH
 
@@ -162,13 +159,6 @@ class ResponseMixin:
                 if raw_prefix and len(raw_prefix) > MAX_MEMORY_CONTEXT_CHARS:
                     raw_prefix = raw_prefix[:MAX_MEMORY_CONTEXT_CHARS] + "\n...[memory truncated]\n\n"
                 memory_prefix = raw_prefix
-                # ── mem0: inject conversation-learned memories ──────────────
-                if self.mem0_memory:
-                    _mem0_ctx = await self.mem0_memory.build_context_snippet(
-                        user_input, user_id=get_session_id() or "default", limit=8
-                    )
-                    if _mem0_ctx:
-                        memory_prefix = (memory_prefix or "") + "\n" + _mem0_ctx + "\n"
 
             user_message = (memory_prefix + user_input) if memory_prefix else user_input
             conv.append({"role": "user", "content": user_message})
@@ -500,8 +490,6 @@ class ResponseMixin:
                         self.memory_worker.submit(
                             user_input, final_text, get_session_id() or ""
                         )
-                    # mem0: learn from every final response
-                    self._mem0_learn(user_input, final_text)
                     return final_text
 
             # If we hit max iterations, inform user but don't fail

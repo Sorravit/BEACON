@@ -55,7 +55,6 @@ from core.mcp_client import MCPManager
 from core.models import ModelRegistry
 from core.skills import SkillManager
 from core.vector_memory import VectorMemory
-from core.mem0_memory import Mem0Memory
 from tools.manager import ToolManager
 
 # ── Telemetry ─────────────────────────────────────────────────────────────────
