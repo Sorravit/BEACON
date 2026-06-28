@@ -902,6 +902,20 @@ async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent, model:
     model_label = _model_info.label if _model_info else resolved_model
     _emit({"type": "model", "content": resolved_model, "label": model_label, "ts": datetime.now().isoformat()})
 
+    # ── Chat-turn lifecycle logging ───────────────────────────────────────────
+    # A single, scannable signal that the message was received and is being
+    # worked, plus a summary when it finishes. Keeps logs informative without
+    # the per-token / per-print noise.
+    _sid8 = session_id[:8]
+    _msg_preview = " ".join(user_input.split())
+    if len(_msg_preview) > 80:
+        _msg_preview = _msg_preview[:80] + "…"
+    _turn_stats = {"tools": 0}
+    logger.info(
+        '▶ chat turn START [session=%s] model=%s msg="%s"',
+        _sid8, model_label, _msg_preview,
+    )
+
     try:
         from main import ToolManager
         # Phase 6 / #2: get per-session browser context from the pool
@@ -926,6 +940,9 @@ async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent, model:
                 f"{k}={str(v)}" for k, v in args.items()
             ) if args else ""
             bg["activity"] = f"{name}({args_preview})"
+            _turn_stats["tools"] += 1
+            _args_log = args_preview if len(args_preview) <= 120 else args_preview[:120] + "…"
+            logger.info("🔧 [session=%s] tool %s(%s)", _sid8, name, _args_log)
             _emit({"type": "tool", "name": name, "args": args_preview})
             # ── Skill indicator: tell the UI which skill is now active ──
             if name == "load_skill":
@@ -1016,6 +1033,12 @@ async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent, model:
 
         _emit({"type": "done"})
 
+        _elapsed = _tmod.perf_counter() - _t0_sess
+        logger.info(
+            "■ chat turn DONE [session=%s] %.1fs · %d chars · %d tool call(s)",
+            _sid8, _elapsed, len(content), _turn_stats["tools"],
+        )
+
         # Generate smart title after first exchange (fire-and-forget)
         if s is not None and not s.get("manually_named"):
             user_msgs = [m for m in s["messages"] if m["role"] == "user"]
@@ -1025,6 +1048,11 @@ async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent, model:
                 )
 
     except asyncio.CancelledError:
+        _elapsed = _tmod.perf_counter() - _t0_sess
+        logger.info(
+            "■ chat turn STOPPED [session=%s] %.1fs · %d tool call(s) (cancelled by user)",
+            _sid8, _elapsed, _turn_stats["tools"],
+        )
         _emit({"type": "stopped", "content": "Stopped by user"})
         if _sess_span_cm and _sess_otel_span:
             try:
@@ -1036,7 +1064,11 @@ async def _run_agent_bg(user_input: str, session_id: str, agent: AIAgent, model:
                 pass
         raise
     except Exception as e:
-        logger.error(f"Agent BG error: {e}")
+        _elapsed = _tmod.perf_counter() - _t0_sess
+        logger.error(
+            "■ chat turn ERROR [session=%s] %.1fs · %d tool call(s): %s",
+            _sid8, _elapsed, _turn_stats["tools"], e,
+        )
         logger.debug("Agent BG traceback", exc_info=True)  # OTel-instrumented
         _emit({"type": "error", "content": str(e)})
         if _sess_span_cm and _sess_otel_span:
@@ -1869,6 +1901,10 @@ if __name__ == "__main__":
         port=8000,
         reload=False,
         log_level="info",
+        # Per-request access logging (GET /events, /tasks, /sessions polling)
+        # floods the log and buries real signal. Chat-turn lifecycle logs in
+        # _run_agent_bg provide the meaningful per-request information instead.
+        access_log=False,
         # Don't let long-lived SSE streams (/events, /chat/stream) stall Ctrl+C —
         # force connections closed a few seconds after shutdown begins.
         timeout_graceful_shutdown=3,

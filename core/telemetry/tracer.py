@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -236,6 +237,12 @@ def install_print_bridge(
 
     setup_telemetry(service_name=service_name, otlp_endpoint=otlp_endpoint)
     otel_logger = logging.getLogger("beacon.stdout")
+    # Forward print() output to the OTel pipeline ONLY. Without this, the bridged
+    # records propagate to the root logger and flood the file/console log with
+    # every line of tool output, raw model text and ANSI escape bytes.
+    otel_logger.propagate = False
+
+    _ansi_re = re.compile(r"\x1b\[[0-9;]*m")
 
     class _PrintBridge:
         """Transparent stdout proxy that also emits whole lines as log records.
@@ -253,8 +260,9 @@ def install_print_bridge(
             self._buf += text
             while "\n" in self._buf:
                 line, self._buf = self._buf.split("\n", 1)
-                if line.strip():
-                    otel_logger.info(line)
+                _clean = _ansi_re.sub("", line)
+                if _clean.strip():
+                    otel_logger.info(_clean)
             return len(text)
 
         def flush(self) -> None:

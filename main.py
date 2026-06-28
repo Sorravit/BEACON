@@ -5,6 +5,7 @@
 # background threads that hold libdispatch / XPC dispatch_once locks.
 # Fix: tell grpc to support fork and avoid the broken kqueue poll strategy.
 import os as _grpc_os
+
 _grpc_os.environ.setdefault("GRPC_ENABLE_FORK_SUPPORT", "1")
 _grpc_os.environ.setdefault("GRPC_POLL_STRATEGY", "poll")
 _grpc_os.environ.setdefault("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES")
@@ -59,13 +60,26 @@ from tools.manager import ToolManager
 try:
     from core.telemetry import record_llm_call, setup_telemetry, install_print_bridge
     from core.telemetry.context import get_session_id, get_reporter
+
     _TELEMETRY_AVAILABLE = True
 except ImportError:
     _TELEMETRY_AVAILABLE = False
-    def get_session_id(): return None  # type: ignore
-    def get_reporter(): return None    # type: ignore
-    def setup_telemetry(*a, **kw): pass  # type: ignore
-    def install_print_bridge(*a, **kw): pass  # type: ignore
+
+
+    def get_session_id():
+        return None  # type: ignore
+
+
+    def get_reporter():
+        return None  # type: ignore
+
+
+    def setup_telemetry(*a, **kw):
+        pass  # type: ignore
+
+
+    def install_print_bridge(*a, **kw):
+        pass  # type: ignore
 
 # ============================================================================
 # CONFIGURATION CONSTANTS - Modify these to customize behavior
@@ -124,12 +138,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 # ── Module-level cached tiktoken encoder (Phase 1 / #7) ──────────────────────
 @lru_cache(maxsize=1)
 def _get_encoder():
     """Return the cached cl100k_base tiktoken encoder (loaded once per process)."""
     import tiktoken
     return tiktoken.get_encoding("cl100k_base")
+
 
 # ── LLM concurrency ──────────────────────────────────────────────────────────
 # The previous global semaphore (LLM_MAX_CONCURRENCY) has been removed: this app
@@ -228,28 +244,29 @@ class _ToolMarkupStreamFilter:
             return s[:idx], tail
         return s, ""
 
+
 class Config:
     """Configuration manager for the AI assistant."""
-    
+
     def __init__(self):
         """Initialize configuration from environment variables and .env file."""
         self._load_env_file()
         self._load_config()
-    
+
     def _load_env_file(self):
         """Load environment variables from .env file if it exists."""
         env_file = Path(".env")
         if not env_file.exists():
             return
-        
+
         for line in env_file.read_text().splitlines():
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
-            
+
             key, value = line.split("=", 1)
             os.environ[key.strip()] = value.strip().strip("\"'")
-    
+
     def _load_config(self):
         """Load configuration values from environment."""
         self.api_key = os.getenv("OPENAI_API_KEY")
@@ -289,9 +306,10 @@ class Config:
         print(f"Tools: {self.enable_tools}")
         print(f"Models available: {len(self.models.ids())}")
 
+
 class AIAgent:
     """Main AI agent that handles conversations and tool execution."""
-    
+
     def __init__(self, config: Config):
         """Initialize the AI agent with configuration."""
         self.config = config
@@ -303,10 +321,10 @@ class AIAgent:
         self.vector_memory: Optional[VectorMemory] = None
         self.memory_available = False
         self.skill_manager: Optional[SkillManager] = None
-        self.memory_worker = None          # MemoryWorker (Phase 2)
+        self.memory_worker = None  # MemoryWorker (Phase 2)
         self.mem0_memory: Optional[Mem0Memory] = None  # mem0 auto-learning
-        self._mem0_tasks: set = set()       # strong refs to fire-and-forget adds
-        self.browser_pool = None           # BrowserPool  (Phase 6)
+        self._mem0_tasks: set = set()  # strong refs to fire-and-forget adds
+        self.browser_pool = None  # BrowserPool  (Phase 6)
         self._last_dispatched_skill: str = ""
         # Cache for the (expensive, ~80k-char) tools prompt. Invalidated when the
         # available tool/MCP set changes (keyed on tool-name signature).
@@ -319,7 +337,7 @@ class AIAgent:
             from core.browser_pool import BrowserPool
             self.browser_pool = BrowserPool()
         return await self.browser_pool.get_context(session_id or "default")
-    
+
     async def initialize(self) -> bool:
         """
         Initialize the AI agent and its tools.
@@ -341,10 +359,10 @@ class AIAgent:
                 timeout=_llm_timeout if _llm_timeout > 0 else None,
                 max_retries=_llm_retries,
             )
-            
+
             # Initialize MCP manager
             self.mcp_manager = MCPManager()
-            
+
             # Load MCP servers from config
             await self._load_mcp_servers()
 
@@ -353,7 +371,7 @@ class AIAgent:
             if self.skill_manager.has_skills():
                 logger.info("✅ %d skill(s) available: %s",
                             len(self.skill_manager), ", ".join(self.skill_manager.names()))
-            
+
             # Initialize vector memory (Weaviate) — optional, graceful if unavailable
             weaviate_port = int(os.getenv("WEAVIATE_PORT", "8090"))
             self.vector_memory = VectorMemory(
@@ -389,7 +407,7 @@ class AIAgent:
                 # mcp_manager already loaded above — update reference in ToolManager
                 if self.tools:
                     self.tools.mcp_manager = self.mcp_manager
-                
+
                 # Add system message establishing tool usage context
                 if self.tools_available:
                     # Ensure output/temp directories exist for AI-generated files
@@ -471,13 +489,13 @@ class AIAgent:
                     if self.skill_manager and self.skill_manager.has_skills():
                         system_message["content"] += self.skill_manager.system_prompt_block()
                     self.conversation.append(system_message)
-                    
+
             logger.info("Agent initialized successfully")
             return True
         except Exception as e:
             logger.error(f"Agent initialization failed: {e}")
             return False
-    
+
     async def _load_mcp_servers(self):
         """Load MCP servers from config file"""
         try:
@@ -485,10 +503,10 @@ class AIAgent:
             if not config_file.exists():
                 logger.info(f"No {MCP_CONFIG_FILE} found, skipping MCP servers")
                 return
-            
+
             with open(config_file) as f:
                 mcp_config = json.load(f)
-            
+
             servers = mcp_config.get("servers", {})
             for server_name, server_config in servers.items():
                 command = server_config.get("command")
@@ -502,10 +520,10 @@ class AIAgent:
                         logger.info(f"✅ MCP server {server_name} loaded")
                     else:
                         logger.warning(f"⚠️  Failed to load MCP server {server_name}")
-        
+
         except Exception as e:
             logger.error(f"Error loading MCP servers: {e}")
-    
+
     async def _extract_and_store_facts(self, user_input: str):
         """
         Detect personal facts in user input and store them in vector memory.
@@ -533,7 +551,9 @@ class AIAgent:
                 model=self.config.model,
                 messages=[{"role": "user", "content": extraction_prompt}],
                 temperature=0,
-                max_tokens=100
+                # Extended-thinking models on the gateway require
+                # max_tokens > thinking.budget_tokens, so keep a safe floor.
+                max_tokens=int(os.getenv("AUTO_MEMORY_MAX_TOKENS", "4096")),
             )
             import contextlib as _cl_ef
             _ef_ctx = record_llm_call(self.config.model, session_id=get_session_id()) if _TELEMETRY_AVAILABLE else _cl_ef.nullcontext()
@@ -555,7 +575,7 @@ class AIAgent:
             logger.debug(f"Fact extraction skipped: {e}")
 
     async def _auto_memory_extract(
-        self, user_input: str, ai_response: str, session_id: str = ""
+            self, user_input: str, ai_response: str, session_id: str = ""
     ) -> int:
         """
         Extract facts from a conversation exchange and store them in AutoLearned.
@@ -653,7 +673,8 @@ class AIAgent:
                 model=extract_model,
                 messages=[{"role": "user", "content": extraction_prompt}],
                 temperature=0.2,
-                max_tokens=800,
+                # Extended-thinking models require max_tokens > budget_tokens.
+                max_tokens=int(os.getenv("AUTO_MEMORY_MAX_TOKENS", "4096")),
             )
 
         raw = (result.choices[0].message.content or "").strip()
@@ -699,8 +720,8 @@ class AIAgent:
         stored_count = 0
         skipped_count = 0
         for _idx, item in enumerate(facts):
-            topic      = item.get("topic", "").strip()
-            fact       = item.get("fact",  "").strip()
+            topic = item.get("topic", "").strip()
+            fact = item.get("fact", "").strip()
             confidence = item.get("confidence", "medium")
 
             # ── (e) SKIP logs ────────────────────────────────────────────────
@@ -756,23 +777,23 @@ class AIAgent:
         return stored_count
 
     _SKILL_TRIGGERS = {
-        "business_analyst":           ["act as ba", "act as business analyst", "write user stories", "write brd"],
-        "lead_qa":                    ["act as lead qa", "qa strategy", "test strategy", "test plan"],
-        "senior_qa":                  ["act as senior qa", "write test cases", "test case design"],
-        "automated_qa_cypress":       ["cypress test", "write cypress", "cypress spec"],
-        "automated_qa_robot":         ["robot framework", "write robot", "robot test"],
-        "senior_java_engineer":       ["act as java engineer", "write spring boot", "java service"],
-        "senior_python_engineer":     ["act as python engineer", "write fastapi", "fastapi service"],
+        "business_analyst": ["act as ba", "act as business analyst", "write user stories", "write brd"],
+        "lead_qa": ["act as lead qa", "qa strategy", "test strategy", "test plan"],
+        "senior_qa": ["act as senior qa", "write test cases", "test case design"],
+        "automated_qa_cypress": ["cypress test", "write cypress", "cypress spec"],
+        "automated_qa_robot": ["robot framework", "write robot", "robot test"],
+        "senior_java_engineer": ["act as java engineer", "write spring boot", "java service"],
+        "senior_python_engineer": ["act as python engineer", "write fastapi", "fastapi service"],
         "senior_javascript_engineer": ["act as javascript engineer", "typescript service"],
-        "frontend_engineer":          ["act as frontend engineer", "write react component"],
-        "backend_engineer":           ["act as backend engineer", "write api spec", "openapi spec"],
-        "devops_engineer":            ["act as devops", "write gitlab ci", "kubernetes yaml", "write dockerfile"],
-        "security_engineer":          ["act as security engineer", "threat model", "security review"],
-        "solution_architect":         ["act as architect", "solution architect", "write adr"],
-        "researcher":                 ["act as researcher", "do research on", "research report on"],
-        "reviewer":                   ["act as reviewer", "review this code", "code review"],
-        "financial_analyst":          ["act as financial analyst", "npv analysis", "roi analysis"],
-        "stock_market_analyst":       ["act as stock analyst", "stock analysis", "analyse stock"],
+        "frontend_engineer": ["act as frontend engineer", "write react component"],
+        "backend_engineer": ["act as backend engineer", "write api spec", "openapi spec"],
+        "devops_engineer": ["act as devops", "write gitlab ci", "kubernetes yaml", "write dockerfile"],
+        "security_engineer": ["act as security engineer", "threat model", "security review"],
+        "solution_architect": ["act as architect", "solution architect", "write adr"],
+        "researcher": ["act as researcher", "do research on", "research report on"],
+        "reviewer": ["act as reviewer", "review this code", "code review"],
+        "financial_analyst": ["act as financial analyst", "npv analysis", "roi analysis"],
+        "stock_market_analyst": ["act as stock analyst", "stock analysis", "analyse stock"],
     }
 
     async def _maybe_dispatch_skill(self, user_input: str):
@@ -850,7 +871,7 @@ class AIAgent:
                         # 3) Render a structured summary from known SkillResult data fields
                         _parts = []
                         _persona = _d.get("persona", "")
-                        _steps   = _d.get("reasoning_steps", [])
+                        _steps = _d.get("reasoning_steps", [])
                         if _persona:
                             _parts.append(f"**Role:** {_persona}")
                         if _steps:
@@ -915,7 +936,7 @@ class AIAgent:
             return self._tools_prompt_cache
 
         prompt = "\n\nYou have access to the following tools:\n\n"
-        
+
         # Add built-in tools
         if self.tools_available and self.tools:
             for tool in self.tools.tools:
@@ -933,7 +954,7 @@ class AIAgent:
                 else:
                     prompt += "Parameters: none\n"
                 prompt += "</tool>\n\n"
-        
+
         # Add MCP tools
         if self.mcp_manager:
             for tool in self.mcp_manager.get_all_tools_for_openai():
@@ -951,7 +972,7 @@ class AIAgent:
                 else:
                     prompt += "Parameters: none\n"
                 prompt += "</tool>\n\n"
-        
+
         prompt += """To use a tool, respond with:
 <tool_use>
 <tool_name>tool_name_here</tool_name>
@@ -969,13 +990,13 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
         self._tools_prompt_cache = prompt
         self._tools_prompt_key = cache_key
         return prompt
-    
+
     def _parse_tool_calls(self, response_text: str) -> List[Dict[str, Any]]:
         """Parse tool calls from Claude's XML response"""
         import re
-        
+
         tool_calls = []
-        
+
         # ── Format 1: <tool_use>...<tool_name>NAME</tool_name>...</tool_use> ──
         # Also tolerates mismatched closing tags: </tool_invoke>, </tool_call>.
         # Separator-tolerant: open/close may use '_' or '-' for the same word
@@ -1001,7 +1022,7 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                 if not tool_name_match:
                     continue
                 tool_name = tool_name_match.group(1).strip()
-                
+
                 # Parse parameters
                 params_match = re.search(r'<parameters>(.*?)</parameters>', match, re.DOTALL)
                 if params_match:
@@ -1037,7 +1058,7 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                         parameters = {}
                 else:
                     parameters = {}
-                
+
                 tool_calls.append({
                     "tool_name": tool_name,
                     "parameters": parameters
@@ -1045,7 +1066,7 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
             except Exception as e:
                 logger.error(f"Error parsing tool call: {e}")
                 continue
-        
+
         return tool_calls
 
     def _mem0_learn(self, user_input: str, ai_output: str) -> None:
@@ -1121,7 +1142,7 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
             conv = conversation  # stateless mode: caller owns this list
         else:
             conv = self.conversation  # CLI mode: mutate self.conversation as before
-        
+
         # Build tools prompt once and store it for use in the first iteration only.
         # We do NOT permanently inject it into conv[0] because:
         #   1. conv[0] is a shared reference to agent.conversation[0] — mutating it
@@ -1159,8 +1180,10 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                     # Phase 1 / #4: batch emit (24-char chunks)
                     _BATCH = 24
                     for _i in range(0, len(_skill_out), _BATCH):
-                        try: token_callback(_skill_out[_i:_i+_BATCH])
-                        except Exception: pass
+                        try:
+                            token_callback(_skill_out[_i:_i + _BATCH])
+                        except Exception:
+                            pass
                 conv.append({"role": "assistant", "content": _skill_out})
                 # Phase 2 / auto-memory: also learn from skill dispatches
                 if self.memory_worker is None:
@@ -1205,7 +1228,7 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
             # single asyncio event loop stays responsive and concurrent streams
             # are not starved (root cause of intermittent "returns nothing").
             await asyncio.to_thread(self._trim_conversation, conv)
-            
+
             # Agent loop - allow multiple tool calls
             # For long-running tasks (courses, etc.), use a very high limit
             # Configured via MAX_TOOL_ITERATIONS constant at top of file
@@ -1229,9 +1252,9 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                     "temperature": self.config.temperature,
                     "max_tokens": self.config.max_tokens
                 }
-                
+
                 # NO tools parameter - use prompt-based approach instead
-                
+
                 # One OTel span per LLM request
                 llm_span_cm = (
                     record_llm_call(
@@ -1256,8 +1279,8 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                 # Non-streaming calls can't measure inactivity (single blocking
                 # call) so they use a generous total wall-clock guard instead;
                 # set LLM_REQUEST_TIMEOUT=0 to disable that guard entirely.
-                _idle_raw     = float(os.getenv("LLM_STREAM_IDLE_TIMEOUT", "0"))
-                _idle_timeout = _idle_raw if _idle_raw > 0 else None   # None = no limit
+                _idle_raw = float(os.getenv("LLM_STREAM_IDLE_TIMEOUT", "0"))
+                _idle_timeout = _idle_raw if _idle_raw > 0 else None  # None = no limit
                 _total_timeout = float(os.getenv("LLM_REQUEST_TIMEOUT", "0"))
                 _nonstream_timeout = _total_timeout if _total_timeout > 0 else None
 
@@ -1345,6 +1368,7 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                                 # Flush any safe text held back by the filter.
                                 _emit(_filter.flush())
                                 return _text
+
                             try:
                                 response_text = await _consume_stream()
                                 if not response_text.strip():
@@ -1420,22 +1444,22 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
 
                 # Parse tool calls from response
                 tool_calls = self._parse_tool_calls(response_text)
-                
+
                 if tool_calls:
                     # Add assistant's response with tool calls
                     conv.append({
                         "role": "assistant",
                         "content": response_text
                     })
-                    
+
                     # Execute all tool calls
                     tool_results = []
                     for tool_call in tool_calls:
                         tool_name = tool_call["tool_name"]
                         tool_args = tool_call["parameters"]
-                        
+
                         print(f"\033[92m  🔧 Executing: {tool_name}({', '.join(f'{k}={str(v)}' for k, v in tool_args.items()) if tool_args else ''})\033[0m")
-                        
+
                         # Route ALL tool calls (built-in and MCP) through effective_tools.execute_tool()
                         # so web_app.py's instrumented wrapper emits SSE events for every call,
                         # including MCP tools. execute_tool() now falls through to mcp_manager for
@@ -1444,13 +1468,13 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                             tool_result = await effective_tools.execute_tool(tool_name, tool_args)
                         else:
                             tool_result = json.dumps({"error": "No tool manager available"})
-                        
+
                         # Print tool result in cyan
                         result_preview = str(tool_result)
                         if len(result_preview) > 500:
                             result_preview = result_preview[:500] + "... [truncated]"
                         print(f"\033[96m  📤 Result: {result_preview}\033[0m")
-                        
+
                         # --- Store tool result in vector memory ---
                         if self.memory_available and self.vector_memory:
                             query_hint = str(list(tool_args.values())[0]) if tool_args else tool_name
@@ -1461,7 +1485,7 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                             )
 
                         tool_results.append(f"Tool: {tool_name}\nResult: {tool_result}")
-                    
+
                     # Notify instead of silently truncate — tell the AI the result is large
                     MAX_RESULT_CHARS = 80000  # ~26k tokens — warn if larger but don't silently cut off
                     notified_results = []
@@ -1473,7 +1497,7 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                             notified_results.append(
                                 f"[RESULT TOO LARGE: {size_kb}KB — only first 3KB shown below. "
                                 f"Use execute_command with grep/head/tail/sed to search/navigate this content "
-                                f"rather than reading the whole thing at once.]\n\n{preview}\n\n[...{size_kb-3}KB more not shown]"
+                                f"rather than reading the whole thing at once.]\n\n{preview}\n\n[...{size_kb - 3}KB more not shown]"
                             )
                         else:
                             notified_results.append(tr)
@@ -1482,7 +1506,7 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                         "role": "user",
                         "content": f"Tool execution results:\n\n{results_text}\n\nPlease provide your final response based on these results."
                     })
-                    
+
                     # Continue loop to let AI process tool results
                     continue
                 else:
@@ -1510,7 +1534,7 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                         _BATCH = 24
                         for _i in range(0, len(clean), _BATCH):
                             try:
-                                token_callback(clean[_i:_i+_BATCH])
+                                token_callback(clean[_i:_i + _BATCH])
                             except Exception:
                                 pass
 
@@ -1529,13 +1553,13 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                     # mem0: learn from every final response
                     self._mem0_learn(user_input, final_text)
                     return final_text
-            
+
             # If we hit max iterations, inform user but don't fail
             logger.warning(f"Reached safety backstop of {MAX_TOOL_ITERATIONS} iterations — this should never happen in normal use.")
             _backstop = f"I've reached the iteration safety backstop ({MAX_TOOL_ITERATIONS} calls). This should never happen in normal use — please report this."
             _stream_out(_backstop)
             return _backstop
-                
+
         except Exception as e:
             logger.error(f"Error: {e}")
             import traceback
@@ -1543,7 +1567,7 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
             if conv and conv[-1]["role"] == "user":
                 conv.pop()
             raise  # Re-raise so web_app.py can surface it to the frontend
-    
+
     def _estimate_tokens(self, text: str) -> int:
         """
         Accurate token count using the module-level cached tiktoken encoder.
@@ -1555,7 +1579,7 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
         except Exception:
             # Fallback: len//2 is safer than //3 for Thai/CJK text
             return max(1, len(text) // 2)
-    
+
     def _get_conversation_tokens(self, conv: List[Dict]) -> int:
         """Calculate total tokens in a conversation list"""
         total = 0
@@ -1563,7 +1587,7 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
             content = msg.get("content", "")
             total += self._estimate_tokens(content)
         return total
-    
+
     def _trim_conversation(self, conv: List[Dict]):
         """
         Dynamically trim conversation history based on token count.
@@ -1572,26 +1596,26 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
         per-request conversation lists).
         """
         total_tokens = self._get_conversation_tokens(conv)
-        
+
         # If under limit, no trimming needed
         if total_tokens <= MAX_CONVERSATION_TOKENS:
             return
-        
+
         # Keep system message (first message with tools description)
         system_msg = None
         start_idx = 0
         if conv and conv[0]["role"] == "system":
             system_msg = conv[0]
             start_idx = 1
-        
+
         # Calculate tokens for system message
         system_tokens = self._estimate_tokens(system_msg["content"]) if system_msg else 0
         available_tokens = MAX_CONVERSATION_TOKENS - system_tokens
-        
+
         # Keep as many recent messages as possible within token limit
         kept_messages = []
         current_tokens = 0
-        
+
         # Iterate from most recent to oldest
         for msg in reversed(conv[start_idx:]):
             msg_tokens = self._estimate_tokens(msg.get("content", ""))
@@ -1600,7 +1624,7 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                 current_tokens += msg_tokens
             else:
                 break  # Stop when we would exceed limit
-        
+
         # Rebuild conversation in-place
         conv.clear()
         if system_msg:
@@ -1613,10 +1637,10 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
             kept_messages.pop(0)
 
         conv.extend(kept_messages)
-        
+
         new_total = self._get_conversation_tokens(conv)
         logger.info(f"Trimmed conversation: {total_tokens} → {new_total} tokens ({len(kept_messages)} messages kept)")
-    
+
     def clear(self):
         """Clear all conversation history"""
         self.conversation.clear()
@@ -1666,18 +1690,18 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
             # Agent mode - programmatic/task interface
             from api.agent_api import AgentAPI
             api = AgentAPI(self)
-            
+
             if task:
                 from datetime import datetime
                 start_time = datetime.now()
                 timestamp = start_time.strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
                 print(f"\n{timestamp} - 🚀 Running task: {task}")
-                print("="*60)
+                print("=" * 60)
                 result = await api.run_task(task)
-                
+
                 end_time = datetime.now()
                 timestamp = end_time.strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
-                
+
                 # Calculate total elapsed time in human-readable format
                 duration_secs = result.get('duration_seconds') or (end_time - start_time).total_seconds()
                 hours, remainder = divmod(int(duration_secs), 3600)
@@ -1688,14 +1712,14 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                     duration_str = f"{minutes}m {seconds}s"
                 else:
                     duration_str = f"{duration_secs:.2f}s"
-                
-                print("\n" + "="*60)
+
+                print("\n" + "=" * 60)
                 print(f"{timestamp} - 🏁 TASK COMPLETED")
                 print(f"⏱️  Total time: {duration_str}")
-                print("="*60)
+                print("=" * 60)
                 print(f"Status: {result.get('status', 'unknown')}")
                 print(f"Success: {result.get('success', False)}")
-                
+
                 if result.get('result'):
                     print("\nRESULT:")
                     print("-" * 20)
@@ -1703,15 +1727,15 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                     print("-" * 20)
                 elif result.get('error'):
                     print(f"\nERROR: {result['error']}")
-                
-                print("="*60 + "\n")
-                
+
+                print("=" * 60 + "\n")
+
                 await self.shutdown()
                 return result
 
-            print("="*60)
+            print("=" * 60)
             print("🤖 AGENT MODE - Programmatic Interface")
-            print("="*60)
+            print("=" * 60)
             print("Agent is ready for programmatic task execution.")
             print("Use the AgentAPI to run tasks programmatically.")
             print("See example_agent_usage.py for examples.")
@@ -1720,11 +1744,11 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
             print(f"  python {sys.argv[0]} --mode agent \"your task here\"")
             print("-" * 60)
             return api
-        
+
         # Chat mode - interactive conversation
-        print("="*60)
+        print("=" * 60)
         print("🤖 AUTONOMOUS AI AGENT (v4.1.0) - CHAT MODE")
-        print("="*60)
+        print("=" * 60)
         self.config.display()
         if self.tools_available:
             tool_count = 0
@@ -1736,7 +1760,7 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
             print("⚡ I take action immediately - just ask!")
             print("🕐 Time/Date | 🔍 Web Search | 📁 Files | 🌐 Browser | 💻 Commands")
         print("\nCommands: help, clear, quit, agent")
-        print("-"*60)
+        print("-" * 60)
 
         # Use prompt_toolkit for rich input: arrow keys, history recall (↑), no length limit
         try:
@@ -1759,16 +1783,16 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                 user_input = user_input.strip()
                 if not user_input:
                     continue
-                
+
                 if user_input.lower() in ['quit', 'exit', 'q']:
                     print("\n👋 Goodbye!")
                     break
-                
+
                 if user_input.lower() in ['clear', 'reset']:
                     self.clear()
                     print("🔄 Cleared!")
                     continue
-                
+
                 if user_input.lower() == 'agent':
                     print("\n🤖 Switching to Agent Mode...")
                     print("To use agent mode programmatically, see example_agent_usage.py")
@@ -1778,7 +1802,7 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                     print("  - Monitor task progress")
                     print("  - Get detailed reports")
                     continue
-                
+
                 if user_input.lower() == 'help':
                     print("\n📖 I'm an autonomous agent - I act immediately!")
                     print("\nExamples:")
@@ -1791,7 +1815,7 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                     print("  clear - Clear history")
                     print("  agent - Info about agent mode")
                     continue
-                
+
                 print("\n🔄 Agent working...")
                 response = await self.get_response(user_input)
                 if response:
@@ -1799,22 +1823,23 @@ IMPORTANT: When you use a tool, ONLY output the <tool_use> block, nothing else. 
                     print(f"\n✅ [{timestamp}] {response}")
                 else:
                     print("❌ Failed to get response")
-                    
+
             except (KeyboardInterrupt, EOFError):
                 print("\n\n👋 Goodbye!")
                 break
             except Exception as e:
                 logger.error(f"Error: {e}")
                 print("❌ An error occurred")
-        
+
         await self.shutdown()
+
 
 async def main():
     import argparse
     parser = argparse.ArgumentParser(description="Autonomous AI Agent")
     parser.add_argument("--mode", choices=["chat", "agent"], default="chat", help="Execution mode")
     parser.add_argument("task", nargs="*", help="Task to run (only for agent mode)")
-    
+
     args = parser.parse_args()
     task_str = " ".join(args.task) if args.task else None
 
@@ -1837,12 +1862,13 @@ async def main():
         if not await agent.initialize():
             print("❌ Failed to initialize")
             return 1
-        
+
         await agent.run(mode=args.mode, task=task_str)
         return 0
     except Exception as e:
         logger.error(f"Fatal: {e}")
         return 1
+
 
 if __name__ == "__main__":
     sys.exit(asyncio.run(main()))

@@ -81,7 +81,7 @@ class ToolManager(
     async def initialize(self):
         try:
             await self._register_tools()
-            logger.info("Initialized with %d tools", len(self.tools))
+            logger.debug("Initialized with %d tools", len(self.tools))
             return True
         except Exception as exc:
             logger.error("Failed to initialize: %s", exc)
